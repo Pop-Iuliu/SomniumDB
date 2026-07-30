@@ -21,13 +21,19 @@ struct Client {
 };
 
 #include <chrono>
+#include "database.h"
 
-struct DbValue {
-    string data;
-    long long expire_at_ms{}; // 0 - traieste vesnic, ms pana cand moare
-};
+auto server_start_time = std::chrono::steady_clock::now();
+long long total_commands = 0;
 
-unordered_map<string, DbValue> database;
+namespace {
+    struct [[maybe_unused]] DbValue {
+        string data;
+        long long expire_at_ms{}; // 0 - traieste vesnic, ms pana cand moare
+    };
+}
+
+static Database db;
 
 // get time
 static long long get_now_ms() {
@@ -40,7 +46,7 @@ static void set_nonblocking(int fd) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-vector<string> parse_resp(string& buffer) {
+static vector<string> parse_resp(string& buffer) {
     vector<string> args;
     size_t pos = 0;
 
@@ -70,41 +76,6 @@ vector<string> parse_resp(string& buffer) {
     return args;
 }
 
-string process_command(const vector<string>& args) {
-    if (args.empty()) return "";
-
-    if (args[0] == "SET") {
-        if (args.size() == 3) {
-            database[args[1]] = DbValue{.data = args[2], .expire_at_ms = 0};
-            return "+OK\r\n";
-        }
-        else if (args.size() == 5 && (args[3] == "EX" || args[3] == "ex")) {
-            const long long ttl_ms = stoll(args[4]) * 1000;
-            database[args[1]] = DbValue{.data = args[2], .expire_at_ms = get_now_ms() + ttl_ms};
-            return "+OK\r\n";
-        }
-    }
-    else if (args[0] == "GET" && args.size() == 2) {
-        if (database.contains(args[1])) {
-            auto&[data, expire_at_ms] = database[args[1]];
-
-            if (expire_at_ms > 0 && get_now_ms() > expire_at_ms) {
-                database.erase(args[1]);
-                return "$-1\r\n";
-            }
-
-            return "$" + to_string(data.length()) + "\r\n" + data + "\r\n";
-        }
-        return "$-1\r\n";
-    }
-
-    if (args[0] == "CLIENT") return "+OK\r\n";
-    if (args[0] == "COMMAND") return "*0\r\n";
-    if (args[0] == "HELLO") return "-ERR unknown command\r\n";
-    if (args[0] == "PING") return "+PONG\r\n";
-
-    return "-ERR unknown command\r\n";
-}
 int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     set_nonblocking(server_fd);
@@ -136,7 +107,7 @@ int main() {
         int num_ready = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
         for (int i = 0; i < num_ready; i++) {
-            Client* current = (Client*)events[i].data.ptr;
+            auto* current = (Client*)events[i].data.ptr;
 
             if (current->fd == server_fd) {
                 sockaddr_in client_addr{};
@@ -167,7 +138,7 @@ int main() {
 
                         if (args.empty()) break;
 
-                        string response = process_command(args);
+                        string response = db.execute(current->fd, args);
                         write(current->fd, response.c_str(), response.length());
                     }
                 }
