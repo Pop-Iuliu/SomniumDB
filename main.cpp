@@ -22,9 +22,7 @@ struct Client {
 
 #include <chrono>
 #include "database.h"
-
-auto server_start_time = std::chrono::steady_clock::now();
-long long total_commands = 0;
+#include "watchdog.h"
 
 namespace {
     struct [[maybe_unused]] DbValue {
@@ -34,6 +32,8 @@ namespace {
 }
 
 static Database db;
+
+static Watchdog watchdog(db);
 
 // get time
 static long long get_now_ms() {
@@ -102,6 +102,7 @@ int main() {
     epoll_event events[MAX_EVENTS];
 
     cout << "Server pornit pe portul " << PORT << "...\n";
+    watchdog.start();
 
     while (true) {
         int num_ready = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
