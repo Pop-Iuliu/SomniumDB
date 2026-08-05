@@ -8,4 +8,6 @@ add_executable(Redis main.cpp
         database.cpp
         json.hpp
         watchdog.h
-        watchdog.cpp)
+        watchdog.cpp
+        pubsub.cpp
+        pubsub.h)

@@ -11,6 +11,7 @@ void Watchdog::start() {
             
             if (running) {
                 db.clean_expired_keys();
+                db.hibernate_inactive_rooms();
             }
         }
     });

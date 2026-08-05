@@ -34,11 +34,11 @@ Database::Database() {
     total_commands = 0;
 }
 
-void Database::set_client_room(int client_fd, const std::string& room_name) {
+void Database::set_client_room(const int client_fd, const std::string& room_name) {
     client_rooms[client_fd] = room_name;
 }
 
-std::string Database::get_client_room(int client_fd) {
+std::string Database::get_client_room(const int client_fd) {
     // Daca clientul nu e in nicio camera, il punem in "default"
     if (!client_rooms.contains(client_fd)) {
         client_rooms[client_fd] = "default";
@@ -46,7 +46,7 @@ std::string Database::get_client_room(int client_fd) {
     return client_rooms[client_fd];
 }
 
-std::string Database::execute(int client_fd, const std::vector<std::string>& args) {
+std::string Database::execute(const int client_fd, const std::vector<std::string>& args) {
     if (args.empty()) return "";
 
     std::lock_guard lock(db_mutex);
@@ -56,12 +56,27 @@ std::string Database::execute(int client_fd, const std::vector<std::string>& arg
     std::string command = args[0];
     std::ranges::transform(command, command.begin(), ::toupper);
 
+    std::string target_room = current_room;
+    if (command == "ROOM" && args.size() >= 2) {
+        target_room = args[1];
+    }
+
+    if (!rooms.contains(target_room)) {
+        if (rooms.size() >= MAX_ACTIVE_ROOMS) {
+            printf("'%s'.\n", target_room.c_str());
+            return "-ERR RAM FULL. Te rog asteapta ca o alta camera sa hiberneze!\r\n";
+        }
+        wakeup_room(target_room);
+    }
+
+    room_access_time[target_room] = get_current_time_ms();
+
     if (command == "COMMAND" || command == "HELLO") {
         return "*0\r\n";
-    }// pentru debugging ca habarn-am ce are paguba
+    }
 
     if (command == "ROOM" && args.size() >= 2) {
-        set_client_room(client_fd, args[1]); // asociem file descriptorului room ul
+        set_client_room(client_fd, args[1]);
         return "+OK\r\n";
     }
 
@@ -90,7 +105,7 @@ std::string Database::execute(int client_fd, const std::vector<std::string>& arg
         if (args.size() == 2) {
             const std::string& key = args[1];
 
-            if (rooms.count(current_room) && rooms[current_room].count(key)) {
+            if (rooms.contains(current_room) && rooms[current_room].contains(key)) {
                 auto&[value, expire_at] = rooms[current_room][key];
 
                 if (expire_at > 0 && expire_at < get_current_time_ms()) {
@@ -163,7 +178,7 @@ void Database::load_from_disk() {
 // TTL Watchdog
 
 void Database::clean_expired_keys() {
-    std::lock_guard lock(db_mutex); // Punem lacatul si aici!
+    std::lock_guard lock(db_mutex);
 
     const long long now = get_current_time_ms();
     int deleted_count = 0;
@@ -178,8 +193,63 @@ void Database::clean_expired_keys() {
             }
         }
     }
-
+    /*
     if (deleted_count > 0) {
         printf("🐶👀 (cainele cu gitul lunge) a sters %d chei expirate din RAM.\n", deleted_count);
+    } */
+}
+
+
+// Paging :)
+
+void Database::wakeup_room(const std::string& room_name) {
+    std::string filename = "room_" + room_name + ".json";
+
+    if (std::ifstream file(filename); file.is_open()) {
+        try {
+            nlohmann::json j;
+            file >> j;
+
+            rooms[room_name].clear();
+
+            for (auto& [key, val] : j.items()) {
+                Record r;
+                r.value = val.at("value").get<std::string>();
+                r.expire_at = val.at("expire_at").get<long long>();
+                rooms[room_name][key] = r;
+            }
+
+            // printf("[Wakeup] camera '%s' a fost trezita de pe disc in RAM.\n", room_name.c_str());
+        } catch (const std::exception& e) {
+            printf("-ERR eroare citire %s: %s\n", filename.c_str(), e.what());
+            rooms[room_name] = {};
+        }
+
+        file.close();
+        std::remove(filename.c_str());
+    } else {
+        rooms[room_name] = {};
+    }
+}
+
+void Database::hibernate_inactive_rooms() {
+    std::lock_guard lock(db_mutex);
+    long long now = get_current_time_ms();
+    std::vector<std::string> rooms_to_sleep;
+
+    for (const auto& [room_name, last_time] : room_access_time) {
+        if (now - last_time > 10000 && room_name != "default") {
+            rooms_to_sleep.push_back(room_name);
+        }
+    }
+    for (const std::string& r : rooms_to_sleep) {
+        std::string filename = "room_" + r + ".json";
+        std::ofstream file(filename);
+
+        nlohmann::json j = rooms[r];
+        file << j.dump(4);
+        file.close();
+        rooms.erase(r);
+        room_access_time.erase(r);
     }
 }

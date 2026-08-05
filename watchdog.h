@@ -7,6 +7,7 @@
 #include "database.h"
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 class Database;
 

@@ -8,6 +8,7 @@
 #include <vector>
 #include <algorithm>
 #include <thread>
+#include <mutex>
 
 struct Record {
     std::string value;
@@ -23,6 +24,11 @@ private:
     long long total_commands;
 
     std::mutex db_mutex;
+
+    std::unordered_map<std::string, long long> room_access_time;
+    const size_t MAX_ACTIVE_ROOMS = 3;
+
+    void wakeup_room(const std::string& room_name);
 public:
     Database();
     void set_client_room(int client_fd, const std::string& room_name);
@@ -31,6 +37,7 @@ public:
     std::string execute(int client_fd, const std::vector<std::string>& args);
     bool save_to_disk();
     void load_from_disk();
+    void hibernate_inactive_rooms();
 
     void clean_expired_keys();
 };
