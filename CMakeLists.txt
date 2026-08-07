@@ -10,4 +10,6 @@ add_executable(Redis main.cpp
         watchdog.h
         watchdog.cpp
         pubsub.cpp
-        pubsub.h)
+        pubsub.h
+        pool_allocator.h
+)

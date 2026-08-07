@@ -5,7 +5,7 @@
 #include <sys/socket.h>
 #include <iostream>
 
-std::string PubSubManager::subscribe(int client_fd, const std::string& channel) {
+std::string PubSubManager::subscribe(const int client_fd, const std::string& channel) {
     std::lock_guard lock(ps_mutex);
 
     channel_subscribers[channel].insert(client_fd);
@@ -45,7 +45,7 @@ std::string PubSubManager::publish(const std::string& channel, const std::string
     return ":" + std::to_string(receivers) + "\r\n";
 }
 
-void PubSubManager::remove_client(int client_fd) {
+void PubSubManager::remove_client(const int client_fd) {
     std::lock_guard lock(ps_mutex);
 
     if (!client_subscriptions.contains(client_fd)) {

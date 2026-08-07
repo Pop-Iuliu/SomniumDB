@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <mutex>
+#include <csignal>
 
 using namespace std;
 
@@ -33,7 +34,6 @@ namespace {
 }
 
 static Database db;
-
 static Watchdog watchdog(db);
 
 // get time
@@ -42,8 +42,8 @@ static long long get_now_ms() {
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
-static void set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
+static void set_nonblocking(const int fd) {
+    const int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
@@ -51,34 +51,50 @@ static vector<string> parse_resp(string& buffer) {
     vector<string> args;
     size_t pos = 0;
 
-    if (buffer.empty() || buffer[0] != '*') return args;
+    if (buffer.empty()) return args;
+
+    if (buffer[0] != '*') {
+        buffer.clear();
+        return args;
+    }
 
     size_t crlf = buffer.find("\r\n", pos);
     if (crlf == string::npos) return args;
 
-    int num_args = stoi(buffer.substr(pos + 1, crlf - pos - 1));
-    pos = crlf + 2;
-
-    for (int i = 0; i < num_args; i++) {
-        if (pos >= buffer.length() || buffer[pos] != '$') return {};
-
-        crlf = buffer.find("\r\n", pos);
-        if (crlf == string::npos) return {};
-
-        int len = stoi(buffer.substr(pos + 1, crlf - pos - 1));
+    try {
+        const int num_args = stoi(buffer.substr(pos + 1, crlf - pos - 1));
         pos = crlf + 2;
 
-        if (pos + len + 2 > buffer.length()) return {};
+        for (int i = 0; i < num_args; i++) {
+            if (pos >= buffer.length()) return {};
 
-        args.push_back(buffer.substr(pos, len));
-        pos += len + 2;
+            if (buffer[pos] != '$') {
+                buffer.clear();
+                return {};
+            }
+
+            crlf = buffer.find("\r\n", pos);
+            if (crlf == string::npos) return {};
+
+            const int len = stoi(buffer.substr(pos + 1, crlf - pos - 1));
+            pos = crlf + 2;
+
+            if (pos + len + 2 > buffer.length()) return {};
+
+            args.push_back(buffer.substr(pos, len));
+            pos += len + 2;
+        }
+        buffer.erase(0, pos);
+        return args;
+    } catch (...) {
+        buffer.clear();
+        return {};
     }
-    buffer.erase(0, pos);
-    return args;
 }
 
 int main() {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    signal(SIGPIPE, SIG_IGN);
+    const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     set_nonblocking(server_fd);
 
     int opt = 1;
@@ -89,12 +105,12 @@ int main() {
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
 
-    bind(server_fd, (sockaddr*)&address, sizeof(address));
+    bind(server_fd, reinterpret_cast<sockaddr *>(&address), sizeof(address));
     listen(server_fd, 10);
 
     int epoll_fd = epoll_create1(0);
 
-    auto* server_state = new Client{server_fd, ""};
+    auto* server_state = new Client{.fd = server_fd, .buffer = ""};
     epoll_event event{};
     event.events = EPOLLIN;
     event.data.ptr = server_state;
@@ -109,7 +125,7 @@ int main() {
         int num_ready = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
         for (int i = 0; i < num_ready; i++) {
-            auto* current = (Client*)events[i].data.ptr;
+            auto* current = static_cast<Client *>(events[i].data.ptr);
 
             if (current->fd == server_fd) {
                 sockaddr_in client_addr{};
@@ -130,6 +146,7 @@ int main() {
 
                 if (int bytes = read(current->fd, temp_buf, sizeof(temp_buf)); bytes <= 0) {
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current->fd, nullptr);
+                    db.cleanup_client(current->fd);
                     close(current->fd);
                     delete current;
                 } else {

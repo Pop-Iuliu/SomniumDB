@@ -49,12 +49,31 @@ std::string Database::get_client_room(const int client_fd) {
 std::string Database::execute(const int client_fd, const std::vector<std::string>& args) {
     if (args.empty()) return "";
 
-    std::lock_guard lock(db_mutex);
-
-    total_commands++;
     const std::string current_room = get_client_room(client_fd);
     std::string command = args[0];
     std::ranges::transform(command, command.begin(), ::toupper);
+
+    if (command == "SUBSCRIBE") {
+        if (args.size() >= 2) {
+            return pubsub.subscribe(client_fd, args[1]);
+        }
+        return "-ERR Wrong number of arguments for SUBSCRIBE\r\n";
+    }
+
+    if (command == "PUBLISH") {
+        if (args.size() >= 3) {
+            return pubsub.publish(args[1], args[2]);
+        }
+        return "-ERR Wrong number of arguments for PUBLISH\r\n";
+    }
+
+    if (pubsub.is_subscribed(client_fd)) {
+        return "-ERR Clientul este in mod SUBSCRIBE. Nu poti trimite comenzi de Database!\r\n";
+    }
+
+    std::lock_guard lock(db_mutex);
+
+    total_commands++;
 
     std::string target_room = current_room;
     if (command == "ROOM" && args.size() >= 2) {
@@ -63,7 +82,6 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
 
     if (!rooms.contains(target_room)) {
         if (rooms.size() >= MAX_ACTIVE_ROOMS) {
-            printf("'%s'.\n", target_room.c_str());
             return "-ERR RAM FULL. Te rog asteapta ca o alta camera sa hiberneze!\r\n";
         }
         wakeup_room(target_room);
@@ -84,7 +102,7 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
         if (args.size() >= 3) {
             const std::string& key = args[1];
             const std::string& value = args[2];
-            long long expire_at = 0; // default - no delete :)
+            long long expire_at = 0;
 
             if (args.size() >= 5 && args[3] == "EX") {
                 try {
@@ -95,7 +113,12 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
                 }
             }
 
-            rooms[current_room][key] = {value, expire_at};
+            if (rooms[current_room].contains(key)) {
+                rooms[current_room][key]->value = value;
+                rooms[current_room][key]->expire_at = expire_at;
+            } else {
+                rooms[current_room][key] = record_pool.allocate(value, expire_at);
+            }
             return "+OK\r\n";
         }
         return "-ERR Wrong number of arguments for SET\r\n";
@@ -106,13 +129,14 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
             const std::string& key = args[1];
 
             if (rooms.contains(current_room) && rooms[current_room].contains(key)) {
-                auto&[value, expire_at] = rooms[current_room][key];
+                Record* r = rooms[current_room][key];
 
-                if (expire_at > 0 && expire_at < get_current_time_ms()) {
-                    rooms[current_room].erase(key); // O stergem din memorie
-                    return "$-1\r\n"; // Returnam NULL
+                if (r->expire_at > 0 && r->expire_at < get_current_time_ms()) {
+                    record_pool.deallocate(r);
+                    rooms[current_room].erase(key);
+                    return "$-1\r\n";
                 }
-                const std::string val = value;
+                const std::string val = r->value;
                 return "$" + std::to_string(val.length()) + "\r\n" + val + "\r\n";
             }
             return "$-1\r\n";
@@ -148,13 +172,26 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
     return "-ERR unknown command\r\n";
 }
 
+void Database::cleanup_client(const int client_fd) {
+    pubsub.remove_client(client_fd);
+
+    std::lock_guard lock(db_mutex);
+    client_rooms.erase(client_fd);
+}
+
 /*
     functii pentru Snapshotting
 */
 
 bool Database::save_to_disk() {
     try {
-        const nlohmann::json j = rooms;
+        nlohmann::json j;
+        // Dereferențiem manual pointerul (*record_ptr) pentru a apela to_json-ul tău
+        for (const auto& [room_name, keys] : rooms) {
+            for (const auto& [key, record_ptr] : keys) {
+                j[room_name][key] = *record_ptr;
+            }
+        }
         std::ofstream file("dump.json");
         file << j.dump(4);
         return true;
@@ -169,38 +206,16 @@ void Database::load_from_disk() {
         try {
             nlohmann::json j;
             file >> j;
-            j.get_to(rooms);
-        } catch (...) {
-        }
-    }
-}
-
-// TTL Watchdog
-
-void Database::clean_expired_keys() {
-    std::lock_guard lock(db_mutex);
-
-    const long long now = get_current_time_ms();
-    int deleted_count = 0;
-
-    for (auto &room_keys: rooms | std::views::values) {
-        for (auto it = room_keys.begin(); it != room_keys.end(); ) {
-            if (it->second.expire_at > 0 && it->second.expire_at < now) {
-                it = room_keys.erase(it);
-                deleted_count++;
-            } else {
-                ++it;
+            for (const auto& [room_name, keys] : j.items()) {
+                for (const auto& [key, val] : keys.items()) {
+                    Record* r = record_pool.allocate();
+                    val.get_to(*r);
+                    rooms[room_name][key] = r;
+                }
             }
-        }
+        } catch (...) {}
     }
-    /*
-    if (deleted_count > 0) {
-        printf("🐶👀 (cainele cu gitul lunge) a sters %d chei expirate din RAM.\n", deleted_count);
-    } */
 }
-
-
-// Paging :)
 
 void Database::wakeup_room(const std::string& room_name) {
     std::string filename = "room_" + room_name + ".json";
@@ -213,13 +228,11 @@ void Database::wakeup_room(const std::string& room_name) {
             rooms[room_name].clear();
 
             for (auto& [key, val] : j.items()) {
-                Record r;
-                r.value = val.at("value").get<std::string>();
-                r.expire_at = val.at("expire_at").get<long long>();
+                Record* r = record_pool.allocate();
+                r->value = val.at("value").get<std::string>();
+                r->expire_at = val.at("expire_at").get<long long>();
                 rooms[room_name][key] = r;
             }
-
-            // printf("[Wakeup] camera '%s' a fost trezita de pe disc in RAM.\n", room_name.c_str());
         } catch (const std::exception& e) {
             printf("-ERR eroare citire %s: %s\n", filename.c_str(), e.what());
             rooms[room_name] = {};
@@ -246,10 +259,40 @@ void Database::hibernate_inactive_rooms() {
         std::string filename = "room_" + r + ".json";
         std::ofstream file(filename);
 
-        nlohmann::json j = rooms[r];
+        nlohmann::json j;
+        for (const auto& [key, record_ptr] : rooms[r]) {
+            j[key] = *record_ptr;
+            record_pool.deallocate(record_ptr);
+        }
+
         file << j.dump(4);
         file.close();
         rooms.erase(r);
         room_access_time.erase(r);
     }
+}
+
+// TTL Watchdog
+
+void Database::clean_expired_keys() {
+    std::lock_guard lock(db_mutex);
+
+    const long long now = get_current_time_ms();
+    int deleted_count = 0;
+
+    for (auto &room_keys: rooms | std::views::values) {
+        for (auto it = room_keys.begin(); it != room_keys.end(); ) {
+            if (it->second->expire_at > 0 && it->second->expire_at < now) {
+                record_pool.deallocate(it->second);
+                it = room_keys.erase(it);
+                deleted_count++;
+            } else {
+                ++it;
+            }
+        }
+    }
+    /*
+    if (deleted_count > 0) {
+        printf("🐶👀 (cainele cu gitul lunge) a sters %d chei expirate din RAM.\n", deleted_count);
+    } */
 }
