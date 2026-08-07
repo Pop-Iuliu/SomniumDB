@@ -1,7 +1,7 @@
 #include "database.h"
-#include "json.hpp"
-#include <fstream>
 
+#include <random>
+#include <ranges>
 /*
     functii utilitare
 */
@@ -11,7 +11,7 @@ static long long get_current_time_ms() {
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
 }
-
+/*
 static void to_json(nlohmann::json& j, const Record& r) {
     j = nlohmann::json{
         {"value", r.value},
@@ -23,15 +23,81 @@ static void from_json(const nlohmann::json& j, Record& r) {
     j.at("value").get_to(r.value);
     j.at("expire_at").get_to(r.expire_at);
 }
+*/
+
+static std::string encode_resp(const std::vector<std::string>& args) {
+    std::string resp = "*" + std::to_string(args.size()) + "\r\n";
+    for (const auto& arg : args) {
+        resp += "$" + std::to_string(arg.length()) + "\r\n" + arg + "\r\n";
+    }
+    return resp;
+}
 
 /*
     main stuff
 */
 
-Database::Database() {
+Database::Database() : is_recovering(true) {
     start_time = std::chrono::steady_clock::now();
-    load_from_disk();
     total_commands = 0;
+
+    aof_file.open("appendonly.aof", std::ios::app | std::ios::binary);
+
+    aof_recover();
+
+    is_recovering = false;
+}
+
+Database::~Database() {
+    if (aof_file.is_open()) {
+        aof_file.close();
+    }
+}
+
+// Logica AOF
+void Database::aof_append(const std::vector<std::string>& args) {
+    if (is_recovering || !aof_file.is_open()) return;
+
+    const std::string resp_cmd = encode_resp(args);
+    aof_file.write(resp_cmd.c_str(), resp_cmd.size());
+    // aof_file.flush();
+}
+
+void Database::aof_recover() {
+    std::ifstream file("appendonly.aof", std::ios::binary);
+    if (!file.is_open()) return;
+
+    std::string buffer;
+    char temp[4096];
+
+    while (file.read(temp, sizeof(temp))) {
+        buffer.append(temp, file.gcount());
+    }
+    buffer.append(temp, file.gcount());
+    file.close();
+
+    size_t pos = 0;
+    while (pos < buffer.length()) {
+        if (buffer[pos] != '*') break;
+
+        size_t crlf = buffer.find("\r\n", pos);
+        if (crlf == std::string::npos) break;
+
+        int num_args = std::stoi(buffer.substr(pos + 1, crlf - pos - 1));
+        pos = crlf + 2;
+
+        std::vector<std::string> args;
+        for (int i = 0; i < num_args; i++) {
+            crlf = buffer.find("\r\n", pos);
+            int len = std::stoi(buffer.substr(pos + 1, crlf - pos - 1));
+            pos = crlf + 2;
+            args.push_back(buffer.substr(pos, len));
+            pos += len + 2;
+        }
+
+        execute(-1, args);
+    }
+    printf("AOF Recovery finalizat. Baza de date este pregatita!\n");
 }
 
 void Database::set_client_room(const int client_fd, const std::string& room_name) {
@@ -46,6 +112,71 @@ std::string Database::get_client_room(const int client_fd) {
     return client_rooms[client_fd];
 }
 
+// !!! Count-Sketch min alg
+
+void Database::evict_despised_keys(const std::string& room_name) {
+    auto& room = rooms[room_name];
+
+    while (room.size() > MAX_KEYS_PER_ROOM) {
+        constexpr int SAMPLE_SIZE = 5;
+        std::string despised_key = "";
+        uint16_t lowest_freq = 0xFFFF;
+
+        size_t bucket_count = room.bucket_count();
+        if (bucket_count == 0) break;
+
+        static std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<size_t> dist(0, bucket_count - 1);
+
+        for (int i = 0; i < SAMPLE_SIZE; ++i) {
+            size_t random_bucket = dist(rng);
+            auto it = room.begin(random_bucket);
+
+            while (it == room.end(random_bucket)) {
+                random_bucket = (random_bucket + 1) % bucket_count;
+                it = room.begin(random_bucket);
+            }
+
+            const std::string& candidate_key = it->first;
+            uint16_t freq = cms.estimate_frequency(candidate_key);
+
+            if (freq < lowest_freq) {
+                lowest_freq = freq;
+                despised_key = candidate_key;
+            }
+        }
+
+        if (lowest_freq > 10) {
+            for (const auto &k: room | std::views::keys) {
+                if (cms.estimate_frequency(k) <= 2) {
+                    despised_key = k;
+                    break;
+                }
+            }
+        }
+
+        if (!despised_key.empty() && room.contains(despised_key)) {
+            if (std::ofstream cold_file("despised_keys.bin", std::ios::app | std::ios::binary); cold_file.is_open()) {
+                size_t rlen = room_name.size();
+                size_t klen = despised_key.size();
+                size_t vlen = room[despised_key]->value.size();
+
+                cold_file.write(reinterpret_cast<const char*>(&rlen), sizeof(rlen));
+                cold_file.write(room_name.data(), rlen);
+                cold_file.write(reinterpret_cast<const char*>(&klen), sizeof(klen));
+                cold_file.write(despised_key.data(), klen);
+                cold_file.write(reinterpret_cast<const char*>(&vlen), sizeof(vlen));
+                cold_file.write(room[despised_key]->value.data(), vlen);
+                cold_file.close();
+            }
+
+            record_pool.deallocate(room[despised_key]);
+            room.erase(despised_key);
+        } else {
+            break;
+        }
+    }
+}
 std::string Database::execute(const int client_fd, const std::vector<std::string>& args) {
     if (args.empty()) return "";
 
@@ -98,20 +229,31 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
         return "+OK\r\n";
     }
 
+    if (command == "GET") {
+        if (args.size() == 2) {
+            const std::string& key = args[1];
+
+            if (rooms[current_room].contains(key)) {
+                cms.record_access(key);
+
+                Record* r = rooms[current_room][key];
+                if (r->expire_at > 0 && get_current_time_ms() > r->expire_at) {
+                    record_pool.deallocate(r);
+                    rooms[current_room].erase(key);
+                    return "$-1\r\n";
+                }
+                return "$" + std::to_string(r->value.length()) + "\r\n" + r->value + "\r\n";
+            }
+            return "$-1\r\n";
+        }
+        return "-ERR Wrong number of arguments for GET\r\n";
+    }
+
     if (command == "SET") {
         if (args.size() >= 3) {
             const std::string& key = args[1];
             const std::string& value = args[2];
             long long expire_at = 0;
-
-            if (args.size() >= 5 && args[3] == "EX") {
-                try {
-                    const long long ttl_seconds = std::stoll(args[4]);
-                    expire_at = get_current_time_ms() + (ttl_seconds * 1000);
-                } catch (...) {
-                    return "-ERR Invalid TTL format\r\n";
-                }
-            }
 
             if (rooms[current_room].contains(key)) {
                 rooms[current_room][key]->value = value;
@@ -119,29 +261,15 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
             } else {
                 rooms[current_room][key] = record_pool.allocate(value, expire_at);
             }
+
+            cms.record_access(key);
+            aof_append(args);
+
+            evict_despised_keys(current_room);
+
             return "+OK\r\n";
         }
         return "-ERR Wrong number of arguments for SET\r\n";
-    }
-
-    if (command == "GET") {
-        if (args.size() == 2) {
-            const std::string& key = args[1];
-
-            if (rooms.contains(current_room) && rooms[current_room].contains(key)) {
-                Record* r = rooms[current_room][key];
-
-                if (r->expire_at > 0 && r->expire_at < get_current_time_ms()) {
-                    record_pool.deallocate(r);
-                    rooms[current_room].erase(key);
-                    return "$-1\r\n";
-                }
-                const std::string val = r->value;
-                return "$" + std::to_string(val.length()) + "\r\n" + val + "\r\n";
-            }
-            return "$-1\r\n";
-        }
-        return "-ERR Wrong number of arguments for GET\r\n";
     }
 
     if (command == "INFO") {
@@ -162,11 +290,7 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
     }
 
     if (command == "SAVE") {
-        if (save_to_disk()) {
-            return "+OK\r\n"; // Raspundem clientului ca totul a mers perfect
-        } else {
-            return "-ERR Failed to save to disk\r\n";
-        }
+        return "+OK AOF is active and up to date\r\n";
     }
 
     return "-ERR unknown command\r\n";
@@ -180,61 +304,38 @@ void Database::cleanup_client(const int client_fd) {
 }
 
 /*
-    functii pentru Snapshotting
+    functii pentru Snapshotting (de acum fara json!)
 */
 
-bool Database::save_to_disk() {
-    try {
-        nlohmann::json j;
-        // Dereferențiem manual pointerul (*record_ptr) pentru a apela to_json-ul tău
-        for (const auto& [room_name, keys] : rooms) {
-            for (const auto& [key, record_ptr] : keys) {
-                j[room_name][key] = *record_ptr;
-            }
-        }
-        std::ofstream file("dump.json");
-        file << j.dump(4);
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
+void Database::wakeup_room(const std::string& room_name) {
+    std::string filename = "room_" + room_name + ".bin"; // Schimbam extensia in .bin
 
-void Database::load_from_disk() {
-    std::ifstream file("dump.json");
+    std::ifstream file(filename, std::ios::binary);
     if (file.is_open()) {
         try {
-            nlohmann::json j;
-            file >> j;
-            for (const auto& [room_name, keys] : j.items()) {
-                for (const auto& [key, val] : keys.items()) {
-                    Record* r = record_pool.allocate();
-                    val.get_to(*r);
-                    rooms[room_name][key] = r;
-                }
-            }
-        } catch (...) {}
-    }
-}
-
-void Database::wakeup_room(const std::string& room_name) {
-    std::string filename = "room_" + room_name + ".json";
-
-    if (std::ifstream file(filename); file.is_open()) {
-        try {
-            nlohmann::json j;
-            file >> j;
-
             rooms[room_name].clear();
 
-            for (auto& [key, val] : j.items()) {
-                Record* r = record_pool.allocate();
-                r->value = val.at("value").get<std::string>();
-                r->expire_at = val.at("expire_at").get<long long>();
-                rooms[room_name][key] = r;
+            size_t num_records = 0;
+            if (file.read(reinterpret_cast<char*>(&num_records), sizeof(num_records))) {
+                for (size_t i = 0; i < num_records; ++i) {
+                    size_t klen = 0;
+                    file.read(reinterpret_cast<char*>(&klen), sizeof(klen));
+                    std::string key(klen, '\0');
+                    file.read(key.data(), klen);
+
+                    size_t vlen = 0;
+                    file.read(reinterpret_cast<char*>(&vlen), sizeof(vlen));
+                    std::string val(vlen, '\0');
+                    file.read(val.data(), vlen);
+
+                    long long expire_at = 0;
+                    file.read(reinterpret_cast<char*>(&expire_at), sizeof(expire_at));
+
+                    rooms[room_name][key] = record_pool.allocate(std::move(val), expire_at);
+                }
             }
         } catch (const std::exception& e) {
-            printf("-ERR eroare citire %s: %s\n", filename.c_str(), e.what());
+            printf("-ERR eroare citire binara %s: %s\n", filename.c_str(), e.what());
             rooms[room_name] = {};
         }
 
@@ -255,18 +356,31 @@ void Database::hibernate_inactive_rooms() {
             rooms_to_sleep.push_back(room_name);
         }
     }
-    for (const std::string& r : rooms_to_sleep) {
-        std::string filename = "room_" + r + ".json";
-        std::ofstream file(filename);
 
-        nlohmann::json j;
-        for (const auto& [key, record_ptr] : rooms[r]) {
-            j[key] = *record_ptr;
-            record_pool.deallocate(record_ptr);
+    for (const std::string& r : rooms_to_sleep) {
+        std::string filename = "room_" + r + ".bin";
+        std::ofstream file(filename, std::ios::binary);
+
+        if (file.is_open()) {
+            size_t num_records = rooms[r].size();
+            file.write(reinterpret_cast<const char*>(&num_records), sizeof(num_records));
+
+            for (const auto& [key, record_ptr] : rooms[r]) {
+                size_t klen = key.size();
+                file.write(reinterpret_cast<const char*>(&klen), sizeof(klen));
+                file.write(key.data(), klen);
+
+                size_t vlen = record_ptr->value.size();
+                file.write(reinterpret_cast<const char*>(&vlen), sizeof(vlen));
+                file.write(record_ptr->value.data(), vlen);
+
+                file.write(reinterpret_cast<const char*>(&record_ptr->expire_at), sizeof(record_ptr->expire_at));
+
+                record_pool.deallocate(record_ptr);
+            }
+            file.close();
         }
 
-        file << j.dump(4);
-        file.close();
         rooms.erase(r);
         room_access_time.erase(r);
     }
