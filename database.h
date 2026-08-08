@@ -9,9 +9,15 @@
 #include <algorithm>
 #include <thread>
 #include <mutex>
+#include <unistd.h>
+#include <fcntl.h>
 #include <fstream>
+#include <string_view>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include "pubsub.h"
 #include "pool_allocator.h"
+#include "bloom_filter.h"
 
 class CountMinSketch {
 private:
@@ -84,7 +90,10 @@ private:
     void aof_append(const std::vector<std::string>& args);
     void aof_recover();
 
+    BloomFilter disk_shield;
     void evict_despised_keys(const std::string& room_name);
+
+    static std::string read_from_cold_storage(const std::string& room_name, const std::string& key);
 public:
     Database();
     ~Database();

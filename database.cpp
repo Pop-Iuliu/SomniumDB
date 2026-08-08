@@ -1,7 +1,7 @@
 #include "database.h"
-
 #include <random>
 #include <ranges>
+#include "metrics.h"
 /*
     functii utilitare
 */
@@ -31,6 +31,61 @@ static std::string encode_resp(const std::vector<std::string>& args) {
         resp += "$" + std::to_string(arg.length()) + "\r\n" + arg + "\r\n";
     }
     return resp;
+}
+
+std::string Database::read_from_cold_storage(const std::string& room_name, const std::string& key) {
+    const int fd = open("despised_keys.bin", O_RDONLY);
+    if (fd < 0) return "";
+
+    struct stat sb{};
+    if (fstat(fd, &sb) == -1 || sb.st_size == 0) {
+        close(fd);
+        return "";
+    }
+
+    // 3. MAGIA: Kernel-ul Linux mapează fișierul direct în spațiul nostru virtual (RAM)
+    const auto mapped = static_cast<char*>(mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0));
+    if (mapped == MAP_FAILED) {
+        close(fd);
+        return "";
+    }
+
+    std::string found_value;
+    size_t offset = 0;
+
+    while (offset < static_cast<size_t>(sb.st_size)) {
+        if (offset + sizeof(size_t) > sb.st_size) break;
+        size_t rlen = *reinterpret_cast<size_t*>(mapped + offset);
+        offset += sizeof(size_t);
+
+        if (offset + rlen > sb.st_size) break;
+        std::string_view current_room(mapped + offset, rlen);
+        offset += rlen;
+
+        if (offset + sizeof(size_t) > sb.st_size) break;
+        size_t klen = *reinterpret_cast<size_t*>(mapped + offset);
+        offset += sizeof(size_t);
+
+        if (offset + klen > sb.st_size) break;
+        std::string_view current_key(mapped + offset, klen);
+        offset += klen;
+
+        if (offset + sizeof(size_t) > sb.st_size) break;
+        size_t vlen = *reinterpret_cast<size_t*>(mapped + offset);
+        offset += sizeof(size_t);
+
+        if (offset + vlen > sb.st_size) break;
+
+        if (current_room == room_name && current_key == key) {
+            found_value = std::string(mapped + offset, vlen);
+        }
+        offset += vlen;
+    }
+
+    munmap(mapped, sb.st_size);
+    close(fd);
+
+    return found_value;
 }
 
 /*
@@ -156,6 +211,10 @@ void Database::evict_despised_keys(const std::string& room_name) {
         }
 
         if (!despised_key.empty() && room.contains(despised_key)) {
+            ++global_metrics.keys_evicted;
+            --global_metrics.keys_in_ram;
+
+            disk_shield.add(despised_key);
             if (std::ofstream cold_file("despised_keys.bin", std::ios::app | std::ios::binary); cold_file.is_open()) {
                 size_t rlen = room_name.size();
                 size_t klen = despised_key.size();
@@ -232,17 +291,38 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
     if (command == "GET") {
         if (args.size() == 2) {
             const std::string& key = args[1];
-
+            // some sort of L1
+            ++global_metrics.total_gets;
             if (rooms[current_room].contains(key)) {
                 cms.record_access(key);
-
+                ++global_metrics.cache_hits;
                 Record* r = rooms[current_room][key];
+
                 if (r->expire_at > 0 && get_current_time_ms() > r->expire_at) {
                     record_pool.deallocate(r);
                     rooms[current_room].erase(key);
                     return "$-1\r\n";
                 }
                 return "$" + std::to_string(r->value.length()) + "\r\n" + r->value + "\r\n";
+            }
+
+            ++global_metrics.cache_misses;
+
+            // ram miss - L2
+            if (!disk_shield.possibly_exists(key)) {
+                ++global_metrics.bloom_prevented_disk_reads;
+                return "$-1\r\n";
+            }
+
+            std::string cold_val = read_from_cold_storage(current_room, key);
+
+            if (!cold_val.empty()) {
+                rooms[current_room][key] = record_pool.allocate(cold_val, 0);
+                cms.record_access(key);
+
+                global_metrics.keys_in_ram++;
+
+                return "$" + std::to_string(cold_val.length()) + "\r\n" + cold_val + "\r\n";
             }
             return "$-1\r\n";
         }
@@ -253,6 +333,12 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
         if (args.size() >= 3) {
             const std::string& key = args[1];
             const std::string& value = args[2];
+            global_metrics.total_sets++;
+
+            if (!rooms[current_room].contains(key)) {
+                global_metrics.keys_in_ram++;
+            }
+
             long long expire_at = 0;
 
             if (rooms[current_room].contains(key)) {

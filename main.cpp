@@ -11,6 +11,7 @@
 #include <sys/epoll.h>
 #include <mutex>
 #include <csignal>
+#include "metrics.h"
 
 using namespace std;
 
@@ -93,6 +94,7 @@ static vector<string> parse_resp(string& buffer) {
 }
 
 int main() {
+    start_prometheus_exporter(9090);
     signal(SIGPIPE, SIG_IGN);
     const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     set_nonblocking(server_fd);

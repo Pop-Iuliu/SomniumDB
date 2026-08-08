@@ -12,4 +12,7 @@ add_executable(Redis main.cpp
         pubsub.cpp
         pubsub.h
         pool_allocator.h
+        bloom_filter.h
+        metrics.h
+        metrics.cpp
 )
