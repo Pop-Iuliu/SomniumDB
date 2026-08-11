@@ -12,7 +12,7 @@
 
 DbMetrics global_metrics;
 
-void prometheus_thread(int port) {
+static void prometheus_thread(int port) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
@@ -22,14 +22,25 @@ void prometheus_thread(int port) {
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
 
-    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
-    listen(server_fd, 3);
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        std::cerr << "[Metrics] Eroare: Nu s-a putut face bind pe portul " << port << "!\n";
+        close(server_fd);
+        return;
+    }
+    if (listen(server_fd, 3) < 0) {
+        std::cerr << "[Metrics] Eroare: Nu s-a putut porni listen!\n";
+        close(server_fd);
+        return;
+    }
 
     std::cout << "[Metrics] Prometheus exporter asculta pe portul " << port << "...\n";
 
     while (true) {
         int client_socket = accept(server_fd, nullptr, nullptr);
-        if (client_socket < 0) continue;
+        if (client_socket < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
 
         char buffer[1024] = {0};
         read(client_socket, buffer, 1024);

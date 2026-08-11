@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/tiwerlol/CLionProjects/Redis/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

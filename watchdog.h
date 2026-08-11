@@ -4,7 +4,7 @@
 
 #ifndef REDIS_WATCHDOG_H
 #define REDIS_WATCHDOG_H
-#include "database.h"
+#include "src/core/database.h"
 #include <thread>
 #include <atomic>
 #include <mutex>

@@ -24,7 +24,7 @@ struct Client {
 };
 
 #include <chrono>
-#include "database.h"
+#include "src/core/database.h"
 #include "watchdog.h"
 
 namespace {

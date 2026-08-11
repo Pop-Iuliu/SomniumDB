@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/Redis.dir/main.cpp.o CMakeFiles/Redis.dir/src/core/database.cpp.o CMakeFiles/Redis.dir/watchdog.cpp.o CMakeFiles/Redis.dir/pubsub.cpp.o CMakeFiles/Redis.dir/metrics.cpp.o CMakeFiles/Redis.dir/src/storage/aof_manager.cpp.o CMakeFiles/Redis.dir/src/storage/snapshot_manager.cpp.o CMakeFiles/Redis.dir/src/storage/eviction_manager.cpp.o -o Redis
