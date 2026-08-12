@@ -1,5 +1,4 @@
-#ifndef DATABASE_H
-#define DATABASE_H
+#pragma once
 
 #include <string>
 #include <unordered_map>
@@ -50,5 +49,3 @@ public:
     void clean_expired_keys();
     void cleanup_client(int client_fd);
 };
-
-#endif

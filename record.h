@@ -1,5 +1,4 @@
-#ifndef RECORD_H
-#define RECORD_H
+#pragma once
 
 #include <string>
 
@@ -10,4 +9,3 @@ struct Record {
     Record(std::string v, const long long e) : value(std::move(v)), expire_at(e) {}
 };
 
-#endif

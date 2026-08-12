@@ -2,11 +2,7 @@
 // Created by tiwerlol on 08.08.2026.
 //
 
-#ifndef REDIS_METRICS_H
-#define REDIS_METRICS_H
-
-#ifndef METRICS_H
-#define METRICS_H
+#pragma once
 
 #include <atomic>
 #include <cstdint>
@@ -24,7 +20,3 @@ struct DbMetrics {
 extern DbMetrics global_metrics;
 
 void start_prometheus_exporter(int port = 9090);
-
-#endif
-
-#endif //REDIS_METRICS_H

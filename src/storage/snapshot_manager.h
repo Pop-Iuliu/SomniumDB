@@ -1,5 +1,4 @@
-#ifndef REDIS_SNAPSHOT_MANAGER_H
-#define REDIS_SNAPSHOT_MANAGER_H
+#pragma once
 
 #include <string>
 #include <unordered_map>
@@ -14,4 +13,3 @@ public:
     static void hibernate_room(Room& room, PoolAllocator<Record, 1024>& pool);
 };
 
-#endif //REDIS_SNAPSHOT_MANAGER_H

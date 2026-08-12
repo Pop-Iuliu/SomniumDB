@@ -2,8 +2,8 @@
 // Created by tiwerlol on 02.08.2026.
 //
 
-#ifndef REDIS_WATCHDOG_H
-#define REDIS_WATCHDOG_H
+#pragma once
+
 #include "src/core/database.h"
 #include <thread>
 #include <atomic>
@@ -23,5 +23,3 @@ public:
     void start();
     void stop();
 };
-
-#endif

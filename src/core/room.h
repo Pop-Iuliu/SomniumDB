@@ -1,5 +1,4 @@
-#ifndef REDIS_ROOM_H
-#define REDIS_ROOM_H
+#pragma once
 
 #include <string>
 #include <unordered_map>
@@ -16,4 +15,3 @@ public:
     explicit Room(std::string name) : name(std::move(name)), last_access_time(0) {}
 };
 
-#endif //REDIS_ROOM_H

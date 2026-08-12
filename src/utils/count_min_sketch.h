@@ -1,5 +1,4 @@
-#ifndef REDIS_COUNT_MIN_SKETCH_H
-#define REDIS_COUNT_MIN_SKETCH_H
+#pragma once
 
 #include <string>
 #include <cstdint>
@@ -42,4 +41,3 @@ public:
     }
 };
 
-#endif //REDIS_COUNT_MIN_SKETCH_H

@@ -111,7 +111,7 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
                 Record* r = room_ptr->keys[key];
 
                 if (r->expire_at > 0 && get_current_time_ms() > r->expire_at) {
-                    record_pool.deallocate(r);
+                    record_pool.destroy(r);
                     room_ptr->keys.erase(key);
                     return "$-1\r\n";
                 }
@@ -135,7 +135,7 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
             std::string cold_val = eviction.read_from_cold_storage(target_room, key);
 
             if (!cold_val.empty()) {
-                room_ptr->keys[key] = record_pool.allocate(cold_val, 0);
+                room_ptr->keys[key] = record_pool.construct(cold_val, 0);
                 eviction.record_access(key);
 
                 global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
@@ -170,7 +170,7 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
                 room_ptr->keys[key]->value = value;
                 room_ptr->keys[key]->expire_at = expire_at;
             } else {
-                room_ptr->keys[key] = record_pool.allocate(value, expire_at);
+                room_ptr->keys[key] = record_pool.construct(value, expire_at);
             }
 
             eviction.record_access(key);
@@ -260,7 +260,7 @@ void Database::clean_expired_keys() {
         std::lock_guard room_lock(ptr->room_mutex);
         for (auto it = ptr->keys.begin(); it != ptr->keys.end(); ) {
             if (it->second->expire_at > 0 && it->second->expire_at < now) {
-                record_pool.deallocate(it->second);
+                record_pool.destroy(it->second);
                 it = ptr->keys.erase(it);
             } else {
                 ++it;

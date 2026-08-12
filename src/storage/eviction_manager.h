@@ -1,5 +1,4 @@
-#ifndef REDIS_EVICTION_MANAGER_H
-#define REDIS_EVICTION_MANAGER_H
+#pragma once
 
 #include <string>
 #include <unordered_map>
@@ -29,4 +28,4 @@ public:
     std::string read_from_cold_storage(const std::string& room_name, const std::string& key);
 };
 
-#endif //REDIS_EVICTION_MANAGER_H
+

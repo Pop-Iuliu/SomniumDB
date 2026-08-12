@@ -1,5 +1,4 @@
-#ifndef REDIS_AOF_MANAGER_H
-#define REDIS_AOF_MANAGER_H
+#pragma once
 
 #include <string>
 #include <vector>
@@ -25,4 +24,3 @@ public:
     bool recovering() const { return is_recovering; }
 };
 
-#endif //REDIS_AOF_MANAGER_H

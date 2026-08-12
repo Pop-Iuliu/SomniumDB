@@ -1,9 +1,7 @@
 //
 // Created by tiwerlol on 08.08.2026.
 //
-
-#ifndef REDIS_BLOOM_FILTER_H
-#define REDIS_BLOOM_FILTER_H
+#pragma once
 
 #include <vector>
 #include <string>
@@ -60,5 +58,3 @@ public:
         return true;
     }
 };
-
-#endif

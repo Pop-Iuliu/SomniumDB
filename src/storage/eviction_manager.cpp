@@ -67,7 +67,7 @@ void EvictionManager::evict_despised_keys(Room& room, PoolAllocator<Record, 1024
                 cold_file.close();
             }
 
-            pool.deallocate(room.keys[despised_key]);
+            pool.destroy(room.keys[despised_key]);
             room.keys.erase(despised_key);
         } else {
             break;

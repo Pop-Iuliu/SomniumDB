@@ -26,7 +26,7 @@ void SnapshotManager::wakeup_room(Room& room, PoolAllocator<Record, 1024>& pool)
                     long long expire_at = 0;
                     file.read(reinterpret_cast<char*>(&expire_at), sizeof(expire_at));
 
-                    room.keys[key] = pool.allocate(std::move(val), expire_at);
+                    room.keys[key] = pool.construct(std::move(val), expire_at);
                 }
             }
         } catch (const std::exception& e) {
@@ -60,7 +60,7 @@ void SnapshotManager::hibernate_room(Room& room, PoolAllocator<Record, 1024>& po
 
             file.write(reinterpret_cast<const char*>(&record_ptr->expire_at), sizeof(record_ptr->expire_at));
 
-            pool.deallocate(record_ptr);
+            pool.destroy(record_ptr);
         }
         file.close();
     }
