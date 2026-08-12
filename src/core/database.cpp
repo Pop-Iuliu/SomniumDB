@@ -37,7 +37,6 @@ std::string Database::get_client_room(const int client_fd) {
     }
     return client_rooms[client_fd];
 }
-
 std::string Database::execute(const int client_fd, const std::vector<std::string>& args) {
     if (args.empty()) return "";
 
@@ -104,7 +103,7 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
         if (args.size() == 2) {
             const std::string& key = args[1];
             global_metrics.total_gets.fetch_add(1, std::memory_order_relaxed);
-            
+
             if (room_ptr->keys.contains(key)) {
                 eviction.record_access(key);
                 global_metrics.cache_hits.fetch_add(1, std::memory_order_relaxed);
@@ -139,7 +138,7 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
                 eviction.record_access(key);
 
                 global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
-                
+
                 std::string resp;
                 resp.reserve(cold_val.length() + 32);
                 resp += "$";
@@ -160,23 +159,27 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
             const std::string& value = args[2];
             global_metrics.total_sets.fetch_add(1, std::memory_order_relaxed);
 
+            const long long now_ms = get_current_time_ms();
+            const uint32_t local_node_id = 1; // ID-ul nodului curent
+            long long expire_at = 0;
+
             if (!room_ptr->keys.contains(key)) {
                 global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
-            }
-
-            long long expire_at = 0; 
-
-            if (room_ptr->keys.contains(key)) {
-                room_ptr->keys[key]->value = value;
-                room_ptr->keys[key]->expire_at = expire_at;
+                Record* new_rec = record_pool.construct(value, expire_at);
+                new_rec->timestamp_ms = now_ms;
+                new_rec->node_id = local_node_id;
+                room_ptr->keys[key] = new_rec;
             } else {
-                room_ptr->keys[key] = record_pool.construct(value, expire_at);
+                Record* r = room_ptr->keys[key];
+                // LWW CRDT Check pe scriere locala
+                r->value = value;
+                r->expire_at = expire_at;
+                r->timestamp_ms = now_ms;
+                r->node_id = local_node_id;
             }
 
             eviction.record_access(key);
-            
             aof.append(args);
-
             eviction.evict_despised_keys(*room_ptr, record_pool);
 
             return "+OK\r\n";
@@ -184,20 +187,74 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
         return "-ERR Wrong number of arguments for SET\r\n";
     }
 
+    if (command == "CRDTMERGE") {
+        if (args.size() >= 5) {
+            const std::string& key = args[1];
+            const std::string& incoming_val = args[2];
+            const uint64_t incoming_ts = std::stoull(args[3]);
+            const uint32_t incoming_node = std::stoul(args[4]);
+
+            if (room_ptr->keys.contains(key)) {
+                Record* r = room_ptr->keys[key];
+
+                auto current_state = std::tie(r->timestamp_ms, r->node_id);
+                auto incoming_state = std::tie(incoming_ts, incoming_node);
+
+                // Monotonic Join Semi-Lattice: actualizam doar daca starea e strict mai noua
+                if (incoming_state > current_state) {
+                    r->value = incoming_val;
+                    r->timestamp_ms = incoming_ts;
+                    r->node_id = incoming_node;
+                    eviction.record_access(key);
+                    aof.append(args);
+                    return "+OK (State Converged)\r\n";
+                }
+                return "+OK (Ignored Stale Write)\r\n";
+            } else {
+                // Cheie noua adusa prin reconciliere
+                Record* new_rec = record_pool.construct(incoming_val, 0);
+                new_rec->timestamp_ms = incoming_ts;
+                new_rec->node_id = incoming_node;
+
+                room_ptr->keys[key] = new_rec;
+                global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
+                eviction.record_access(key);
+                aof.append(args);
+
+                return "+OK (State Converged)\r\n";
+            }
+        }
+        return "-ERR Wrong number of arguments for CRDTMERGE\r\n";
+    }
+
+    if (command == "DEL") {
+        if (args.size() >= 2) {
+            const std::string& key = args[1];
+            if (room_ptr->keys.contains(key)) {
+                Record* r = room_ptr->keys[key];
+                record_pool.destroy(r);
+                room_ptr->keys.erase(key);
+                aof.append(args);
+                return ":1\r\n";
+            }
+            return ":0\r\n";
+        }
+        return "-ERR Wrong number of arguments for DEL\r\n";
+    }
+
     if (command == "INFO") {
         const auto now = std::chrono::steady_clock::now();
         const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
         size_t total_keys = 0;
-        
+
         std::shared_lock shared_rooms_lock(rooms_mutex);
         size_t rooms_count = rooms.size();
         for (const auto& [name, ptr] : rooms) {
-            if (name != target_room) { 
-                // lock non-active rooms safely
+            if (name != target_room) {
                 std::lock_guard r_lock(ptr->room_mutex);
                 total_keys += ptr->keys.size();
             } else {
-                total_keys += ptr->keys.size(); // target_room e deja lockat de if-ul in care suntem
+                total_keys += ptr->keys.size();
             }
         }
 

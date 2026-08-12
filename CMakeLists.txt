@@ -23,6 +23,7 @@ add_executable(Redis main.cpp
         src/storage/eviction_manager.h
         src/storage/eviction_manager.cpp
         src/utils/count_min_sketch.h
+        src/core/crdt_engine.h
 )
 
 target_link_libraries(Redis uring)
