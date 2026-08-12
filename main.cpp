@@ -8,36 +8,37 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <sys/epoll.h>
 #include <mutex>
 #include <csignal>
+#include <chrono>
+#include <sched.h>
+#include <liburing.h>
+#include <poll.h>
+
 #include "metrics.h"
+#include "src/core/database.h"
+#include "watchdog.h"
 
 using namespace std;
 
-#define MAX_EVENTS 10
 #define PORT 6379
+#define URING_ENTRIES 2048
 
 struct Client {
     int fd;
     string buffer;
 };
 
-#include <chrono>
-#include "src/core/database.h"
-#include "watchdog.h"
-
 namespace {
     struct [[maybe_unused]] DbValue {
         string data;
-        long long expire_at_ms{}; // 0 - traieste vesnic, ms pana cand moare
+        long long expire_at_ms{};
     };
 }
 
 static Database db;
 static Watchdog watchdog(db);
 
-// get time
 static long long get_now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
@@ -68,7 +69,6 @@ static vector<string> parse_resp(string& buffer) {
 
         for (int i = 0; i < num_args; i++) {
             if (pos >= buffer.length()) return {};
-
             if (buffer[pos] != '$') {
                 buffer.clear();
                 return {};
@@ -93,6 +93,33 @@ static vector<string> parse_resp(string& buffer) {
     }
 }
 
+static void adjust_thread_priority(unsigned int current_load) {
+    static bool is_high_prio = false;
+
+    if (current_load > 500 && !is_high_prio) {
+        sched_param param{};
+        param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+        if (sched_setscheduler(0, SCHED_FIFO, &param) == 0) {
+            is_high_prio = true;
+            cout << "[PRIO CLIMB] Thread promovat la SCHED_FIFO (Real-Time) datorita stresului!\n";
+        }
+    }
+    else if (current_load < 100 && is_high_prio) {
+        sched_param param{};
+        param.sched_priority = 0;
+        if (sched_setscheduler(0, SCHED_OTHER, &param) == 0) {
+            is_high_prio = false;
+            cout << "[PRIO DROP] Trafic normalizat. Revenire la SCHED_OTHER.\n";
+        }
+    }
+}
+
+static void add_poll_request(struct io_uring *ring, Client *client) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_poll_add(sqe, client->fd, POLLIN);
+    io_uring_sqe_set_data(sqe, client);
+}
+
 int main() {
     start_prometheus_exporter(9090);
     signal(SIGPIPE, SIG_IGN);
@@ -108,26 +135,32 @@ int main() {
     address.sin_port = htons(PORT);
 
     bind(server_fd, reinterpret_cast<sockaddr *>(&address), sizeof(address));
-    listen(server_fd, 10);
+    listen(server_fd, 4096);
 
-    int epoll_fd = epoll_create1(0);
+    struct io_uring ring;
+    if (io_uring_queue_init(URING_ENTRIES, &ring, 0) < 0) {
+        cerr << "Eroare la initializarea io_uring. Kernel prea vechi? :( \n";
+        return 1;
+    }
 
     auto* server_state = new Client{.fd = server_fd, .buffer = ""};
-    epoll_event event{};
-    event.events = EPOLLIN;
-    event.data.ptr = server_state;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event);
+    add_poll_request(&ring, server_state);
+    io_uring_submit(&ring);
 
-    epoll_event events[MAX_EVENTS];
-
-    cout << "Server pornit pe portul " << PORT << "...\n";
+    cout << "Server pornit (io_uring) pe portul " << PORT << "...\n";
     watchdog.start();
 
     while (true) {
-        int num_ready = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        io_uring_submit_and_wait(&ring, 1);
 
-        for (int i = 0; i < num_ready; i++) {
-            auto* current = static_cast<Client *>(events[i].data.ptr);
+        struct io_uring_cqe *cqe;
+        unsigned head;
+        unsigned count = 0;
+
+        io_uring_for_each_cqe(&ring, head, cqe) {
+            count++;
+            auto* current = static_cast<Client*>(io_uring_cqe_get_data(cqe));
+            bool keep_client = true;
 
             if (current->fd == server_fd) {
                 sockaddr_in client_addr{};
@@ -137,26 +170,22 @@ int main() {
                 if (client_fd > 0) {
                     set_nonblocking(client_fd);
                     auto* new_client = new Client{client_fd, ""};
-
-                    epoll_event c_event{};
-                    c_event.events = EPOLLIN;
-                    c_event.data.ptr = new_client;
-                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &c_event);
+                    add_poll_request(&ring, new_client);
                 }
             } else {
-                char temp_buf[1024];
+                char temp_buf[4096];
+                int bytes = read(current->fd, temp_buf, sizeof(temp_buf));
 
-                if (int bytes = read(current->fd, temp_buf, sizeof(temp_buf)); bytes <= 0) {
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current->fd, nullptr);
+                if (bytes <= 0) {
                     db.cleanup_client(current->fd);
                     close(current->fd);
                     delete current;
+                    keep_client = false;
                 } else {
                     current->buffer.append(temp_buf, bytes);
 
                     while (true) {
                         vector<string> args = parse_resp(current->buffer);
-
                         if (args.empty()) break;
 
                         string response = db.execute(current->fd, args);
@@ -164,9 +193,17 @@ int main() {
                     }
                 }
             }
+            if (keep_client) {
+                add_poll_request(&ring, current);
+            }
         }
+
+        io_uring_cq_advance(&ring, count);
+
+        adjust_thread_priority(count);
     }
 
+    io_uring_queue_exit(&ring);
     close(server_fd);
     return 0;
 }
