@@ -1,4 +1,4 @@
-# Mini-Redis
+# SomniumDB
 
 > A high-performance, asynchronous in-memory key-value store in modern C++17, powered by Linux `io_uring` and custom memory management.
 
@@ -6,7 +6,7 @@
 
 ## Overview
 
-**Mini-Redis** is a high-performance in-memory key-value store built in C++, inspired by the Redis architecture. It is engineered from the ground up to maximize throughput (**400,000+ OPS**) and minimize latency by leveraging:
+**SomniumDB** is a high-performance in-memory key-value store built in C++, inspired by the Redis architecture. It is engineered from the ground up to maximize throughput (**400,000+ OPS**) and minimize latency by leveraging:
 
 * **Kernel-level asynchronous I/O** via Linux `io_uring`.
 * **Zero-fragmentation memory management** with a custom C++ compliant pool allocator.
@@ -37,7 +37,7 @@ A multi-tiered concurrency model designed for parallel command execution:
 
 ### Intelligent Cold Storage & Tiering
 
-When RAM limits are reached, Mini-Redis seamlessly shifts cold keys to disk:
+When RAM limits are reached, SomniumDB seamlessly shifts cold keys to disk:
 
 * **CountMinSketch Algorithm:** Tracks access frequency to enforce a precise Least Frequently Used (LFU) eviction policy.
 * **Bloom Filter:** Guardrail structure that prevents costly disk reads on non-existent keys (*cache miss optimization*).
@@ -52,7 +52,7 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 ## Project Structure
 
 ```text
-mini-redis/
+SomniumDB/
 ├── src/
 │   ├── core/         # Engine orchestrator, RESP protocol parser, Room partitioning
 │   ├── storage/      # Async I/O managers (aof_manager, snapshot_manager, eviction_manager)
@@ -66,7 +66,7 @@ mini-redis/
 
 ## Monitoring Stack (Prometheus & Grafana)
 
-Mini-Redis includes a ready-to-use Docker environment for real-time observability.
+SomniumDB includes a ready-to-use Docker environment for real-time observability.
 
 ```bash
 # Spin up Prometheus & Grafana in the background
@@ -98,8 +98,8 @@ The build configuration automatically applies aggressive compiler optimizations 
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/username/mini-redis.git
-cd mini-redis
+git clone https://github.com/username/SomniumDB.git
+cd SomniumDB
 
 # 2. Create and enter build directory
 mkdir -p build && cd build
@@ -109,7 +109,7 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
 
 # 4. Launch the server
-./Redis
+./Somnium
 
 ```
 
