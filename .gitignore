@@ -1,0 +1,8 @@
+build/
+build-release/
+build-asan/
+cmake-build-*/
+.idea/
+*.bin
+appendonly.aof
+dump.json

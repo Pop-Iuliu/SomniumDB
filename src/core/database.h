@@ -58,6 +58,11 @@ public:
     void set_client_room(int client_fd, const std::string& room_name);
     std::string get_client_room(int client_fd);
 
+    // livrarea mesajelor Pub/Sub prin coada de output a serverului
+    void set_message_sink(std::function<void(int, const std::string&)> fn) {
+        pubsub.set_message_sink(std::move(fn));
+    }
+
     std::string execute(int client_fd, const std::vector<std::string>& args);
 
     void hibernate_inactive_rooms();

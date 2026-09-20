@@ -121,17 +121,21 @@ Measured head-to-head against **Redis 6.0.16** on the same machine, using `redis
 
 ### Results
 
+Measured after the S3 (nonblocking output) milestone:
+
 | Workload | Redis 6.0.16 | SomniumDB | Delta |
 | --- | --- | --- | --- |
-| SET, 50 clients | 82,850 ops/s | 80,906 ops/s | -2% (tied) |
-| GET, 50 clients | 76,923 ops/s | **147,059 ops/s** | **+91%** |
-| SET, 1 client | 27,071 ops/s | 17,800 ops/s | -34% |
-| GET, 1 client | 26,667 ops/s | 27,685 ops/s | tied |
-| SET pipelined (-P 16) | 759,636 ops/s | 19,262 ops/s | -97% |
-| GET pipelined (-P 16) | 1,190,667 ops/s | 19,419 ops/s | -98% |
-| 100k x 100B insert (deep pipeline) | 214,497 ops/s | 80,116 ops/s | -63% |
+| GET, 50 clients | 76,923 ops/s | **143,472 ops/s** | **+87%** |
+| SET, 50 clients | 82,850 ops/s | 84,246 ops/s | tied |
+| GET, 1 client | 26,667 ops/s | 23,719 ops/s | tied (RTT-bound) |
+| SET, 1 client | 27,071 ops/s | 22,361 ops/s | -17% |
+| GET pipelined (-P 16) | 1,492,537 ops/s | 568,273 ops/s | -62% |
+| SET pipelined (-P 16) | 918,018 ops/s | 259,067 ops/s | -72% |
+| 100k x 100B insert (deep pipeline) | 293,489 ops/s | 74,572 ops/s | -75% |
 | RSS for 100k keys (100B values) | +17.7 MB | +23.9 MB | +35% |
 | CRDTMERGE, 1 client pipelined | n/a | 54,227 ops/s | SomniumDB only |
+
+For history: before the queued-output milestone, pipelined throughput collapsed to ~19k ops/s (a blocked sender stalled the whole event loop); the same workload now runs 29x faster.
 
 ### Correctness under load
 
@@ -140,8 +144,8 @@ Both servers passed an independent verification probe: 10,000 unique keys writte
 ### Interpretation
 
 * **Unpipelined GET wins by ~2x.** The `io_uring` poll-read-write loop has less per-request overhead than Redis's epoll path on this kernel (6.8) and hardware. With a single connection the two are in a dead heat, so the win is specifically in the lightly-concurrent, unpipelined shape.
-* **SET carries an AOF tax.** Every append is flushed to disk on the command path, which costs ~34% at one connection. Removing this trade-off is a planned durability-policy change (batched flush or optional `fdatasync` policy).
-* **Pipelining is the current weak spot.** Bursty pipelined replies fill the socket buffer and the sender blocks in `poll(POLLOUT)`, stalling the single event loop on one client instead of serving the others. Fixing this with queued, nonblocking client output is the top item on the roadmap.
+* **SET carries an AOF tax.** Every append does a `write` + `flush` syscall on the command path, which dominates the SET-heavy pipelined numbers. Batching this behind a configurable durability policy is planned next (S5).
+* **Pipelining is fixed but not yet at parity.** Queued, nonblocking output took pipelined GET from 19k to 568k ops/s (29x). The remaining gap versus Redis comes from the per-command AOF syscall and per-command allocations in the dispatcher.
 * **Memory is the same ballpark, ~35% heavier per key**, coming from per-record CRDT metadata and pool slack.
 
 ### How to reproduce

@@ -34,9 +34,13 @@ std::string PubSubManager::publish(const std::string& channel, const std::string
         msg_resp += "$" + std::to_string(channel.length()) + "\r\n" + channel + "\r\n";
         msg_resp += "$" + std::to_string(message.length()) + "\r\n" + message + "\r\n";
 
-        // trm mesajul
-        for (const int fd : channel_subscribers[channel]) {
-            send(fd, msg_resp.c_str(), msg_resp.size(), 0);
+        // colectam fd-urile inainte de livrare: sink-ul poate deconecta un
+        // abonat lent (capul de output), iar erase-ul nu trebuie sa rupa iteratia
+        std::vector<int> targets(channel_subscribers[channel].begin(),
+                                 channel_subscribers[channel].end());
+
+        for (const int fd : targets) {
+            if (message_sink) message_sink(fd, msg_resp);
             receivers++;
         }
     }
