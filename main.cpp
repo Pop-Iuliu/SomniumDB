@@ -11,6 +11,7 @@
 #include <mutex>
 #include <csignal>
 #include <chrono>
+#include <cerrno>
 #include <sched.h>
 #include <liburing.h>
 #include <poll.h>
@@ -29,19 +30,25 @@ struct Client {
     string buffer;
 };
 
-namespace {
-    struct [[maybe_unused]] DbValue {
-        string data;
-        long long expire_at_ms{};
-    };
-}
-
 static Database db;
 static Watchdog watchdog(db);
 
-static long long get_now_ms() {
-    using namespace std::chrono;
-    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+static void send_all(const int fd, const string& data) {
+    size_t sent = 0;
+    while (sent < data.size()) {
+        const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+        if (n >= 0) {
+            sent += static_cast<size_t>(n);
+            continue;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            pollfd pfd{.fd = fd, .events = POLLOUT, .revents = 0};
+            poll(&pfd, 1, -1);
+            continue;
+        }
+        return; // clientul a disparut
+    }
 }
 
 static void set_nonblocking(const int fd) {
@@ -121,6 +128,17 @@ static void add_poll_request(struct io_uring *ring, Client *client) {
 }
 
 int main() {
+    // portul poate fi suprascris (ex: masina de dev are deja un redis pe 6379)
+    int port = PORT;
+    if (const char* env_port = getenv("REDIS_PORT"); env_port != nullptr) {
+        try {
+            port = stoi(env_port);
+        } catch (...) {
+            cerr << "REDIS_PORT invalid: " << env_port << "\n";
+            return 1;
+        }
+    }
+
     start_prometheus_exporter(9090);
     signal(SIGPIPE, SIG_IGN);
     const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -132,9 +150,13 @@ int main() {
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
+    address.sin_port = htons(static_cast<uint16_t>(port));
 
-    bind(server_fd, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+    if (bind(server_fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) {
+        cerr << "Nu pot face bind pe portul " << port << ": " << strerror(errno) << "\n";
+        close(server_fd);
+        return 1;
+    }
     listen(server_fd, 4096);
 
     struct io_uring ring;
@@ -147,7 +169,7 @@ int main() {
     add_poll_request(&ring, server_state);
     io_uring_submit(&ring);
 
-    cout << "Server pornit (io_uring) pe portul " << PORT << "...\n";
+    cout << "Server pornit (io_uring) pe portul " << port << "...\n";
     watchdog.start();
 
     while (true) {
@@ -189,7 +211,9 @@ int main() {
                         if (args.empty()) break;
 
                         string response = db.execute(current->fd, args);
-                        write(current->fd, response.c_str(), response.length());
+                        if (!response.empty()) {
+                            send_all(current->fd, response);
+                        }
                     }
                 }
             }
@@ -202,8 +226,4 @@ int main() {
 
         adjust_thread_priority(count);
     }
-
-    io_uring_queue_exit(&ring);
-    close(server_fd);
-    return 0;
 }

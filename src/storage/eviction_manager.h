@@ -1,7 +1,6 @@
 #pragma once
 
 #include <string>
-#include <unordered_map>
 #include "../../record.h"
 #include "../../pool_allocator.h"
 #include "../core/room.h"
@@ -14,7 +13,13 @@ private:
     BloomFilter disk_shield;
     const size_t MAX_KEYS_PER_ROOM = 1000000;
 
+    // reconstruieste disk shield din cold storage la restart, altfel cheile
+    // evict-uite devin pierdute (bloom gol -> GET intoarce nil fara sa caute pe disk)
+    void reload_disk_shield();
+
 public:
+    EvictionManager();
+
     void record_access(const std::string& key) {
         cms.record_access(key);
     }
@@ -27,5 +32,3 @@ public:
 
     std::string read_from_cold_storage(const std::string& room_name, const std::string& key);
 };
-
-

@@ -11,7 +11,7 @@ public:
     std::unordered_map<std::string, Record*> keys;
     std::mutex room_mutex;
     long long last_access_time;
+    bool hibernated;
 
-    explicit Room(std::string name) : name(std::move(name)), last_access_time(0) {}
+    explicit Room(std::string name) : name(std::move(name)), last_access_time(0), hibernated(false) {}
 };
-

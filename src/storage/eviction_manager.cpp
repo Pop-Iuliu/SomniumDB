@@ -6,8 +6,77 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <cstring>
 #include <fstream>
 #include <string_view>
+
+namespace {
+    // format cold storage: rlen | room | klen | key | vlen | value (append-only)
+    template <typename Fn>
+    void for_each_cold_record(const char* mapped, size_t size, Fn&& fn) {
+        size_t offset = 0;
+        auto read_size = [&](size_t& out) {
+            if (offset + sizeof(size_t) > size) return false;
+            std::memcpy(&out, mapped + offset, sizeof(size_t));
+            offset += sizeof(size_t);
+            return true;
+        };
+
+        while (offset < size) {
+            size_t rlen = 0;
+            if (!read_size(rlen) || offset + rlen + sizeof(size_t) > size) break;
+            const std::string_view room(mapped + offset, rlen);
+            offset += rlen;
+
+            size_t klen = 0;
+            if (!read_size(klen) || offset + klen + sizeof(size_t) > size) break;
+            const std::string_view key(mapped + offset, klen);
+            offset += klen;
+
+            size_t vlen = 0;
+            if (!read_size(vlen) || offset + vlen > size) break;
+            const std::string_view value(mapped + offset, vlen);
+            offset += vlen;
+
+            if (fn(room, key, value)) break;
+        }
+    }
+} // namespace
+
+EvictionManager::EvictionManager() {
+    reload_disk_shield();
+}
+
+void EvictionManager::reload_disk_shield() {
+    const int fd = open("despised_keys.bin", O_RDONLY);
+    if (fd < 0) return;
+
+    struct stat sb{};
+    if (fstat(fd, &sb) == -1 || sb.st_size == 0) {
+        close(fd);
+        return;
+    }
+
+    const auto mapped = static_cast<char*>(mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0));
+    if (mapped == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+
+    size_t restored = 0;
+    for_each_cold_record(mapped, static_cast<size_t>(sb.st_size), [&](std::string_view, std::string_view key, std::string_view) {
+        disk_shield.add(std::string(key));
+        restored++;
+        return false;
+    });
+
+    munmap(mapped, sb.st_size);
+    close(fd);
+
+    if (restored > 0) {
+        printf("Disk Shield reconstruit: %zu chei evict-uite cunoscute.\n", restored);
+    }
+}
 
 void EvictionManager::evict_despised_keys(Room& room, PoolAllocator<Record, 1024>& pool) {
     while (room.keys.size() > MAX_KEYS_PER_ROOM) {
@@ -59,12 +128,11 @@ void EvictionManager::evict_despised_keys(Room& room, PoolAllocator<Record, 1024
                 size_t vlen = room.keys[despised_key]->value.size();
 
                 cold_file.write(reinterpret_cast<const char*>(&rlen), sizeof(rlen));
-                cold_file.write(room.name.data(), rlen);
+                cold_file.write(room.name.data(), static_cast<std::streamsize>(rlen));
                 cold_file.write(reinterpret_cast<const char*>(&klen), sizeof(klen));
-                cold_file.write(despised_key.data(), klen);
+                cold_file.write(despised_key.data(), static_cast<std::streamsize>(klen));
                 cold_file.write(reinterpret_cast<const char*>(&vlen), sizeof(vlen));
-                cold_file.write(room.keys[despised_key]->value.data(), vlen);
-                cold_file.close();
+                cold_file.write(room.keys[despised_key]->value.data(), static_cast<std::streamsize>(vlen));
             }
 
             pool.destroy(room.keys[despised_key]);
@@ -91,37 +159,15 @@ std::string EvictionManager::read_from_cold_storage(const std::string& room_name
         return "";
     }
 
+    // ultima aparitie castiga: cheile re-evict-uite produc duplicate, cel mai
+    // recent append este si cea mai noua valoare
     std::string found_value;
-    size_t offset = 0;
-
-    while (offset < static_cast<size_t>(sb.st_size)) {
-        if (offset + sizeof(size_t) > sb.st_size) break;
-        size_t rlen = *reinterpret_cast<size_t*>(mapped + offset);
-        offset += sizeof(size_t);
-
-        if (offset + rlen > sb.st_size) break;
-        std::string_view current_room(mapped + offset, rlen);
-        offset += rlen;
-
-        if (offset + sizeof(size_t) > sb.st_size) break;
-        size_t klen = *reinterpret_cast<size_t*>(mapped + offset);
-        offset += sizeof(size_t);
-
-        if (offset + klen > sb.st_size) break;
-        std::string_view current_key(mapped + offset, klen);
-        offset += klen;
-
-        if (offset + sizeof(size_t) > sb.st_size) break;
-        size_t vlen = *reinterpret_cast<size_t*>(mapped + offset);
-        offset += sizeof(size_t);
-
-        if (offset + vlen > sb.st_size) break;
-
-        if (current_room == room_name && current_key == key) {
-            found_value = std::string(mapped + offset, vlen);
+    for_each_cold_record(mapped, static_cast<size_t>(sb.st_size), [&](std::string_view room, std::string_view k, std::string_view v) {
+        if (room == room_name && k == key) {
+            found_value.assign(v.begin(), v.end());
         }
-        offset += vlen;
-    }
+        return false;
+    });
 
     munmap(mapped, sb.st_size);
     close(fd);
