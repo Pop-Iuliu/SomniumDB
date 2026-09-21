@@ -1,6 +1,7 @@
 #include "database.h"
 #include "../../metrics.h"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 
 namespace {

@@ -18,10 +18,22 @@ jobs:
           cmake --version
           g++ --version
 
-      - name: Configure + build (Release)
+      - name: Configure (Release)
         run: |
           cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-release
+
+      - name: Build (Release)
+        run: |
+          set -o pipefail
+          cmake --build build-release 2>&1 | tee build.log
+
+      - name: Afiseaza erorile de build in summary
+        if: failure()
+        run: |
+          echo "## Eroare build" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -60 build.log >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Configure + build (Debug + ASan)
         run: |
