@@ -7,3 +7,6 @@ cmake-build-*/
 appendonly.aof
 dump.json
 AGENTS.md
+__pycache__/
+*.log
+*.pid

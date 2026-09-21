@@ -73,6 +73,8 @@ static void set_nonblocking(const int fd) {
 static void schedule_close(const shared_ptr<Client>& c) {
     if (c->closed) return;
     c->closed = true;
+    if (g_trace == -2 || g_trace == c->fd)
+        printf("[TRACE] fd %d CLOSE\n", c->fd);
     db.cleanup_client(c->fd);
     ::close(c->fd);
     clients.erase(c->fd);
@@ -108,22 +110,36 @@ static void submit_backlog(io_uring* ring) {
         }
         io_uring_prep_poll_add(sqe, t->client->fd, t->for_write ? POLLOUT : POLLIN);
         io_uring_sqe_set_data(sqe, t);
+        // ownership mutat in ring: ticketul e eliberat la procesarea CQE-ului
     }
     arm_backlog.resize(kept);
 }
 
+static uint64_t eventfd_drain_buffer; // buffer stabil pentru citirea eventfd-ului
+
+// listenerul NU mai foloseste poll: accept direct in ring (op blocanta,
+// CQE doar cand exista conexiune). Pollul pe socketul de listen s-a dovedit
+// fragil la kernel 6.8 in setupul asta (CQE pierdut la pornire).
 static void arm_listener(io_uring* ring) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring);
-    if (!sqe) return;
-    io_uring_prep_poll_add(sqe, g_server_fd, POLLIN);
+    if (!sqe) {
+        if (g_trace == -2) printf("[TRACE] arm_listener ESUAT (sqe null)\n");
+        return;
+    }
+    io_uring_prep_accept(sqe, g_server_fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
     io_uring_sqe_set_data(sqe, &listener_ticket);
+    const int submitted = io_uring_submit(ring);
+    if (g_trace == -2) printf("[TRACE] arm_listener submit=%d\n", submitted);
 }
 
 static void arm_eventfd(io_uring* ring) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring);
     if (!sqe) return;
-    io_uring_prep_poll_add(sqe, g_eventfd, POLLIN);
+    // read blocant in ring: CQE doar cand contorul eventfd e nenul
+    io_uring_prep_read(sqe, g_eventfd, &eventfd_drain_buffer, sizeof(eventfd_drain_buffer), 0);
     io_uring_sqe_set_data(sqe, &eventfd_ticket);
+    const int submitted = io_uring_submit(ring);
+    if (g_trace == -2) printf("[TRACE] arm_eventfd submit=%d\n", submitted);
 }
 
 // tri-state: Complete = tot a plecat; Pending = fd plin, reluam pe POLLOUT; Dead = eroare
@@ -321,10 +337,14 @@ int main() {
         }
     }
 
-    start_prometheus_exporter(9090);
+    if (getenv("SOMNIUM_NO_METRICS") == nullptr) {
+        start_prometheus_exporter(9090);
+    }
     signal(SIGPIPE, SIG_IGN);
 
     if (const char* t = getenv("SOMNIUM_TRACE_FD"); t != nullptr) g_trace = atoi(t);
+    // loguri utile in fisiere si la moarte prin semnal
+    setvbuf(stdout, nullptr, _IOLBF, 0);
 
     g_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (g_eventfd < 0) {
@@ -333,8 +353,8 @@ int main() {
     }
 
     g_server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    set_nonblocking(g_server_fd);
-
+    // listenerul RAMANE blocant: acceptul in ring e gestionat async de io-wq,
+    // iar fd nonblocking ar produce re-inarmari in ciclu fara conexiuni
     int opt = 1;
     setsockopt(g_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -365,9 +385,35 @@ int main() {
     cout << "Server pornit (io_uring) pe portul " << port << "...\n";
     watchdog.start();
 
+    bool first_wait = true; // doar prima asteptare e sensibila la CQE-uri pierdute
+
     while (true) {
         submit_backlog(&ring);
-        io_uring_submit_and_wait(&ring, 1);
+
+        int ret;
+        if (first_wait) {
+            // prima asteptare: cu timeout - pe acest kernel am vazut CQE-ul
+            // de listener pierdut la pornire (poll/accept armat corect,
+            // conexiune in coada, si totusi nimic). La timeout re-submittm.
+            __kernel_timespec wait_ts{3, 0};
+            io_uring_cqe *first_cqe = nullptr;
+            io_uring_submit(&ring);
+            ret = io_uring_wait_cqe_timeout(&ring, &first_cqe, &wait_ts);
+            if (ret == -ETIME) {
+                if (g_trace == -2) printf("[TRACE] prima asteptare timeout - resubmit armarilor\n");
+                arm_listener(&ring);
+                arm_eventfd(&ring);
+                continue;
+            }
+            first_wait = false;
+        } else {
+            ret = io_uring_submit_and_wait(&ring, 1);
+        }
+        if (ret < 0 && ret != -EINTR) {
+            cerr << "io_uring_submit_and_wait esuat: " << strerror(-ret) << "\n";
+            continue;
+        }
+        if (g_trace == -2) printf("[TRACE] submit_and_wait ret=%d\n", ret);
 
         io_uring_cqe *cqe;
         unsigned head;
@@ -376,27 +422,29 @@ int main() {
         io_uring_for_each_cqe(&ring, head, cqe) {
             count++;
             auto* ticket = static_cast<PollTicket*>(io_uring_cqe_get_data(cqe));
-            const int res = cqe->res;
+
+            if (g_trace == -2)
+                printf("[TRACE] CQE res=%d ticket=%p\n", cqe->res, (void*)ticket);
 
             if (ticket == &listener_ticket) {
-                // acceptam toti clientii in asteptare, nu doar unul
-                while (true) {
-                    const int cfd = accept(g_server_fd, nullptr, nullptr);
-                    if (cfd < 0) break;
-                    set_nonblocking(cfd);
-                    auto c = make_shared<Client>(cfd);
-                    clients[cfd] = c;
+                const int res = cqe->res;
+                if (res >= 0) {
+                    if (g_trace == -2) printf("[TRACE] accept fd %d\n", res);
+                    set_nonblocking(res); // SOCK_NONBLOCK deja; defensive
+                    auto c = make_shared<Client>(res);
+                    clients[res] = c;
                     arm_client(c, false);
+                } else if (res != -EINTR) {
+                    // accept esuat: logam si re-armam oricum, altfel serverul
+                    // nu mai accepta conexiuni niciodata
+                    printf("[TRACE] accept esuat: %d (%s)\n", res, strerror(-res));
                 }
-                arm_listener(&ring); // re-arm listener
+                arm_listener(&ring); // re-arm accept
                 continue;
             }
 
             if (ticket == &eventfd_ticket) {
-                uint64_t val = 0;
-                const ssize_t drained = read(g_eventfd, &val, sizeof(val)); // scurge semnalul
-                (void)drained;
-                arm_eventfd(&ring);
+                arm_eventfd(&ring); // re-arm read, apoi pomparea
                 pump_work();
                 continue;
             }

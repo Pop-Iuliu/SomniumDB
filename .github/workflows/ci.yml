@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instaleaza dependente
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev
+
+      - name: Configure + build (Release)
+        run: |
+          cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-release
+
+      - name: Configure + build (Debug + ASan)
+        run: |
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address -g"
+          cmake --build build-asan
+
+      - name: Teste impotriva buildului ASan
+        run: tests/run_all.sh build-asan/Redis
+
+  benchmark:
+    runs-on: ubuntu-24.04
+    needs: tests
+    # benchmarkul e zgomotos pe runneri partajati: artefact informational,
+    # nu gate de CI
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instaleaza dependente
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev redis-server redis-tools
+
+      - name: Build (Release)
+        run: |
+          cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-release
+
+      - name: Benchmark SomniumDB vs Redis de referinta
+        run: |
+          redis-server --port 6399 --save "" --appendonly no --dir /tmp >/dev/null 2>&1 &
+          echo $! > /tmp/redis.pid
+          REDIS_PORT=6380 ./build-release/Redis >/tmp/somnium.log 2>&1 &
+          echo $! > /tmp/somnium.pid
+          sleep 2
+          {
+            echo "--- SomniumDB: SET/GET c=50 ---"
+            redis-benchmark -h 127.0.0.1 -p 6380 -t set,get -c 50 -n 100000 --csv
+            echo "--- SomniumDB: SET/GET c=50 pipelinat -P 16 ---"
+            redis-benchmark -h 127.0.0.1 -p 6380 -t set,get -c 50 -n 100000 -P 16 --csv
+            echo "--- Redis 6.x referinta: SET/GET c=50 ---"
+            redis-benchmark -h 127.0.0.1 -p 6399 -t set,get -c 50 -n 100000 --csv
+            echo "--- Redis 6.x referinta: SET/GET c=50 pipelinat -P 16 ---"
+            redis-benchmark -h 127.0.0.1 -p 6399 -t set,get -c 50 -n 100000 -P 16 --csv
+          } | tee bench.txt
+          kill "$(cat /tmp/somnium.pid)" "$(cat /tmp/redis.pid)" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark
+          path: bench.txt
