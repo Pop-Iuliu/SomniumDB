@@ -14,7 +14,9 @@ jobs:
       - name: Instaleaza dependente
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev
+          sudo apt-get install -y liburing-dev cmake build-essential
+          cmake --version
+          g++ --version
 
       - name: Configure + build (Release)
         run: |
@@ -41,7 +43,8 @@ jobs:
       - name: Instaleaza dependente
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev redis-server redis-tools
+          sudo apt-get install -y liburing-dev cmake build-essential redis-server redis-tools
+          cmake --version
 
       - name: Build (Release)
         run: |
