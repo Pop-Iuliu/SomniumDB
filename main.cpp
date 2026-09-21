@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <cstring>
+#include <cstdlib>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>

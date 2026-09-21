@@ -2,7 +2,7 @@
 // Created by tiwerlol on 05.08.2026.
 //
 #include "pubsub.h"
-#include <sys/socket.h>
+#include <cstdio>
 #include <iostream>
 
 std::string PubSubManager::subscribe(const int client_fd, const std::string& channel) {

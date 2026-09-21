@@ -1,5 +1,6 @@
 #include "aof_manager.h"
 #include <iostream>
+#include <iterator>
 #include <system_error>
 #include <filesystem>
 

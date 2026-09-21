@@ -1,4 +1,5 @@
 #include "watchdog.h"
+#include <chrono>
 
 Watchdog::Watchdog(Database& database) : db(database), running(false) {}
 

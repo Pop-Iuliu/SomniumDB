@@ -2,11 +2,13 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <chrono>
 #include <mutex>
 #include <shared_mutex>
 #include <memory>
 #include <atomic>
+#include <functional>
 #include "../../pubsub.h"
 #include "../../pool_allocator.h"
 #include "../storage/aof_manager.h"
