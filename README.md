@@ -6,7 +6,7 @@
 
 ## Overview
 
-**SomniumDB** is a high-performance in-memory key-value store built in C++, inspired by the Redis architecture. It is engineered from the ground up to maximize throughput (**147,000+ unpipelined GET ops/s**, see Benchmarks) and minimize latency by leveraging:
+**SomniumDB** is a high-performance in-memory key-value store built in C++, inspired by the Redis architecture. It is engineered from the ground up to maximize throughput (**140,000+ unpipelined GET ops/s**, see Benchmarks) and minimize latency by leveraging:
 
 * **Kernel-level asynchronous I/O** via Linux `io_uring`.
 * **Zero-fragmentation memory management** with a custom C++ compliant pool allocator.
@@ -117,25 +117,25 @@ make -j$(nproc)
 
 ## Benchmarks
 
-Measured head-to-head against **Redis 6.0.16** on the same machine, using `redis-benchmark` (100,000 operations per test). The reference Redis ran as a dedicated instance (empty dataset, no persistence), and SomniumDB ran in Release mode with a clean data directory.
+Measured head-to-head against **Redis 6.0.16** on the same machine, using `redis-benchmark` (100,000 operations per test). The reference Redis ran as a dedicated instance (empty dataset, no persistence), and SomniumDB ran in Release mode with a clean data directory and the default `SOMNIUM_AOF_SYNC=everysec` durability policy.
 
 ### Results
 
-Measured after the S3 (nonblocking output) milestone:
+Measured after the S5 (persistence contracts) milestone. Both servers measured back to back in the same session:
 
 | Workload | Redis 6.0.16 | SomniumDB | Delta |
 | --- | --- | --- | --- |
-| GET, 50 clients | 76,923 ops/s | **143,472 ops/s** | **+87%** |
-| SET, 50 clients | 82,850 ops/s | 84,246 ops/s | tied |
-| GET, 1 client | 26,667 ops/s | 23,719 ops/s | tied (RTT-bound) |
-| SET, 1 client | 27,071 ops/s | 22,361 ops/s | -17% |
-| GET pipelined (-P 16) | 1,492,537 ops/s | 568,273 ops/s | -62% |
-| SET pipelined (-P 16) | 918,018 ops/s | 259,067 ops/s | -72% |
-| 100k x 100B insert (deep pipeline) | 293,489 ops/s | 74,572 ops/s | -75% |
-| RSS for 100k keys (100B values) | +17.7 MB | +23.9 MB | +35% |
-| CRDTMERGE, 1 client pipelined | n/a | 54,227 ops/s | SomniumDB only |
+| GET, 50 clients | 79,365 ops/s | **141,044 ops/s** | **+78%** |
+| SET, 50 clients | 77,700 ops/s | **110,375 ops/s** | **+42%** |
+| GET, 1 client | 22,957 ops/s | 25,733 ops/s | +12% |
+| SET, 1 client | 27,609 ops/s | 24,015 ops/s | -13% |
+| GET pipelined (-P 16) | 980,392 ops/s | **1,137,273 ops/s** | **+16%** |
+| SET pipelined (-P 16) | 676,216 ops/s | 689,655 ops/s | +2% (parity) |
+| 100k x 100B insert (deep pipeline) | 1,089,913 ops/s | 564,972 ops/s | -48% |
+| RSS for 63k keys (100B values) | +13 MB | +17 MB | +29% |
+| CRDTMERGE, 1 client pipelined | n/a | 263,158 ops/s | SomniumDB only |
 
-For history: before the queued-output milestone, pipelined throughput collapsed to ~19k ops/s (a blocked sender stalled the whole event loop); the same workload now runs 29x faster.
+For history: before the queued-output milestone, pipelined throughput collapsed to ~19k ops/s (a blocked sender stalled the whole event loop); the same workload now runs over 50x faster. The S5 milestone also removed the SET handicap — the per-command AOF append became a single POSIX `write()` and the `everysec` fsync moved off the command thread onto the watchdog.
 
 ### Correctness under load
 
@@ -143,10 +143,10 @@ Both servers passed an independent verification probe: 10,000 unique keys writte
 
 ### Interpretation
 
-* **Unpipelined GET wins by ~2x.** The `io_uring` poll-read-write loop has less per-request overhead than Redis's epoll path on this kernel (6.8) and hardware. With a single connection the two are in a dead heat, so the win is specifically in the lightly-concurrent, unpipelined shape.
-* **SET carries an AOF tax.** Every append does a `write` + `flush` syscall on the command path, which dominates the SET-heavy pipelined numbers. Batching this behind a configurable durability policy is planned next (S5).
-* **Pipelining is fixed but not yet at parity.** Queued, nonblocking output took pipelined GET from 19k to 568k ops/s (29x). The remaining gap versus Redis comes from the per-command AOF syscall and per-command allocations in the dispatcher.
-* **Memory is the same ballpark, ~35% heavier per key**, coming from per-record CRDT metadata and pool slack.
+* **Unpipelined GET wins by ~1.8x.** The `io_uring` poll-read-write loop has less per-request overhead than Redis's epoll path on this kernel (6.8) and hardware.
+* **SET is no longer taxed.** With the AOF write reduced to one syscall per record and durability fsyncs running on the watchdog thread (policy `everysec`), SET outperforms Redis unpipelined and reaches pipelined parity. Choose `SOMNIUM_AOF_SYNC=always` when durability must cover power loss on every acknowledged write (throughput drops accordingly); `no` for maximum speed when only crash-safety against process death is needed.
+* **Deep pipelines with large values still trail ~2x.** The remaining gap comes from per-command allocations and RESP parsing in the dispatcher, not from persistence.
+* **Memory is +29% per key**, coming from per-record CRDT metadata and pool slack.
 
 ### How to reproduce
 
@@ -154,10 +154,11 @@ Both servers passed an independent verification probe: 10,000 unique keys writte
 # SomniumDB in Release mode on a free port (REDIS_PORT overrides the default 6379)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release
-REDIS_PORT=6380 ./build-release/Redis
+mkdir -p /tmp/somnium-bench && cd /tmp/somnium-bench
+REDIS_PORT=6380 SOMNIUM_NO_METRICS=1 /path/to/build-release/Redis &
 
 # Dedicated reference Redis (does not touch any system instance)
-redis-server --port 6399 --save "" --appendonly no --dir /tmp/somnium-bench
+redis-server --port 6399 --save "" --appendonly no --dir /tmp/somnium-bench2 &
 
 # Run the same matrix
 redis-benchmark -h 127.0.0.1 -p 6399 -t set,get -c 50 -n 100000 --csv
@@ -166,6 +167,11 @@ redis-benchmark -h 127.0.0.1 -p 6399 -t set,get -c 1  -n 50000 --csv
 redis-benchmark -h 127.0.0.1 -p 6380 -t set,get -c 1  -n 50000 --csv
 redis-benchmark -h 127.0.0.1 -p 6399 -t set,get -c 50 -n 100000 -P 16 --csv
 redis-benchmark -h 127.0.0.1 -p 6380 -t set,get -c 50 -n 100000 -P 16 --csv
+
+# Deep pipeline with 100B values over a random 100k keyspace (also used for the RSS delta:
+# measure VmRSS of each server before/after; -r makes the keys distinct)
+redis-benchmark -h 127.0.0.1 -p 6399 -t set -c 50 -n 100000 -d 100 -r 100000 --csv
+redis-benchmark -h 127.0.0.1 -p 6380 -t set -c 50 -n 100000 -d 100 -r 100000 --csv
 ```
 
 Numbers vary across machines, kernels, and virtualization. The meaningful comparison is relative behavior between the two servers on identical hardware, run back to back.
