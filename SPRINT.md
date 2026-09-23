@@ -102,6 +102,8 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 ## S5 - Calcaneoscaphoid: Strengthen the Joint
 
+**Status: DONE.** Implemented and verified. The AOF is now format v3: a RESP header (`SOMNIUM-AOF` / `3`) followed by records that carry the room, the command and the resulting mutation metadata (`SOMNIUM-META` + expire + CRDT timestamp + node). Recovery is strict: the last fully valid byte offset is tracked; an incomplete final record (crash mid-write) is truncated exactly there, while mid-file corruption preserves the whole file renamed `.corrupt.<ts>` for diagnosis and reserializes the replayed state. Legacy v1 (command-only) and v2 (room-prefixed) files are detected once per file at the first record and migrated to v3 by serializing the replayed RAM state through a temp file + fsync + atomic rename; a room literally named `SET` round-trips because format detection no longer guesses per command. Snapshots load into temporary state and replace live records only after full validation (explicit version check, bounds-checked lengths); corrupt snapshots are preserved, never silently deleted. Hibernation returns explicit success/failure and releases records only after write+fsync+close+checked-rename all succeed. Durability policy via `SOMNIUM_AOF_SYNC` (`always`/`everysec` default/`no`); everysec fsyncs from the watchdog thread so the command thread never blocks on fdatasync. AOF replay applies stored metadata verbatim - replayed SETs keep their original CRDT timestamps, so local SET vs remote CRDTMERGE resolves identically after restart. Recovery also bypasses the active-room budget so history with more than 3 rooms is never dropped. Verified by a 76-point per-byte truncation sweep, v1/v2 migration round-trips, mid-file corruption preservation, injected write/rename failures (room stays active and readable), corrupted-magic/version/truncated snapshot preservation, CRDT ordering across restart, and recovery past the 3-room budget; suite green under AddressSanitizer.
+
 **Inspiration:** A load-bearing connection becomes a reliable contract between in-memory mutations and their persistent representation.
 
 **Why now:** AOF recovery drops the command token from legacy entries and can truncate inside an incomplete record. Snapshots free records after an unchecked rename, and reads can delete a corrupt snapshot. New SET timestamps during replay can also change CRDT ordering.
@@ -123,7 +125,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 ## Execution and completion
 
-- Start with S5's storage contracts and regression fixtures, then S4 and S1. Build S2 on the resulting record/expiry semantics. S3 is independent of the storage work.
+- ~~Start with S5's storage contracts and regression fixtures~~ (S5 DONE), then S4 and S1. Build S2 on the resulting record/expiry semantics. S3 is independent of the storage work.
 - Each ticket includes its acceptance tests and documentation in its implementation change.
 - Integration tests use a fresh temporary data directory, an explicitly selected free port, and verification that the launched process owns the endpoint. Development data and an existing Redis service are not test fixtures.
 - Add the regression suite to CTest and run it from a clean build. Record benchmark conditions for the slow-client and compaction demonstrations.

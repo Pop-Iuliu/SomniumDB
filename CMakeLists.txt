@@ -18,6 +18,7 @@ add_executable(Redis main.cpp
         metrics.cpp
         src/storage/aof_manager.h
         src/storage/aof_manager.cpp
+        src/storage/fs_util.h
         src/storage/snapshot_manager.h
         src/storage/snapshot_manager.cpp
         src/storage/eviction_manager.h
@@ -26,3 +27,8 @@ add_executable(Redis main.cpp
 )
 
 target_link_libraries(Redis uring)
+
+enable_testing()
+add_test(NAME somnium_suite
+         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/run_all.sh $<TARGET_FILE:Redis>)
+set_tests_properties(somnium_suite PROPERTIES TIMEOUT 900)

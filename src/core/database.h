@@ -39,11 +39,20 @@ private:
     AOFManager aof;
     EvictionManager eviction;
 
-    // intoarce nullptr daca s-a atins limita de camere active
-    std::shared_ptr<Room> get_or_create_room(const std::string& name);
+    // intoarce nullptr daca s-a atins limita de camere active (bypass la
+    // recovery: redarea nu trebuie sa piarda camere doar din cauza bugetului)
+    std::shared_ptr<Room> get_or_create_room(const std::string& name, bool allow_over_budget = false);
 
     // dispecerarea lock-uita pe camera; folosita si de replay-ul AOF
     std::string execute_in_room(const std::string& room_name, const std::vector<std::string>& args);
+
+    // replay verbatim al unei mutatii persistate: aplica starea rezultata
+    // (valoare, expirare, versiune CRDT) asa cum a fost serializata, fara sa
+    // regenereze timestampuri sau sa re-evalueze comanda
+    void replay_record(const AofRecord& rec);
+
+    // migrarea fisierelor AOF vechi (v1/v2) sau corupte catre formatul v3
+    void migrate_aof_to_v3();
 
     std::string handle_get(const std::string& room_name, Room& room, const std::vector<std::string>& args);
     std::string handle_set(const std::string& room_name, Room& room, const std::vector<std::string>& args);
@@ -66,6 +75,9 @@ public:
     }
 
     std::string execute(int client_fd, const std::vector<std::string>& args);
+
+    // sincronizare AOF granulata (politica everysec); apelata de watchdog
+    void sync_aof_if_due() { aof.sync_if_due(); }
 
     void hibernate_inactive_rooms();
     void clean_expired_keys();

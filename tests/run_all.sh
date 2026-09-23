@@ -15,6 +15,7 @@ sleep 0.3
 # o rezolva, deci o suita pica => o mai rulam o data inainte sa declaram FAIL.
 run_suite() {
     python3 tests/smoke_test.py
+    python3 tests/s5_test.py
     python3 tests/s3_test.py
     python3 tests/hib_test.py
 }

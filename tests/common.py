@@ -15,7 +15,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 class Server:
     """Cicleaza de viata al serverului intr-un director de date curat."""
 
-    def __init__(self, bin_path=None, port=None):
+    def __init__(self, bin_path=None, port=None, env_extra=None, keep_dir_on_retry=False):
         self.bin = os.path.abspath(
             bin_path
             or os.environ.get("SOMNIUM_BIN")
@@ -25,6 +25,10 @@ class Server:
         self.workdir = tempfile.mkdtemp(prefix="somnium-test-")
         self.proc = None
         self._log = None
+        self.env_extra = dict(env_extra or {})
+        # testele care insamneaza fisiere in director NU trebuie sa-si piarda
+        # datele la o reincercare de start (flake-ul io_uring)
+        self.keep_dir_on_retry = keep_dir_on_retry
 
     def start(self, retries=3):
         """Porneste serverul; reuse pana la `retries` incercari.
@@ -36,7 +40,21 @@ class Server:
         """
         last_err = None
         for attempt in range(retries):
-            env = dict(os.environ, REDIS_PORT=str(self.port))
+            # portul trebuie sa fie legabil efectiv: un server "flaked" dar in
+            # viu de la o incercare anterioara il poate tine ocupat (bind esuat
+            # => proces mort inca de la start => conexiuni refuzate)
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                probe = socket.socket()
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    probe.bind(("0.0.0.0", self.port))
+                    probe.close()
+                    break
+                except OSError:
+                    probe.close()
+                    time.sleep(0.1)
+            env = dict(os.environ, REDIS_PORT=str(self.port), **self.env_extra)
             self._log = open(os.path.join(self.workdir, f"server.{attempt}.log"), "wb")
             self.proc = subprocess.Popen(
                 [self.bin], cwd=self.workdir, env=env,
@@ -48,16 +66,24 @@ class Server:
             except (RuntimeError, OSError) as e:
                 last_err = e
                 self.stop()
-                # director curat pentru urmatoarea incercare
-                shutil.rmtree(self.workdir, ignore_errors=True)
-                os.makedirs(self.workdir, exist_ok=True)
+                # director curat pentru urmatoarea incercare (exceptie: testele
+                # cu fisiere insamnate manual pastreaza directorul)
+                if not self.keep_dir_on_retry:
+                    shutil.rmtree(self.workdir, ignore_errors=True)
+                    os.makedirs(self.workdir, exist_ok=True)
         raise RuntimeError(f"serverul nu a pornit dupa {retries} incercari: {last_err}")
 
     def wait_port_free(self, timeout=5.0):
-        """Asteapta ca portul sa fie eliberat efectiv (socketul vechi inchis)."""
+        """Asteapta ca portul sa fie eliberat efectiv (socketul vechi inchis).
+
+        Sonda prinde SO_REUSEADDR: starea TIME_WAIT lasata in urma conexiunilor
+        ucise (flake-ul io_uring) nu blocheaza bind-ul unui listener nou, deci
+        nu trebuie sa blocheze nici sonda.
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             probe = socket.socket()
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind(("0.0.0.0", self.port))
                 probe.close()
