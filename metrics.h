@@ -17,6 +17,8 @@ struct DbMetrics {
     std::atomic<uint64_t> cold_file_bytes{0};
     std::atomic<uint64_t> cold_obsolete_bytes{0};
     std::atomic<uint64_t> cold_reclaimed_bytes{0};
+    std::atomic<uint64_t> aof_bytes{0};
+    std::atomic<uint64_t> aof_base_bytes{0};
 };
 
 extern DbMetrics global_metrics;

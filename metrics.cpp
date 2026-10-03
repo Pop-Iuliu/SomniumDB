@@ -71,7 +71,13 @@ static void prometheus_thread(int port) {
             "db_cold_obsolete_bytes " + std::to_string(global_metrics.cold_obsolete_bytes.load()) + "\n"
             "# HELP db_cold_reclaimed_bytes Total bytes reclaimed by cold storage compaction\n"
             "# TYPE db_cold_reclaimed_bytes counter\n"
-            "db_cold_reclaimed_bytes " + std::to_string(global_metrics.cold_reclaimed_bytes.load()) + "\n";
+            "db_cold_reclaimed_bytes " + std::to_string(global_metrics.cold_reclaimed_bytes.load()) + "\n"
+            "# HELP db_aof_bytes Current size of the append-only file\n"
+            "# TYPE db_aof_bytes gauge\n"
+            "db_aof_bytes " + std::to_string(global_metrics.aof_bytes.load()) + "\n"
+            "# HELP db_aof_base_bytes AOF size after the last rewrite (or at startup)\n"
+            "# TYPE db_aof_base_bytes gauge\n"
+            "db_aof_base_bytes " + std::to_string(global_metrics.aof_base_bytes.load()) + "\n";
 
         std::string response =
             "HTTP/1.1 200 OK\r\n"

@@ -19,6 +19,12 @@ public:
     // sa ramana pentru diagnostic.
     static bool wakeup_room(Room& room, PoolAllocator<Record, 1024>& pool);
 
+    // true doar pentru un fisier REGULAR de snapshot (stat ieftin, nu citeste datele)
+    static bool has_snapshot(const std::string& room_name);
+
+    // sterge snapshot-ul unei camere a carei stare traieste in RAM si in AOF
+    static void discard(const std::string& room_name);
+
     // true = snapshot validat (write+fsync+close+rename) si inregistrarile
     // eliberate. false = persistenta a esuat: inregistrarile raman in RAM.
     // Starea camerei o gestioneaza apelantul (Database).

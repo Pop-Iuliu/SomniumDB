@@ -123,6 +123,19 @@ std::optional<Record> EvictionManager::take(const std::string& room_name, const 
     return decode(raw);
 }
 
+bool EvictionManager::for_each(
+    const std::function<void(const std::string& room, const std::string& key, const Record&)>& fn) const {
+    std::string raw;
+    for (const auto& [room_name, keys] : index) {
+        for (const auto& [key, ref] : keys) {
+            raw.resize(ref.len);
+            if (!fsutil::pread_all(fd, raw.data(), raw.size(), static_cast<off_t>(ref.off))) return false;
+            fn(room_name, key, decode(raw));
+        }
+    }
+    return true;
+}
+
 long long EvictionManager::compact(const long long now_ms) {
     const int out = ::open(kColdTmp, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0644);
     if (out < 0) {

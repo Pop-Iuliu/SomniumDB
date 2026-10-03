@@ -56,15 +56,23 @@ public:
     bool append(const std::string& room_name, const std::vector<std::string>& args,
                 long long expire_at, uint64_t timestamp_ms, uint32_t node_id);
 
-    // Migrare explicita v1/v2 -> v3: starea actuala (redata deja in RAM) se
-    // serialaza intr-un fisier temporar si se substituie atomic celui vechi.
-    // Esuarea in orice punct lasa fisierul vechi neatins.
+    // Rescriere (si migrare v1/v2 -> v3): starea curenta se serializeaza intr-un
+    // fisier temporar si se substituie atomic celui vechi. Esuarea in orice punct
+    // lasa fisierul vechi in uz.
     bool start_rewrite();
     bool append_rewrite(const AofRecord& rec);
     bool commit_rewrite();
     void abort_rewrite();
     // true daca fisierul redat nu era v3 (sau era corupt): necesita reserializare
     bool needs_rewrite() const { return needs_rewrite_; }
+
+    // rescriere automata: AOF-ul s-a dublat fata de dimensiunea de dupa ultima
+    // rescriere si a trecut de SOMNIUM_AOF_REWRITE_MIN_BYTES (implicit 64 MB).
+    // Fiecare incercare reseteaza baza, deci un esec nu se reia la fiecare comanda.
+    bool rewrite_due() const {
+        const uint64_t size = size_.load(std::memory_order_relaxed);
+        return size >= rewrite_min_ && size >= 2 * base_size_.load(std::memory_order_relaxed);
+    }
 
     // Sincronizare granulata pentru politica everysec; apelata din watchdog
     // (thread-ul de comenzi nu blocheaza niciodata pe fdatasync).
@@ -83,6 +91,12 @@ private:
     std::atomic<long long> last_sync_ms_{0};
     std::atomic<bool> healthy_{true}; // citit fara mutex de thread-ul de comenzi
     bool needs_rewrite_ = false;
+    std::atomic<uint64_t> size_{0};      // octetii fisierului curent
+    std::atomic<uint64_t> base_size_{0}; // dimensiunea dupa ultima rescriere (sau la pornire)
+    uint64_t rewrite_bytes_ = 0;         // octetii scrisi in fisierul temporar
+    uint64_t rewrite_min_ = 64ull << 20;
+
+    void publish_sizes() const;
     bool replaying_ = true;
 
     static std::string encode_record(const AofRecord& rec);

@@ -61,8 +61,8 @@ private:
     // regenereze timestampuri sau sa re-evalueze comanda
     void replay_record(const AofRecord& rec);
 
-    // migrarea fisierelor AOF vechi (v1/v2) sau corupte catre formatul v3
-    void migrate_aof_to_v3();
+    // AOF rescris ca stare curenta; folosit si pentru migrarea v1/v2 -> v3
+    bool rewrite_aof();
 
     // cheia logica: RAM, apoi cold storage (reincarcata in RAM); cheile expirate
     // conteaza ca absente. nullptr = cheia nu exista.
