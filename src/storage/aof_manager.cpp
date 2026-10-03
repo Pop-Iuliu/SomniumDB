@@ -1,5 +1,6 @@
 #include "aof_manager.h"
 #include "fs_util.h"
+#include "../core/resp.h"
 #include <cstdio>
 #include <cerrno>
 #include <cstdlib>
@@ -115,47 +116,6 @@ std::string AOFManager::encode_record(const AofRecord& rec) {
     bulk(std::to_string(rec.timestamp_ms));
     bulk(std::to_string(rec.node_id));
     return out;
-}
-
-AOFManager::ParseStatus AOFManager::parse_resp_array(const std::string& buf, const size_t pos,
-                                                     size_t* rec_end, std::vector<std::string>* tokens) {
-    size_t p = pos;
-    if (p >= buf.size()) return ParseStatus::NeedMore;
-    if (buf[p] != '*') return ParseStatus::Malformed;
-
-    const size_t hdr = buf.find("\r\n", p);
-    if (hdr == std::string::npos) return ParseStatus::NeedMore;
-
-    uint64_t count = 0;
-    if (!fsutil::parse_u64(buf.substr(p + 1, hdr - p - 1), &count) || count == 0 || count > 1000000) {
-        return ParseStatus::Malformed;
-    }
-    p = hdr + 2;
-
-    tokens->clear();
-    tokens->reserve(static_cast<size_t>(count));
-
-    for (uint64_t i = 0; i < count; ++i) {
-        if (p >= buf.size()) return ParseStatus::NeedMore;
-        if (buf[p] != '$') return ParseStatus::Malformed;
-
-        const size_t len_end = buf.find("\r\n", p);
-        if (len_end == std::string::npos) return ParseStatus::NeedMore;
-
-        uint64_t len = 0;
-        if (!fsutil::parse_u64(buf.substr(p + 1, len_end - p - 1), &len) || len > (1ull << 32)) {
-            return ParseStatus::Malformed;
-        }
-        p = len_end + 2;
-        // niciodata alocam inainte sa stim ca bytes exista in buffer
-        if (p + len + 2 > buf.size()) return ParseStatus::NeedMore;
-
-        tokens->emplace_back(buf, p, static_cast<size_t>(len));
-        p += len + 2;
-    }
-
-    *rec_end = p;
-    return ParseStatus::Complete;
 }
 
 bool AOFManager::sync_locked(const int fd) {
@@ -326,16 +286,16 @@ void AOFManager::recover(const std::function<void(const AofRecord&)>& replay) {
     while (true) {
         std::vector<std::string> tokens;
         size_t rec_end = 0;
-        ParseStatus st;
-        while ((st = parse_resp_array(buf, pos, &rec_end, &tokens)) == ParseStatus::NeedMore) {
+        resp::Status st;
+        while ((st = resp::parse(buf, pos, &rec_end, &tokens)) == resp::Status::NeedMore) {
             if (!fill()) break; // EOF in mijlocul unei inregistrari
         }
 
-        if (st == ParseStatus::NeedMore) {
+        if (st == resp::Status::NeedMore) {
             if (pos < buf.size()) truncate_tail(compacted + pos);
             break; // istoricul complet ramane neatins
         }
-        if (st == ParseStatus::Malformed) {
+        if (st == resp::Status::Malformed) {
             preserve_as_corrupt("inregistrare malformata");
             break;
         }

@@ -2,7 +2,7 @@
 
 **Goal:** Make SomniumDB more dependable under storage churn, room switching, and slow clients, while adding useful command features.
 
-**Status:** Planned. These are five implementation tickets, each inspired by one supplied word.
+**Status:** S3 and S5 done; S1, S2 and S4 implemented, awaiting CI verification. These are five implementation tickets, each inspired by one supplied word.
 
 **Planning target:** One two-week sprint. Size the tickets against available capacity at kickoff; completion means meeting the acceptance checks below.
 
@@ -136,3 +136,129 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 - Integration tests use a fresh temporary data directory, an explicitly selected free port, and verification that the launched process owns the endpoint. Development data and an existing Redis service are not test fixtures.
 - Add the regression suite to CTest and run it from a clean build. Record benchmark conditions for the slow-client and compaction demonstrations.
 - Sprint demo: create an expiring key in one room, switch rooms, exercise cold storage and hibernation, stall a subscriber, restart, and show correct values, deadlines, room states, and reclaimed disk space.
+
+---
+
+# Sprint 2: Odd Words, Fewer Ceilings
+
+**Goal:** Remove the remaining hard ceilings: inputs that can kill the server, clients that cannot connect, a log that grows forever, memory that no budget actually bounds, and a CRDT that never leaves its node.
+
+**Status:** Planned. Five tickets, each inspired by one supplied word.
+
+**Planning target:** One two-week sprint for S6 to S9; S10 may spill into the next one. Completion means meeting the acceptance checks below.
+
+| ID | Inspiration | Deliverable | Priority | Depends on |
+| --- | --- | --- | --- | --- |
+| S6 | hyaenanche | Linear, hardened RESP parser and deadlock-free Pub/Sub | P0 | None |
+| S7 | catholicized | Redis client compatibility | P1 | S6 |
+| S8 | rebag | AOF rewrite as current state | P1 | S1, S4 |
+| S9 | scolog | Byte-based memory budget | P1 | S1, S4 |
+| S10 | koreish | Batched CRDT replication between nodes | P2 | S6, S8 |
+
+P0 fixes failures that can take the server down. P1 removes ceilings on adoption, disk and memory. P2 builds the differentiating feature on top.
+
+## S6 - Hyaenanche: Poison for Scavengers
+
+**Status: IMPLEMENTED, awaiting CI verification.** The AOF already had a correct offset-based RESP parser, so it moved to `src/core/resp.h` and now serves both the network and AOF recovery: integers via `std::from_chars` (no temporary strings), header scan bounded to 32 bytes, CRLF checked after every bulk, limits of 1M arguments and 512 MB per bulk. The event loop parses from an offset and erases consumed input once per batch, so a deep pipeline is linear instead of quadratic. Malformed input gets `-ERR Protocol error` and closes only that connection; replies to the commands before it are still sent. `publish()` copies the subscriber list under the lock and delivers after releasing it, so disconnecting a subscriber during delivery can no longer self-deadlock. Tests: `tests/resp_test.cpp` (every prefix of a command waits for more bytes, malformed cases, pipelined offsets; run by `run_all.sh`), `tests/s6_test.py` (protocol errors, byte-by-byte delivery, a subscriber pushed past the 32 MB cap). The CI benchmark job now also records a 100-byte SET at `-P 64` for both servers; the before/after gap is not measured yet.
+
+**Inspiration:** A plant whose fruit was used to poison hyenas becomes a defense against the inputs and clients that can bring the server down.
+
+**Why now:** `parse_resp()` erases consumed bytes from the front of the input buffer after every command, so a deep pipeline (the buffer may reach 128 MB) costs quadratic copying; this is the likely cause of the 2x gap on the deep-pipeline insert benchmark. Lengths go through `stoi(substr(...))`: `$-1` wraps to a huge `size_t` and silently corrupts the stream, and a length near `INT_MAX` overflows. Separately, `PubSubManager::publish()` holds `ps_mutex` while delivering; disconnecting a slow or dead subscriber during delivery calls `remove_client()`, which locks the same mutex on the same thread and hangs the whole server.
+
+**Deliver:**
+- Parse from a read offset and erase consumed input once per batch. Parse integers with `std::from_chars`, without temporary strings.
+- Reject malformed multibulk input (negative or oversized counts and lengths, a wrong type prefix, a bulk without its trailing CRLF) with `-ERR Protocol error` and close the connection, instead of silently clearing the buffer.
+- In `publish()`, collect the subscriber targets under the lock and deliver after releasing it.
+
+**Acceptance checks:**
+- The deep-pipeline insert benchmark (100k x 100B, README conditions) is recorded before and after, and the gap to Redis shrinks.
+- `$-1`, `$99999999999`, `*-1` and a bulk missing its CRLF each produce a protocol error and a closed connection, while other clients keep being served.
+- A command split at every byte boundary across reads parses exactly once.
+- A subscriber pushed past the output cap, and one whose socket resets mid-PUBLISH, are disconnected without hanging the publisher. Bounded test, AddressSanitizer clean.
+
+**Primary files:** `main.cpp`, `pubsub.*`.
+
+## S7 - Catholicized: Every Client Welcome
+
+**Inspiration:** Made universal: any Redis client, tool or library should work unmodified.
+
+**Why now:** `COMMAND` and `HELLO` return empty arrays, input that does not start with `*` is dropped, and `PING`, `EXISTS`, `MGET`, `MSET`, `EXPIRE` and `UNSUBSCRIBE` are missing. `redis-benchmark` can only run its SET/GET tests, and a subscribed client can never leave subscribe mode.
+
+**Deliver:**
+- Inline commands (one line split on spaces) next to RESP multibulk.
+- `PING [message]`, `ECHO`, `EXISTS key [key ...]`, `MGET`, `MSET`, `EXPIRE`/`PEXPIRE`/`PERSIST` on top of S2's absolute deadlines, `UNSUBSCRIBE [channel ...]` and `QUIT`. PING and UNSUBSCRIBE also work in subscribe mode.
+- New mutations persist their resulting state through the existing AOF meta (EXPIRE logs the absolute deadline), so replay stays verbatim.
+- Keep the if-chain dispatcher until it measurably hurts; no RESP3.
+
+**Acceptance checks:**
+- An interactive `redis-cli` session works, and `redis-benchmark -t ping,set,get,mset` runs without errors.
+- `EXPIRE` survives restart without extra lifetime; `PERSIST` removes the deadline; both are visible through `TTL`.
+- `MGET` and `EXISTS` see cold-storage keys and treat expired keys as absent.
+- A subscriber can UNSUBSCRIBE from every channel and then run normal commands.
+
+**Primary files:** `main.cpp`, `src/core/database.*`, `pubsub.*`.
+
+## S8 - Rebag: Pack the Log Again
+
+**Inspiration:** Repacking a bag becomes rewriting the append-only log as current state instead of full history.
+
+**Why now:** `appendonly.aof` only grows. Startup replays all of history, so recovery time and disk usage grow without bound, and every restart reloads every key into RAM.
+
+**Deliver:**
+- Rewrite the AOF as current state through the existing `start_rewrite` / `append_rewrite` / `commit_rewrite` path: resident keys, cold-storage keys read through the index (S1 relies on the AOF holding every key), and sleeping rooms.
+- Decide and document how sleeping rooms are handled: either serialize them (loading each snapshot under its room lock) or keep the snapshot as their base and discover snapshot-only rooms at startup.
+- `REWRITEAOF` runs on request and automatically when the AOF reaches twice its size after the last rewrite. Synchronous on the command thread first, marked as a known ceiling; a background rewrite only once that pause is measured.
+- Expose the current AOF size and the size after the last rewrite as metrics.
+
+**Acceptance checks:**
+- 10,000 overwrites of 100 keys rewrite to about 100 records; restart restores identical values, deadlines and CRDT versions.
+- Keys in cold storage and in sleeping rooms survive a rewrite followed by a restart.
+- Expired keys are not written.
+- A failure injected at create, write, sync or rename leaves the old AOF in use, and appends continue.
+
+**Primary files:** `src/storage/aof_manager.*`, `src/core/database.cpp`, `src/storage/eviction_manager.*`, `src/storage/snapshot_manager.*`.
+
+## S9 - Scolog: Rooms Pay Rent
+
+**Inspiration:** A tenant farmer paying rent for church land becomes rooms paying for RAM in bytes.
+
+**Why now:** Both budgets are counts (3 active rooms, `SOMNIUM_MAX_KEYS` keys per room) and neither bounds memory: a million 1 MB values is a terabyte.
+
+**Deliver:**
+- Track resident bytes per room (key, value and a fixed per-record overhead) at the centralized points S1 and S4 created: `lookup()`, SET/CRDTMERGE, eviction, expiry, `activate()` and `hibernate()`.
+- `SOMNIUM_MAXMEMORY` sets one global byte budget. Eviction runs while over budget; waking a room that cannot fit returns a clear error.
+- Report bytes in `ROOM.INFO`, `INFO` and the metrics exporter. An estimate is enough; no allocator-level accounting.
+
+**Acceptance checks:**
+- Writing past the budget with mixed value sizes keeps resident bytes within the budget plus one record, and every key stays readable.
+- The byte counters return to zero after deleting, expiring, evicting or hibernating everything (no drift).
+- Waking a room larger than the free budget returns an error and changes nothing.
+
+**Primary files:** `src/core/database.*`, `src/core/room.h`, `src/storage/eviction_manager.*`, `metrics.*`.
+
+## S10 - Koreish: Caravans Between Nodes
+
+**Inspiration:** The merchant caravans of the Koreish become batches of CRDT merges carried between nodes.
+
+**Why now:** CRDTMERGE is commutative and idempotent, and every AOF v3 record already carries `(timestamp, node)`, but `LOCAL_NODE_ID` is hard-coded to 1 and nothing ever leaves the node. Convergent multi-node replication is the differentiating feature, and most of its parts already exist.
+
+**Deliver:**
+- `SOMNIUM_NODE_ID` and `SOMNIUM_PEERS` (a `host:port` list).
+- On each watchdog tick, a sender reads AOF records from its saved offset and ships them to each peer as one pipelined batch of CRDTMERGE. Only records that originated on this node are shipped, so nothing echoes back. Delivery is at-least-once, and the offset persists so a restart resumes.
+- Versioned delete markers so a replicated DEL cannot be undone by a late, older merge. If they are deferred, document "writes replicate, deletes stay local" as the explicit first limit.
+- Sender offsets survive an AOF rewrite (S8).
+
+**Acceptance checks:**
+- Two nodes writing the same keys concurrently converge to identical values and versions after a quiet period.
+- Killing a peer mid-batch and restarting it still converges; duplicate deliveries change nothing.
+- Records received from a peer are never re-sent.
+- If delete markers are in scope: a DEL on one node followed by an older remote merge stays deleted on both.
+
+**Primary files:** a new replication component, `src/storage/aof_manager.*`, `src/core/database.cpp`, `watchdog.cpp`.
+
+## Sprint 2 execution and completion
+
+- Land S6 first: it removes the two server-killing failures and its parser work is where S7's inline commands live.
+- S8 and S9 are independent of each other; S10 waits for S8 because rewrites move AOF offsets.
+- Each ticket includes its acceptance tests, a line in the README command or configuration reference, and its status paragraph here.
+- Sprint demo: pipeline 100k inserts and compare with Redis, connect with `redis-cli`, rewrite a long AOF and restart instantly, fill past `SOMNIUM_MAXMEMORY`, and show two nodes converging.

@@ -18,6 +18,7 @@
 
 #include "metrics.h"
 #include "src/core/database.h"
+#include "src/core/resp.h"
 #include "watchdog.h"
 
 using namespace std;
@@ -198,26 +199,32 @@ static void queue_work() {
     }
 }
 
-static vector<string> parse_resp(string& buffer);
-
 // proceseaza comenzi buffered (pana la buget); true = mai exista input complet neprocesat
 static bool process_buffered(const shared_ptr<Client>& c) {
+    // parsam de la un offset si stergem inputul consumat o singura data pe
+    // batch: un pipeline adanc costa liniar, nu cate o copiere per comanda
     int processed = 0;
-    bool budget_hit = false;
+    size_t pos = 0;
+    vector<string> args;
+    resp::Status st = resp::Status::NeedMore;
 
-    while (true) {
-        if (processed >= MAX_COMMANDS_PER_TURN) {
-            budget_hit = !c->in_buf.empty();
-            break;
-        }
-        vector<string> args = parse_resp(c->in_buf);
-        if (args.empty()) break;
+    while (processed < MAX_COMMANDS_PER_TURN) {
+        size_t end = 0;
+        st = resp::parse(c->in_buf, pos, &end, &args);
+        if (st != resp::Status::Complete) break;
+        pos = end;
+        ++processed;
 
         const string response = db.execute(c->fd, args);
-        ++processed;
-        if (!response.empty()) {
-            if (!enqueue_output(c, response)) return false; // deconectat (cap output)
-        }
+        if (!response.empty() && !enqueue_output(c, response)) return false; // deconectat (cap output)
+    }
+    c->in_buf.erase(0, pos);
+
+    if (st == resp::Status::Malformed) {
+        // ca Redis: eroare de protocol, apoi inchidem (inputul nu mai poate fi resincronizat)
+        if (enqueue_output(c, "-ERR Protocol error\r\n")) flush_output(*c);
+        schedule_close(c);
+        return false;
     }
 
     const auto r = flush_output(*c);
@@ -228,7 +235,7 @@ static bool process_buffered(const shared_ptr<Client>& c) {
     }
 
     arm_client(c, false); // re-arm read
-    return budget_hit;
+    return processed == MAX_COMMANDS_PER_TURN && !c->in_buf.empty();
 }
 
 // citeste tot ce e disponibil; false = conexiunea s-a terminat
@@ -258,50 +265,6 @@ static void pump_work() {
     for (const auto& c : snapshot) {
         if (c->closed || c->in_buf.empty()) continue;
         if (process_buffered(c)) queue_work(); // inca mai e lucru: re-signal
-    }
-}
-
-static vector<string> parse_resp(string& buffer) {
-    vector<string> args;
-    size_t pos = 0;
-
-    if (buffer.empty()) return args;
-
-    if (buffer[0] != '*') {
-        buffer.clear();
-        return args;
-    }
-
-    size_t crlf = buffer.find("\r\n", pos);
-    if (crlf == string::npos) return args;
-
-    try {
-        const int num_args = stoi(buffer.substr(pos + 1, crlf - pos - 1));
-        pos = crlf + 2;
-
-        for (int i = 0; i < num_args; i++) {
-            if (pos >= buffer.length()) return {};
-            if (buffer[pos] != '$') {
-                buffer.clear();
-                return {};
-            }
-
-            crlf = buffer.find("\r\n", pos);
-            if (crlf == string::npos) return {};
-
-            const int len = stoi(buffer.substr(pos + 1, crlf - pos - 1));
-            pos = crlf + 2;
-
-            if (pos + len + 2 > buffer.length()) return {};
-
-            args.push_back(buffer.substr(pos, len));
-            pos += len + 2;
-        }
-        buffer.erase(0, pos);
-        return args;
-    } catch (...) {
-        buffer.clear();
-        return {};
     }
 }
 
