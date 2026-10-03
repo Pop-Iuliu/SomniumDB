@@ -19,18 +19,21 @@
 // impreuna cu inode-ul AOF-ului: o rescriere (S8) creeaza alt fisier, iar
 // atunci retrimitem de la inceput.
 //
-// Limita asumata: DEL, EXPIRE si PERSIST raman locale (nu au versiune proprie,
-// deci nu pot converge); scrierile cu valoare (SET, MSET, CRDTMERGE) se replica.
+// Se replica scrierile (SET, MSET, CRDTMERGE; EXPIRE/PERSIST se logheaza ca SET
+// versionat) si stergerile (DEL, CRDTDEL ca CRDTDEL). Dupa un batch care a ajuns
+// la capatul AOF-ului pleaca REPLFRONTIER node F: toate scrierile locale <= F
+// sunt livrate, deci peer-ul poate uita tombstone-urile mai vechi (S13).
 //
 // Indulgent (Guerraoui, PODC 2000): siguranta (convergenta) nu depinde deloc de
 // detectia defectelor, fiindca merge-urile sunt idempotente. O suspiciune falsa
 // costa doar intarziere, deci fiecare peer are thread-ul lui (un peer inaccesibil
 // nu le blocheaza pe celelalte), connect marginit in timp, backoff exponential la
-// esec si un heartbeat (PING) cand nu e nimic de trimis, din care se calculeaza phi.
+// esec si un heartbeat (REPLFRONTIER) la fiecare caravana, din care se calculeaza phi.
 class Replicator {
 public:
-    // citeste SOMNIUM_NODE_ID si SOMNIUM_PEERS ("host:port,host:port")
-    Replicator();
+    // citeste SOMNIUM_NODE_ID si SOMNIUM_PEERS ("host:port,host:port"); frontier e
+    // versiunea pana la care toate scrierile locale sunt deja in AOF (Database)
+    explicit Replicator(const std::atomic<uint64_t>& frontier);
     ~Replicator();
 
     void start(); // nu face nimic fara peers
@@ -50,6 +53,7 @@ private:
     };
 
     uint32_t node_id_ = 1;
+    const std::atomic<uint64_t>& frontier_;
     std::vector<Peer> peers_;
     std::atomic<bool> running_{false};
     std::vector<std::thread> workers_;

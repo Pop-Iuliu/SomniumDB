@@ -18,6 +18,13 @@
 #include "room.h"
 #include "hlc.h"
 
+// versiunea CRDT a unei scrieri sau stergeri: (timestamp HLC, nod), ordonata lexicografic
+struct Version {
+    uint64_t ts = 0;
+    uint32_t node = 0;
+    auto operator<=>(const Version&) const = default;
+};
+
 class Database {
 private:
     // shared_ptr ca o comanda in curs sa poata supravietuii hibernarii
@@ -37,6 +44,15 @@ private:
     static constexpr long long ROOM_IDLE_MS = 10000;
     uint32_t local_node_id = 1; // SOMNIUM_NODE_ID: versiunea CRDT a scrierilor locale
     hlc::Clock clock_;          // versiunile scrierilor locale (thread-ul de comenzi)
+
+    // S13: delete markers versionate, doar cu replicare (camera -> cheie -> versiune).
+    // Un tombstone se uita cand versiunea lui e sub watermark: minimul frontierelor
+    // primite de la toti peer-ii (Wuu & Bernstein, PODC 1984). Thread-ul de comenzi.
+    std::unordered_map<std::string, std::unordered_map<std::string, Version>> tombstones_;
+    std::unordered_map<uint32_t, uint64_t> frontiers_; // nod -> "toate scrierile mele <= F au ajuns"
+    uint64_t watermark_ = 0;
+    size_t peer_count_ = 0;                            // intrarile din SOMNIUM_PEERS
+    std::atomic<uint64_t> frontier_{0};                // frontiera locala, citita de replicator
     long long max_clock_offset_ms = 600000; // SOMNIUM_MAX_CLOCK_OFFSET_MS
 
     PubSubManager pubsub;
@@ -70,6 +86,17 @@ private:
     // cheia logica: RAM, apoi cold storage (reincarcata in RAM); cheile expirate
     // conteaza ca absente. nullptr = cheia nu exista.
     Record* lookup(const std::string& room_name, Room& room, const std::string& key);
+    // versiunea unei scrieri primite: parsare stricta, format HLC, garda de viitor;
+    // intoarce eroarea RESP sau "" la succes
+    std::string incoming_version(const std::string& ts_arg, const std::string& node_arg, Version* out);
+    // o scriere primita pierde fata de inregistrare, de tombstone, sau e sub watermark
+    bool stale(const std::string& room_name, const std::string& key, const Record* r, const Version& v) const;
+    const Version* find_tomb(const std::string& room_name, const std::string& key) const;
+    uint64_t tomb_ts(const std::string& room_name, const std::string& key) const;
+    void set_tomb(const std::string& room_name, const std::string& key, const Version& v);
+    void clear_tomb(const std::string& room_name, const std::string& key);
+    void collect_tombstones();
+
     // singurele locuri care schimba continutul RAM al unei camere, ca numarul
     // de chei si octetii rezidenti sa nu poata diverge (presupun room_mutex prins)
     Record* insert(Room& room, const std::string& key); // goala; apelantul o completeaza
@@ -85,6 +112,7 @@ private:
                               long long scale);
     std::string handle_ttl(const std::string& room_name, Room& room, const std::vector<std::string>& args, bool millis);
     std::string handle_del(const std::string& room_name, Room& room, const std::vector<std::string>& args);
+    std::string handle_crdtdel(const std::string& room_name, Room& room, const std::vector<std::string>& args);
     std::string handle_crdtmerge(const std::string& room_name, Room& room, const std::vector<std::string>& args);
     std::string handle_info();
     std::string handle_room_admin(const std::string& command, const std::vector<std::string>& args);
@@ -113,6 +141,9 @@ public:
 
     // resp3: protocolul negociat de conexiune prin HELLO (tinut de server)
     std::string execute(int client_fd, const std::vector<std::string>& args, bool resp3 = false);
+
+    // versiunea pana la care toate scrierile locale sunt deja in AOF (pentru REPLFRONTIER)
+    const std::atomic<uint64_t>& replication_frontier() const { return frontier_; }
 
     // sincronizare AOF granulata (politica everysec); apelata de watchdog
     void sync_aof_if_due() { aof.sync_if_due(); }
