@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 
 struct DbMetrics {
     std::atomic<uint64_t> keys_in_ram{0};
@@ -23,5 +24,11 @@ struct DbMetrics {
 };
 
 extern DbMetrics global_metrics;
+
+// Starea peer-ilor de replicare, scrisa de thread-urile replicatorului. phi
+// (Hayashibara et al., SRDS 2004) se calculeaza la raport, din istoricul
+// heartbeat-urilor: suspiciunea creste cat timp peer-ul tace.
+void publish_peer(const std::string& peer, double mean_ms, double stddev_ms, long long last_beat_ms, uint64_t lag_bytes);
+std::string peers_report(bool prometheus);
 
 void start_prometheus_exporter(int port = 9090);

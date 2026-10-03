@@ -29,6 +29,9 @@ Database::Database() {
         if (fsutil::parse_u64(env, &id) && id >= 1 && id <= UINT32_MAX) local_node_id = static_cast<uint32_t>(id);
         else fprintf(stderr, "SOMNIUM_NODE_ID invalid: '%s' (folosesc 1)\n", env);
     }
+    if (const char* env = getenv("SOMNIUM_MAX_CLOCK_OFFSET_MS"); env && !fsutil::parse_i64(env, &max_clock_offset_ms)) {
+        fprintf(stderr, "SOMNIUM_MAX_CLOCK_OFFSET_MS invalid: '%s'\n", env);
+    }
 
     // 1) redare istoric (snapshot-urile se incarca sub prima mutatie a fiecarei camere,
     //    apoi mutatiile AOF se aplica peste ele: un snapshot vechi nu poate
@@ -117,8 +120,9 @@ void Database::replay_record(const AofRecord& rec) {
         Record* r = it != room->keys.end() ? it->second : insert(*room, key);
         set_value(*room, r, value);
         r->expire_at = rec.expire_at;
-        r->timestamp_ms = ts;
+        r->timestamp_ms = hlc::normalize(ts);
         r->node_id = static_cast<uint32_t>(node);
+        clock_.observe(r->timestamp_ms); // dupa restart, scrierile locale depasesc istoricul
     };
 
     // live, CRDTMERGE ajunge in AOF doar cand a convers, deci nu se re-evalueaza
@@ -503,16 +507,17 @@ std::string Database::handle_set(const std::string& room_name, Room& room, const
     // o conditie esuata nu produce nicio mutatie, deci nimic in AOF
     Record* r = lookup(room_name, room, key);
     if ((nx && r) || (xx && !r)) return nil();
+    const uint64_t version = clock_.next(now_ms, r ? r->timestamp_ms : 0);
     if (!r) r = insert(room, key);
     set_value(room, r, args[2]);
     r->expire_at = expire_at; // un SET simplu sterge si TTL-ul vechi
-    r->timestamp_ms = now_ms;
+    r->timestamp_ms = version;
     r->node_id = local_node_id;
 
     eviction.record_access(key);
     // mutatia rezultata pleaca in AOF cu termenul absolut si versiunea CRDT:
     // replay-ul o aplica verbatim, fara sa re-evalueze NX/XX sau sa reporneasca TTL-ul
-    aof.append(room_name, args, expire_at, now_ms, local_node_id);
+    aof.append(room_name, args, expire_at, version, local_node_id);
 
     return "+OK\r\n";
 }
@@ -523,19 +528,23 @@ std::string Database::handle_mset(const std::string& room_name, Room& room, cons
         return "-ERR Wrong number of arguments for MSET\r\n";
     }
 
-    const long long now_ms = get_current_time_ms();
+    uint64_t overwritten = 0;
+    for (size_t i = 1; i < args.size(); i += 2) {
+        if (const Record* r = lookup(room_name, room, args[i])) overwritten = std::max(overwritten, r->timestamp_ms);
+    }
+    const uint64_t version = clock_.next(get_current_time_ms(), overwritten);
     for (size_t i = 1; i < args.size(); i += 2) {
         Record* r = lookup(room_name, room, args[i]);
         if (!r) r = insert(room, args[i]);
         set_value(room, r, args[i + 1]);
         r->expire_at = 0; // ca la SET simplu: TTL-ul vechi dispare
-        r->timestamp_ms = now_ms;
+        r->timestamp_ms = version;
         r->node_id = local_node_id;
         eviction.record_access(args[i]);
     }
     global_metrics.total_sets.fetch_add(args.size() / 2, std::memory_order_relaxed);
 
-    aof.append(room_name, args, 0, now_ms, local_node_id);
+    aof.append(room_name, args, 0, version, local_node_id);
     return "+OK\r\n";
 }
 
@@ -645,7 +654,7 @@ std::string Database::handle_del(const std::string& room_name, Room& room, const
     if (!lookup(room_name, room, key)) return ":0\r\n";
 
     erase(room, room.keys.find(key));
-    aof.append(room_name, args, 0, get_current_time_ms(), local_node_id);
+    aof.append(room_name, args, 0, clock_.next(get_current_time_ms(), 0), local_node_id);
     return ":1\r\n";
 }
 
@@ -668,6 +677,13 @@ std::string Database::handle_crdtmerge(const std::string& room_name, Room& room,
     if (args.size() == 6 && (!fsutil::parse_i64(args[5], &expire_at) || expire_at < 0)) {
         return "-ERR invalid expire time for CRDTMERGE\r\n";
     }
+    // versiunile in ms (clienti vechi) intra in formatul HLC; o versiune prea
+    // departe in viitor ar ingheta cheia pentru totdeauna (nicio scriere n-ar mai castiga)
+    incoming_ts = hlc::normalize(incoming_ts);
+    if (static_cast<long long>(hlc::physical_ms(incoming_ts)) > get_current_time_ms() + max_clock_offset_ms) {
+        return "-ERR CRDTMERGE timestamp too far in the future (SOMNIUM_MAX_CLOCK_OFFSET_MS)\r\n";
+    }
+    clock_.observe(incoming_ts);
 
     const std::string& key = args[1];
     Record* r = lookup(room_name, room, key);
@@ -698,7 +714,8 @@ std::string Database::handle_info() {
         "Chei totale: " + std::to_string(global_metrics.keys_in_ram.load(std::memory_order_relaxed)) + "\n" +
         "Octeti rezidenti: " + std::to_string(global_metrics.resident_bytes.load(std::memory_order_relaxed)) + "\n" +
         "Comenzi procesate: " + std::to_string(total_commands.load(std::memory_order_relaxed)) + "\n" +
-        "AOF: " + std::string(aof.policy_name()) + (aof.healthy() ? " (sanatos)" : " (ERORI SCRIERE)") + "\n";
+        "AOF: " + std::string(aof.policy_name()) + (aof.healthy() ? " (sanatos)" : " (ERORI SCRIERE)") + "\n" +
+        peers_report(false);
 
     return bulk_string(info_text);
 }

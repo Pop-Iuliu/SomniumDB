@@ -143,7 +143,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 **Goal:** Remove the remaining hard ceilings: inputs that can kill the server, clients that cannot connect, a log that grows forever, memory that no budget actually bounds, and a CRDT that never leaves its node.
 
-**Status:** In progress. S6 to S9 done; S10 implemented, awaiting CI verification. Five tickets, each inspired by one supplied word.
+**Status:** DONE. All five tickets implemented and verified. Five tickets, each inspired by one supplied word.
 
 **Planning target:** One two-week sprint for S6 to S9; S10 may spill into the next one. Completion means meeting the acceptance checks below.
 
@@ -244,7 +244,7 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 
 ## S10 - Koreish: Caravans Between Nodes
 
-**Status: IMPLEMENTED, awaiting CI verification.** `SOMNIUM_NODE_ID` replaces the hard-coded node 1 and `SOMNIUM_PEERS` lists the peers. A `Replicator` with its own thread (network I/O must never delay the watchdog's AOF fsync) reads the local AOF every 500 ms from a per-peer offset and ships the records written on this node (SET, MSET, CRDTMERGE) as one pipelined batch of `CRDTMERGE`, switching `ROOM` where needed. Records received from other nodes carry their node in the AOF meta and are never re-sent. Delivery is at-least-once; the offset advances only to the last acknowledged record and is saved with the AOF's inode, so a restart resumes and an S8 rewrite (new file, new inode) simply resends from the start. `CRDTMERGE` accepts an optional absolute deadline so `SET ... PX` replicates its expiry. Delete markers are deferred: DEL, EXPIRE and PERSIST carry no version of their own and stay local, which is the documented first limit and tested explicitly. A peer that keeps refusing `ROOM` (its own active-room budget) stalls replication to it until a slot frees. Tests: `tests/s10_test.py` (two nodes).
+**Status: DONE.** Verified by CI on PR #6 (AddressSanitizer suite, ThreadSanitizer and benchmark jobs green). `SOMNIUM_NODE_ID` replaces the hard-coded node 1 and `SOMNIUM_PEERS` lists the peers. A `Replicator` with its own thread (network I/O must never delay the watchdog's AOF fsync) reads the local AOF every 500 ms from a per-peer offset and ships the records written on this node (SET, MSET, CRDTMERGE) as one pipelined batch of `CRDTMERGE`, switching `ROOM` where needed. Records received from other nodes carry their node in the AOF meta and are never re-sent. Delivery is at-least-once; the offset advances only to the last acknowledged record and is saved with the AOF's inode, so a restart resumes and an S8 rewrite (new file, new inode) simply resends from the start. `CRDTMERGE` accepts an optional absolute deadline so `SET ... PX` replicates its expiry. Delete markers are deferred: DEL, EXPIRE and PERSIST carry no version of their own and stay local, which is the documented first limit and tested explicitly. A peer that keeps refusing `ROOM` (its own active-room budget) stalls replication to it until a slot frees. Tests: `tests/s10_test.py` (two nodes).
 
 **Inspiration:** The merchant caravans of the Koreish become batches of CRDT merges carried between nodes.
 
@@ -270,3 +270,99 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 - S8 and S9 are independent of each other; S10 waits for S8 because rewrites move AOF offsets.
 - Each ticket includes its acceptance tests, a line in the README command or configuration reference, and its status paragraph here.
 - Sprint demo: pipeline 100k inserts and compare with Redis, connect with `redis-cli`, rewrite a long AOF and restart instantly, fill past `SOMNIUM_MAXMEMORY`, and show two nodes converging.
+
+---
+
+# Sprint 3: Odd Words, Science Inside
+
+**Goal:** Ground the next steps in published distributed-systems results: versions that respect causality, replication that tolerates its own failure detector, deletes that converge, maintenance that never pauses clients, and a cache that only admits what is warm.
+
+**Status:** In progress. S11 and S12 (the P0s) implemented, awaiting CI verification; S13 to S15 planned.
+
+| ID | Inspiration | Deliverable | Science | Priority | Depends on |
+| --- | --- | --- | --- | --- | --- |
+| S11 | glidder | Hybrid Logical Clock versions | Kulkarni et al., OPODIS 2014 | P0 | S10 |
+| S12 | indulgently | Per-peer isolation, bounded connect, phi accrual | Guerraoui, PODC 2000; Hayashibara et al., SRDS 2004 | P0 | S10 |
+| S13 | eldermen | Versioned delete markers with causal-stability GC | Wuu & Bernstein, PODC 1984; Baquero et al., DAIS 2014 | P1 | S11 |
+| S14 | padnags | Fork-based AOF rewrite with tail splice | Kemper & Neumann (HyPer), ICDE 2011 | P1 | S8 |
+| S15 | equatorwards | TinyLFU admission from cold storage, aged sketch | Einziger, Friedman & Manes, ACM TOS 2017 | P2 | S1 |
+
+P0 fixes a live convergence bug and a replication stall. P1 closes the replication and maintenance gaps. P2 is a measured performance win.
+
+## S11 - Glidder: Slippery Clocks
+
+**Status: IMPLEMENTED, awaiting CI verification.** `hlc::Clock` (`src/core/hlc.h`) packs 48 bits of milliseconds and a 16-bit logical counter into the existing 64-bit version. A local write gets a version strictly above the local clock and above the version it overwrites, and every version seen (incoming merge, AOF replay) advances the clock, so later local writes exceed it, including after a restart. Values below 2^47 are legacy milliseconds and are converted at every entry point (merge, replay, snapshot load), so old data and clients that send milliseconds keep their order. Merges more than `SOMNIUM_MAX_CLOCK_OFFSET_MS` (default 10 minutes) in the future are rejected, so no client can freeze a key. Tests: `tests/hlc_test.cpp` (assert-based, run by `run_all.sh`), `tests/s11_test.py`.
+
+**Inspiration:** Slippery clocks become hybrid clocks that cannot slide backwards.
+
+**Why now:** A local `SET` set the version to the wall clock even when the stored version was higher. With clock skew above the replication delay, the write replicated with a lower version, peers ignored it, and the nodes diverged permanently. A client could also send a huge timestamp and make a key unwritable.
+
+**Acceptance checks:**
+- Two nodes with clocks 20 seconds apart converge when the node with the slower clock overwrites a key.
+- Absurd and far-future timestamps are rejected; a local write beats the version it overwrites and every version seen, also after a restart.
+- Existing CRDT ordering tests keep passing with legacy millisecond timestamps.
+
+**Primary files:** `src/core/hlc.h`, `src/core/database.*`, `src/storage/snapshot_manager.cpp`.
+
+## S12 - Indulgently: Tolerant of Mistakes
+
+**Status: IMPLEMENTED, awaiting CI verification.** Each peer gets its own replication thread, `connect` is nonblocking and bounded by `poll` (2 seconds), failures back off exponentially up to 30 seconds, and an idle peer receives a `PING` heartbeat. Successful round trips feed a phi accrual detector; phi is computed at report time from the heartbeat history, so suspicion grows while a peer stays silent. `INFO` and `/metrics` show phi and the unacknowledged AOF bytes per peer. Replication stays indulgent: merges are idempotent, so a false suspicion only delays delivery and never affects convergence. Tests: `tests/s12_test.py`.
+
+**Inspiration:** Indulgent algorithms never lose safety when the failure detector is wrong.
+
+**Why now:** A single replicator thread served every peer, and its blocking `connect` had no timeout. A peer that silently drops packets held the thread for about two minutes (`tcp_syn_retries`) and stalled replication to every healthy peer.
+
+**Acceptance checks:**
+- With an unreachable peer listed first, a healthy peer receives writes within seconds.
+- `INFO` reports a small phi and zero lag for the healthy peer, infinite phi and positive lag for the unreachable one.
+
+**Primary files:** `src/storage/replicator.*`, `metrics.*`.
+
+## S13 - Eldermen: The Council That Decides What Can Be Forgotten
+
+**Inspiration:** Elders who must all agree before something is forgotten become causal stability.
+
+**Why now:** DEL, EXPIRE and PERSIST do not replicate (S10's stated limit), and a local DEL followed by an older replicated write brings the key back.
+
+**Deliver:**
+- `DEL` writes a versioned tombstone that replicates as `CRDTDEL key ts node`; older merges lose against it.
+- `EXPIRE` and `PERSIST` log the key's full new state (value, deadline, new version), so they replicate like writes.
+- Each sender reports its progress with `REPLFRONTIER node hlc`; a tombstone is dropped once its version is at or below the lowest frontier, and incoming writes older than that watermark are ignored instead of resurrecting keys.
+
+**Acceptance checks:**
+- DEL, EXPIRE and PERSIST converge on all nodes; a late older write does not resurrect a deleted key.
+- Tombstones are garbage-collected once every peer's frontier has passed them, and kept while a peer is down (with a metric showing the backlog).
+
+**Primary files:** `src/core/database.*`, `src/storage/replicator.*`, `src/storage/aof_manager.*`.
+
+## S14 - Padnags: A Smooth Ride
+
+**Inspiration:** An easy-gaited horse becomes maintenance that never jolts clients.
+
+**Why now:** `REWRITEAOF` runs synchronously on the command thread and pauses every client for the length of the rewrite.
+
+**Deliver:**
+- Take every room lock briefly, `fork()`, and let the child write the rewrite from its copy-on-write image (no locks, no stdio, `_exit`).
+- The parent keeps serving and appending to the old AOF; when the child finishes, it copies the old AOF's tail since the fork onto the new file and swaps files. Records carry resulting state, so snapshot plus tail replays to the current state.
+
+**Acceptance checks:**
+- Client latency stays flat during a rewrite of a large dataset.
+- State after restart matches exactly, including writes made while the child ran; a failed child leaves the old AOF in use.
+
+**Primary files:** `src/core/database.cpp`, `src/storage/aof_manager.*`.
+
+## S15 - Equatorwards: From the Cold Poles to the Warm Equator
+
+**Inspiration:** Keys moving from cold to warm only when they are warm enough.
+
+**Why now:** Every read of a cold key moves it into RAM, and end-of-command eviction pushes another key out: a cold scan costs a disk read and a disk write per key. The frequency sketch never forgets, and rooms share counters.
+
+**Deliver:**
+- On a read of a cold key while the room is at its limit, admit it only if its estimated frequency beats the eviction victim's; otherwise serve it from disk without moving it. Writes always admit.
+- Halve every counter after W updates (TinyLFU aging) and count room and key together.
+
+**Acceptance checks:**
+- A scan over cold keys leaves the hot working set in RAM and does not grow `cold.bin`.
+- A Zipf workload with periodic scans shows a higher RAM hit ratio than before.
+
+**Primary files:** `src/storage/eviction_manager.*`, `src/utils/count_min_sketch.h`, `src/core/database.cpp`.
