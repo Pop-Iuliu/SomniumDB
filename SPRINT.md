@@ -18,6 +18,8 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 ## S1 - Excrescencies: Prune the Growth
 
+**Status: IMPLEMENTED, awaiting CI verification.** Cold storage moved to `cold.bin` with an in-RAM `(room, key)` index that points at the latest record; reads are a single `pread`, misses never touch the disk, and the index replaces the Bloom filter (deleted). Records carry value, absolute expiry and CRDT version. A key lives in RAM or in the index, never both: every access goes through one `lookup()` that moves a cold key back into RAM, so DEL and expiry cannot resurrect a disk value. Because the AOF replays the full state into RAM at startup, the cold file lasts for the process lifetime (truncated on start), which removes the need for on-disk deletion markers, index rebuilds and legacy migration. `COMPACT` rewrites live, unexpired records and publishes file and index together only after every write succeeded. Metrics: `db_cold_file_bytes`, `db_cold_obsolete_bytes`, `db_cold_reclaimed_bytes`. `SOMNIUM_MAX_KEYS` sets the per-room limit (0 makes eviction deterministic for tests). Tests: `tests/s1_test.py`.
+
 **Inspiration:** Unwanted outgrowths become obsolete records accumulating in cold storage.
 
 **Why now:** `despised_keys.bin` retains every eviction, reads scan the whole file, and `DEL` only removes RAM entries. An old disk value can reappear after deletion.
@@ -37,6 +39,8 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 **Primary files:** `src/storage/eviction_manager.*`, `src/core/database.cpp`, `record.h`, `metrics.*`.
 
 ## S2 - Sundaes: Build Your Own SET
+
+**Status: IMPLEMENTED, awaiting CI verification.** `SET key value [NX|XX] [EX|PX]` validates every option before any effect (conflicts, duplicates, missing values, nonpositive or overflowing durations), evaluates NX/XX through the same `lookup()` as reads (cold storage included, expired keys absent), and writes nothing to the AOF when a condition fails. `TTL`/`PTTL` follow Redis (`-1`/`-2`). Deadlines are absolute and already travel through AOF meta, snapshots and cold records. Replay now applies CRDTMERGE verbatim like SET (live, an expired key counts as absent, so re-comparing at replay could diverge). `SOMNIUM_CLOCK_OFFSET_MS` is the controllable clock used to simulate time passing while the server is down. Tests: `tests/s2_test.py`.
 
 **Inspiration:** A base scoop with optional toppings becomes a write with composable conditions and expiration.
 
@@ -82,6 +86,8 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 ## S4 - Rezoned: Rooms With Rules
 
+**Status: IMPLEMENTED, awaiting CI verification.** Rooms have an explicit atomic state (`sleeping`, `loading`, `active`, `hibernating`) with the contract documented in `src/core/room.h`: registry lock before room lock, never the reverse. The active budget is an atomic slot counter reserved with a CAS on both creation and wake, so it holds without scanning the registry under a lock; a full budget returns `-ERR ROOMS FULL` (no implicit LRU eviction: that would put snapshot I/O on the command thread). INFO reads counters only, removing the room-lock then registry-lock inversion. Rooms are never erased from the registry, so a write racing with hibernation of an empty room stays reachable. New commands: `ROOMS`, `ROOM.INFO`, `ROOM.HIBERNATE`, `ROOM.WAKE`; `ROOM name` still selects. Recovery bypasses the budget. Tests: `tests/s4_test.py`, plus a ThreadSanitizer CI job running the S4 stress section.
+
 **Inspiration:** Changing how space is allocated becomes explicit control of which rooms occupy RAM.
 
 **Why now:** Room creation checks the active-room limit, but waking an existing room bypasses it. Lifecycle fields have inconsistent lock protection, and some paths acquire room/map locks in opposite orders.
@@ -125,7 +131,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 ## Execution and completion
 
-- ~~Start with S5's storage contracts and regression fixtures~~ (S5 DONE), then S4 and S1. Build S2 on the resulting record/expiry semantics. S3 is independent of the storage work.
+- ~~Start with S5's storage contracts and regression fixtures~~ (S5 DONE), ~~then S4 and S1. Build S2 on the resulting record/expiry semantics.~~ (S4, S1, S2 implemented) S3 is independent of the storage work.
 - Each ticket includes its acceptance tests and documentation in its implementation change.
 - Integration tests use a fresh temporary data directory, an explicitly selected free port, and verification that the launched process owns the endpoint. Development data and an existing Redis service are not test fixtures.
 - Add the regression suite to CTest and run it from a clean build. Record benchmark conditions for the slow-client and compaction demonstrations.

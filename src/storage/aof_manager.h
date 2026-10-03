@@ -83,7 +83,7 @@ private:
     std::mutex mutex_;
     std::atomic<bool> dirty_{false};
     std::atomic<long long> last_sync_ms_{0};
-    bool healthy_ = true;
+    std::atomic<bool> healthy_{true}; // citit fara mutex de thread-ul de comenzi
     bool needs_rewrite_ = false;
     bool replaying_ = true;
 

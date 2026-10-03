@@ -2,7 +2,10 @@ cmake_minimum_required(VERSION 3.20)
 project(Redis)
 
 set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_BUILD_TYPE Release)
+# default Release, dar respectam tipul cerut (CI: Debug + sanitizere)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
 
 add_executable(Redis main.cpp
         src/core/database.h
@@ -13,7 +16,6 @@ add_executable(Redis main.cpp
         pubsub.cpp
         pubsub.h
         pool_allocator.h
-        bloom_filter.h
         metrics.h
         metrics.cpp
         src/storage/aof_manager.h

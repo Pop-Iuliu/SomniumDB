@@ -13,8 +13,10 @@ struct DbMetrics {
     std::atomic<uint64_t> total_sets{0};
     std::atomic<uint64_t> cache_hits{0};
     std::atomic<uint64_t> cache_misses{0};
-    std::atomic<uint64_t> bloom_prevented_disk_reads{0};
     std::atomic<uint64_t> keys_evicted{0};
+    std::atomic<uint64_t> cold_file_bytes{0};
+    std::atomic<uint64_t> cold_obsolete_bytes{0};
+    std::atomic<uint64_t> cold_reclaimed_bytes{0};
 };
 
 extern DbMetrics global_metrics;

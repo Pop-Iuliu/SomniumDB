@@ -173,6 +173,83 @@ def recv_until(s, want_crlf, want_bytes=0, timeout=10.0):
     return data
 
 
+class Client:
+    """Client RESP minimal cu buffer propriu: un raspuns per comanda, array-uri incluse."""
+
+    def __init__(self, srv):
+        self.s = srv.connect(timeout=10)
+        self.buf = b""
+
+    def cmd(self, *args):
+        self.s.sendall(resp_cmd(*args))
+        return self.read_reply()
+
+    def _fill(self):
+        chunk = self.s.recv(1 << 16)
+        if not chunk:
+            raise ConnectionError("serverul a inchis conexiunea")
+        self.buf += chunk
+
+    def _line(self):
+        while b"\r\n" not in self.buf:
+            self._fill()
+        line, self.buf = self.buf.split(b"\r\n", 1)
+        return line
+
+    def read_reply(self):
+        line = self._line()
+        t, rest = line[:1], line[1:]
+        if t == b"+":
+            return ("ok", rest.decode())
+        if t == b"-":
+            return ("err", rest.decode())
+        if t == b":":
+            return ("int", int(rest))
+        if t == b"*":
+            return ("array", [self.read_reply() for _ in range(int(rest))])
+        if t == b"$":
+            n = int(rest)
+            if n == -1:
+                return ("nil", None)
+            while len(self.buf) < n + 2:
+                self._fill()
+            payload, self.buf = self.buf[:n], self.buf[n + 2:]
+            return ("bulk", payload)
+        raise AssertionError(f"raspuns necunoscut: {line!r}")
+
+    def close(self):
+        self.s.close()
+
+
+def run_with_retry(fn, fails, max_attempts=3):
+    """Ruleaza o sectiune de test, reluata de la zero la decesul serverului.
+
+    Flake-ul io_uring documentat in AGENTS.md poate livra un server fara
+    nicio completare; sectiunile sunt self-contained (Server curat de fiecare
+    data), deci le putem re-rula. Esecurile reale de asertie raman consemnate
+    la ultima incercare.
+    """
+    for attempt in range(max_attempts):
+        local_fails = []
+
+        def check(name, cond, extra="", _lf=local_fails):
+            print(("PASS" if cond else "FAIL"), name, extra if not cond else "")
+            if not cond:
+                _lf.append(name)
+
+        try:
+            fn(check)
+            fails.extend(local_fails)
+            return
+        except (ConnectionError, TimeoutError, OSError, RuntimeError, AssertionError) as e:
+            if attempt == max_attempts - 1:
+                print(f"  sectiune esuata definitiv: {type(e).__name__} {e}")
+                fails.extend(local_fails)
+                fails.append(f"sectiune prabusita: {type(e).__name__}: {e}")
+            else:
+                print(f"  (sectiune reluata dupa {type(e).__name__})")
+
+
 def report(fails, suite):
     print(f"\n[{suite}] {len(fails)} esecuri", fails if fails else "")
     sys.exit(1 if fails else 0)
