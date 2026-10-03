@@ -66,7 +66,7 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 | `ROOM.INFO name` | State, last access, resident keys and estimated bytes |
 | `ROOM.HIBERNATE name`, `ROOM.WAKE name` | Explicit room control |
 | `COMPACT` | Compact cold storage; replies with reclaimed bytes |
-| `REWRITEAOF` | Rewrite the AOF as current state (also automatic, see below) |
+| `REWRITEAOF` | Rewrite the AOF as current state in the background: a forked child writes a copy-on-write snapshot while clients keep being served; `INFO` shows progress (also automatic, see below) |
 | `SUBSCRIBE channel [channel ...]`, `UNSUBSCRIBE [channel ...]`, `PUBLISH channel message` | Pub/Sub; `PING` and `UNSUBSCRIBE` also work while subscribed |
 | `PING [message]`, `ECHO message`, `QUIT` | Connection commands |
 | `HELLO [2\|3 [AUTH user pass] [SETNAME name]]` | Protocol negotiation; `HELLO 3` switches the connection to RESP3 (nulls, maps, Pub/Sub pushes, normal commands while subscribed) |

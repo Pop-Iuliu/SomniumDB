@@ -2,6 +2,7 @@
 #include "fs_util.h"
 #include "../core/resp.h"
 #include "../../metrics.h"
+#include <algorithm>
 #include <cstdio>
 #include <cerrno>
 #include <cstdlib>
@@ -373,7 +374,6 @@ bool AOFManager::start_rewrite() {
         ::unlink("appendonly.aof.tmp");
         return false;
     }
-    rewrite_bytes_ = sizeof(kAofHeader) - 1;
     return true;
 }
 
@@ -385,7 +385,6 @@ bool AOFManager::append_rewrite(const AofRecord& rec) {
         fprintf(stderr, "AOF: rescriere: scriere esuata: %s\n", strerror(errno));
         return false;
     }
-    rewrite_bytes_ += data.size();
     return true;
 }
 
@@ -403,10 +402,31 @@ void AOFManager::abort_rewrite() {
     abort_locked();
 }
 
+bool AOFManager::append_tail(const uint64_t from) {
+    std::lock_guard lock(mutex_);
+    if (rewrite_fd_ < 0) return false;
+    const int in = ::open(kAofPath, O_RDONLY);
+    if (in < 0) return false;
+
+    std::string buf(1 << 16, '\0');
+    const uint64_t end = size_.load(std::memory_order_relaxed);
+    bool ok = true;
+    for (uint64_t off = from; ok && off < end;) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(buf.size(), end - off));
+        ok = fsutil::pread_all(in, buf.data(), n, static_cast<off_t>(off)) && fsutil::write_all(rewrite_fd_, buf.data(), n);
+        off += n;
+    }
+    ::close(in);
+    if (!ok) fprintf(stderr, "AOF: rescriere: coada nu a putut fi copiata: %s\n", strerror(errno));
+    return ok;
+}
+
 bool AOFManager::commit_rewrite() {
     std::lock_guard lock(mutex_);
     if (rewrite_fd_ < 0) return false;
 
+    struct stat sb{};
+    const uint64_t written = ::fstat(rewrite_fd_, &sb) == 0 ? static_cast<uint64_t>(sb.st_size) : 0;
     if (!fsutil::sync_fd(rewrite_fd_)) {
         fprintf(stderr, "AOF: rescriere: fdatasync esuat: %s\n", strerror(errno));
         abort_locked();
@@ -437,9 +457,9 @@ bool AOFManager::commit_rewrite() {
     fd_ = ::open(kAofPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
     healthy_ = fd_ >= 0;
     needs_rewrite_ = false;
-    size_ = rewrite_bytes_;
-    base_size_ = rewrite_bytes_;
+    size_ = written;
+    base_size_ = written;
     publish_sizes();
-    printf("AOF: rescriere finalizata (%llu octeti)\n", static_cast<unsigned long long>(rewrite_bytes_));
+    printf("AOF: rescriere finalizata (%llu octeti)\n", static_cast<unsigned long long>(written));
     return healthy_;
 }

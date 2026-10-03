@@ -24,6 +24,16 @@ def records(srv):
     return aof(srv).count(b"SOMNIUM-META")
 
 
+def wait_rewrite(c, timeout=30):
+    """REWRITEAOF ruleaza in fundal (S14); INFO incheie rescrierea cand copilul a terminat."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if b"Rescriere AOF: inactiva" in c.cmd("INFO")[1]:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def sec_rewrite_and_restart(check):
     srv = Server(env_extra=ENV)
     try:
@@ -38,7 +48,7 @@ def sec_rewrite_and_restart(check):
         before = records(srv)
         p = c.cmd("PTTL", "ttl")[1]
 
-        check("REWRITEAOF", c.cmd("REWRITEAOF") == ("ok", "OK"))
+        check("REWRITEAOF", c.cmd("REWRITEAOF")[0] == "ok" and wait_rewrite(c))
         check("o inregistrare per cheie vie (fara cea expirata)", records(srv) == 102, (before, records(srv)))
         check("headerul v3 pastrat", aof(srv).startswith(b"*2\r\n$11\r\nSOMNIUM-AOF\r\n$1\r\n3\r\n"))
         check("fara fisier temporar ramas", not os.path.exists(os.path.join(srv.workdir, "appendonly.aof.tmp")))
@@ -79,7 +89,7 @@ def sec_cold_sleeping_stale(check):
         c.cmd("ROOM", "c")  # trezire: snapshot-ul ramane pe disc, dar se va invechi
         check("DEL dupa trezire", c.cmd("DEL", "x") == ("int", 1))
 
-        check("REWRITEAOF", c.cmd("REWRITEAOF") == ("ok", "OK"))
+        check("REWRITEAOF", c.cmd("REWRITEAOF")[0] == "ok" and wait_rewrite(c))
         check("snapshot-ul camerei active sters", not os.path.exists(os.path.join(srv.workdir, "room_c.bin")))
         check("snapshot-ul camerei adormite pastrat", os.path.exists(os.path.join(srv.workdir, "room_b.bin")))
         c.close()
@@ -127,6 +137,7 @@ def sec_auto(check):
         value = "x" * 100
         for i in range(200):  # ~30KB de istoric pentru o singura cheie
             c.cmd("SET", "hot", f"{i}{value}")
+        wait_rewrite(c)
         size = len(aof(srv))
         check("rescrierea automata tine AOF-ul mic", size < 4000, size)
         c.close()
