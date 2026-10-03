@@ -1,9 +1,10 @@
 """S7 "catholicized": orice client Redis e binevenit.
 
-Verifica: comenzi inline, PING/ECHO/QUIT, EXISTS/MGET/MSET (cold storage
-inclus, expiratele absente), EXPIRE/PEXPIRE/PERSIST cu termen absolut peste
-restart, SUBSCRIBE multiplu + UNSUBSCRIBE + PING in modul subscribe, si
-redis-cli / redis-benchmark reale cand sunt instalate (in CI sunt).
+Verifica: comenzi inline (cu ghilimele), PING/ECHO/QUIT, EXISTS/MGET/MSET
+(cold storage inclus, expiratele absente), EXPIRE/PEXPIRE/PERSIST cu termen
+absolut peste restart si optiunile NX/XX/GT/LT, SUBSCRIBE multiplu +
+UNSUBSCRIBE + PING in modul subscribe, RESP3 prin HELLO, si redis-cli /
+redis-benchmark reale cand sunt instalate (in CI sunt).
 """
 
 import os
@@ -119,6 +120,103 @@ def sec_pubsub(check):
         srv.cleanup()
 
 
+def sec_inline_quotes(check):
+    srv = Server(env_extra=ENV)
+    try:
+        srv.start()
+        c = Client(srv)
+        c.s.sendall(b'SET q1 "hello world"\r\n'
+                    + rb'SET q2 "a\x41\n\"b"' + b"\r\n"
+                    + rb"SET q3 'it\'s'" + b"\r\n"
+                    + b'SET q4 x"y z"\r\n')
+        check("SET-uri inline cu ghilimele", [c.read_reply() for _ in range(4)] == [("ok", "OK")] * 4)
+        check("ghilimele duble pastreaza spatiile", c.cmd("GET", "q1") == ("bulk", b"hello world"))
+        check("escape-uri in ghilimele duble", c.cmd("GET", "q2") == ("bulk", b'aA\n"b'))
+        check("ghilimea escapata in ghilimele simple", c.cmd("GET", "q3") == ("bulk", b"it's"))
+        check("ghilimele in mijlocul argumentului", c.cmd("GET", "q4") == ("bulk", b"xy z"))
+        c.close()
+
+        for name, line in (("ghilimele neinchise", b'SET q "abc\r\n'), ("ghilimea lipita de text", b'SET q "ab"c\r\n')):
+            bad = srv.connect()
+            bad.sendall(line)
+            check(f"{name}: eroare de protocol", read_to_eof(bad) == b"-ERR Protocol error\r\n")
+            bad.close()
+    finally:
+        srv.cleanup()
+
+
+def sec_expire_options(check):
+    srv = Server(env_extra=ENV)
+    try:
+        srv.start()
+        c = Client(srv)
+        c.cmd("SET", "p", "v")
+        check("XX pe cheie fara termen", c.cmd("EXPIRE", "p", "100", "XX") == ("int", 0))
+        check("GT pe cheie fara termen (TTL infinit)", c.cmd("EXPIRE", "p", "100", "GT") == ("int", 0))
+        check("LT pe cheie fara termen (TTL infinit)", c.cmd("EXPIRE", "p", "100", "LT") == ("int", 1))
+        check("NX pe cheie cu termen", c.cmd("EXPIRE", "p", "50", "NX") == ("int", 0))
+        check("GT cu termen mai lung", c.cmd("EXPIRE", "p", "200", "GT") == ("int", 1))
+        check("GT cu termen mai scurt", c.cmd("EXPIRE", "p", "150", "gt") == ("int", 0))
+        check("TTL dupa GT", c.cmd("TTL", "p") == ("int", 200))
+        check("LT cu termen mai scurt", c.cmd("EXPIRE", "p", "150", "LT") == ("int", 1))
+        check("PEXPIRE XX GT", c.cmd("PEXPIRE", "p", "300000", "XX", "GT") == ("int", 1))
+        check("TTL dupa PEXPIRE XX GT", c.cmd("TTL", "p") == ("int", 300))
+        for opts in (("NX", "XX"), ("NX", "GT"), ("GT", "LT"), ("FOO",)):
+            check(f"EXPIRE {' '.join(opts)} -> -ERR", c.cmd("EXPIRE", "p", "10", *opts)[0] == "err")
+        check("optiunile se verifica inainte de stergere (GT)", c.cmd("EXPIRE", "p", "0", "GT") == ("int", 0))
+        check("cheia ramane dupa GT refuzat", c.cmd("EXISTS", "p") == ("int", 1))
+        check("LT cu termen trecut sterge cheia", c.cmd("EXPIRE", "p", "-1", "LT") == ("int", 1))
+        check("cheia stearsa de LT", c.cmd("EXISTS", "p") == ("int", 0))
+        c.cmd("SET", "n", "v")
+        check("NX pe cheie fara termen", c.cmd("EXPIRE", "n", "10", "NX") == ("int", 1))
+        c.close()
+    finally:
+        srv.cleanup()
+
+
+def sec_resp3(check):
+    srv = Server(env_extra=ENV)
+    try:
+        srv.start()
+        c = Client(srv)
+        r = c.cmd("HELLO")
+        check("HELLO fara argumente: RESP2, lista plata", r[0] == "array" and len(r[1]) == 14 and r[1][5] == ("int", 2), r)
+        r = c.cmd("HELLO", "3")
+        fields = {k[1]: v for k, v in r[1]} if r[0] == "map" else {}
+        check("HELLO 3: harta cu proto 3", fields.get(b"proto") == ("int", 3) and fields.get(b"server") == ("bulk", b"somnium"), r)
+        check("RESP3: GET absent -> null", c.cmd("GET", "nope") == ("null", None))
+        c.cmd("SET", "a", "1")
+        check("RESP3: MGET cu null", c.cmd("MGET", "a", "nope") == ("array", [("bulk", b"1"), ("null", None)]))
+        check("RESP3: SET NX esuat -> null", c.cmd("SET", "a", "2", "NX") == ("null", None))
+        check("RESP3: ROOM.INFO e harta", c.cmd("ROOM.INFO", "default")[0] == "map")
+        check("HELLO cu protocol nesuportat", c.cmd("HELLO", "4") == ("err", "NOPROTO unsupported protocol version"))
+        check("HELLO cu versiune invalida", c.cmd("HELLO", "x")[0] == "err")
+        check("HELLO cu optiune necunoscuta", c.cmd("HELLO", "3", "FOO")[0] == "err")
+        check("HELLO 3 AUTH ... SETNAME ...", c.cmd("HELLO", "3", "AUTH", "default", "pw", "SETNAME", "me")[0] == "map")
+        c.cmd("HELLO", "2")
+        check("HELLO 2: inapoi la $-1", c.cmd("GET", "nope") == ("nil", None))
+        c.close()
+
+        sub = Client(srv)
+        sub.cmd("HELLO", "3")
+        check("RESP3: confirmarea SUBSCRIBE e push",
+              sub.cmd("SUBSCRIBE", "ch") == ("push", [("bulk", b"subscribe"), ("bulk", b"ch"), ("int", 1)]))
+        check("RESP3: comenzi normale in modul subscribe", sub.cmd("SET", "s", "1") == ("ok", "OK"))
+        check("RESP3: PING normal in modul subscribe", sub.cmd("PING") == ("ok", "PONG"))
+        pub = Client(srv)  # publisher RESP2
+        check("PUBLISH catre abonat RESP3", pub.cmd("PUBLISH", "ch", "hello") == ("int", 1))
+        check("RESP3: mesajul ajunge ca push",
+              sub.read_reply() == ("push", [("bulk", b"message"), ("bulk", b"ch"), ("bulk", b"hello")]))
+        check("RESP3: UNSUBSCRIBE ca push",
+              sub.cmd("UNSUBSCRIBE") == ("push", [("bulk", b"unsubscribe"), ("bulk", b"ch"), ("int", 0)]))
+        check("RESP3: UNSUBSCRIBE fara abonamente",
+              sub.cmd("UNSUBSCRIBE") == ("push", [("bulk", b"unsubscribe"), ("null", None), ("int", 0)]))
+        pub.close()
+        sub.close()
+    finally:
+        srv.cleanup()
+
+
 def sec_real_clients(check):
     cli, bench = shutil.which("redis-cli"), shutil.which("redis-benchmark")
     if not cli or not bench:
@@ -133,6 +231,10 @@ def sec_real_clients(check):
         check("redis-cli: sesiune de comenzi", out.returncode == 0 and out.stdout.split() ==
               [b"OK", b"1", b"1", b"50", b"PONG"], out)
 
+        out = subprocess.run([cli, "-3", "-p", port], input=b"SET r3 1\nGET r3\nPING\n",
+                             capture_output=True, timeout=20)
+        check("redis-cli -3: sesiune RESP3", out.returncode == 0 and out.stdout.split() == [b"OK", b"1", b"PONG"], out)
+
         out = subprocess.run([bench, "-p", port, "-t", "ping,set,get,mset", "-n", "2000", "-q"],
                              capture_output=True, timeout=120)
         tests = [ln.split(b":")[0] for ln in out.stdout.replace(b"\r", b"\n").splitlines() if b"requests per second" in ln]
@@ -145,7 +247,8 @@ def sec_real_clients(check):
 
 def main():
     fails = []
-    for sec in (sec_basics, sec_cold_and_restart, sec_pubsub, sec_real_clients):
+    for sec in (sec_basics, sec_cold_and_restart, sec_pubsub, sec_inline_quotes, sec_expire_options, sec_resp3,
+                sec_real_clients):
         run_with_retry(sec, fails)
     report(fails, "s7")
 

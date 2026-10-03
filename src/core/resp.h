@@ -4,7 +4,7 @@
 // (apelantul sterge octetii consumati o singura data pe batch), fara copii
 // temporare, si nu aloca pana nu stie ca octetii exista in buffer.
 
-#include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <string>
@@ -60,9 +60,57 @@ inline Status parse(const std::string& buf, const size_t pos, size_t* end, std::
 
 constexpr size_t kMaxInline = 64 * 1024; // ca PROTO_INLINE_MAX_SIZE din Redis
 
+// Imparte o linie inline ca sdssplitargs din Redis: argumente separate prin
+// spatii; "..." accepta \n \r \t \b \a \xHH, iar orice alt caracter escapat
+// ramane literal (\" \\); '...' accepta doar \'. O ghilimea de inchidere
+// trebuie urmata de spatiu sau de final. false = ghilimele neechilibrate.
+inline bool split_inline(const std::string_view line, std::vector<std::string>* args) {
+    const auto space = [](const char ch) { return std::isspace(static_cast<unsigned char>(ch)) != 0; };
+    const auto hex = [](const char ch) { return std::isxdigit(static_cast<unsigned char>(ch)) != 0; };
+
+    args->clear();
+    size_t i = 0;
+    while (true) {
+        while (i < line.size() && space(line[i])) ++i;
+        if (i == line.size()) return true;
+
+        std::string arg;
+        char quote = 0;
+        for (; i < line.size(); ++i) {
+            const char ch = line[i];
+            if (!quote) {
+                if (space(ch)) break;
+                if (ch == '"' || ch == '\'') quote = ch;
+                else arg += ch;
+            } else if (ch == quote) {
+                quote = 0;
+                if (i + 1 < line.size() && !space(line[i + 1])) return false;
+            } else if (ch == '\\' && i + 1 < line.size()) {
+                const char next = line[++i];
+                if (quote == '\'') {
+                    if (next != '\'') arg += '\\';
+                    arg += next;
+                } else if (next == 'x' && i + 2 < line.size() && hex(line[i + 1]) && hex(line[i + 2])) {
+                    unsigned char byte = 0;
+                    std::from_chars(line.data() + i + 1, line.data() + i + 3, byte, 16);
+                    arg += static_cast<char>(byte);
+                    i += 2;
+                } else {
+                    constexpr std::string_view from = "nrtba", to = "\n\r\t\b\a";
+                    const size_t k = from.find(next);
+                    arg += k == std::string_view::npos ? next : to[k];
+                }
+            } else {
+                arg += ch;
+            }
+        }
+        if (quote) return false;
+        args->push_back(std::move(arg));
+    }
+}
+
 // Cererile clientilor: array RESP sau comanda inline (telnet, redis-benchmark
-// PING_INLINE), o linie terminata cu LF sau CRLF, impartita pe spatii si
-// taburi. Fara ghilimele: clientii reali trimit array-uri. AOF-ul ramane strict.
+// PING_INLINE), o linie terminata cu LF sau CRLF. AOF-ul ramane strict.
 inline Status parse_request(const std::string& buf, const size_t pos, size_t* end, std::vector<std::string>* args) {
     if (pos >= buf.size() || buf[pos] == '*') return parse(buf, pos, end, args);
 
@@ -75,13 +123,7 @@ inline Status parse_request(const std::string& buf, const size_t pos, size_t* en
     std::string_view line = window.substr(0, nl);
     if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
 
-    args->clear();
-    for (size_t i = line.find_first_not_of(" \t"); i != std::string_view::npos;
-         i = line.find_first_not_of(" \t", i)) {
-        const size_t stop = std::min(line.find_first_of(" \t", i), line.size());
-        args->emplace_back(line.substr(i, stop - i));
-        i = stop;
-    }
+    if (!split_inline(line, args)) return Status::Malformed;
     *end = pos + nl + 1; // o linie goala e o comanda goala: ignorata
     return Status::Complete;
 }

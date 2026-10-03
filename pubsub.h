@@ -29,12 +29,13 @@ public:
         message_sink = std::move(fn);
     }
 
-    std::string subscribe(int client_fd, const std::string& channel);
+    // resp3: confirmarile pleaca ca mesaje push ('>'), nu ca array-uri
+    std::string subscribe(int client_fd, const std::string& channel, bool resp3);
 
     std::string publish(const std::string& channel, const std::string& message);
 
     // fara canale = dezabonare de la toate; un raspuns per canal, ca la Redis
-    std::string unsubscribe(int client_fd, std::vector<std::string> channels);
+    std::string unsubscribe(int client_fd, std::vector<std::string> channels, bool resp3);
 
     void remove_client(int client_fd);
 

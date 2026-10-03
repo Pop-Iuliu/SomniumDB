@@ -47,6 +47,7 @@ struct Client {
     bool closed = false;
     bool read_armed = false;
     bool write_armed = false;
+    bool resp3 = false; // protocolul negociat prin HELLO
 
     explicit Client(int f) : fd(f) {}
     size_t pending_out() const { return out_buf.size() - out_off; }
@@ -185,7 +186,15 @@ static bool enqueue_output(const shared_ptr<Client>& c, const string& data) {
 static void deliver_pubsub(const int fd, const string& msg) {
     const auto it = clients.find(fd);
     if (it == clients.end() || it->second->closed) return;
-    if (!enqueue_output(it->second, msg)) return;
+    if (it->second->resp3) {
+        // RESP3: acelasi mesaj, trimis ca push ('>' in loc de '*'), ca sa nu se
+        // confunde cu raspunsul unei comenzi trimise de abonat intre timp
+        string push = msg;
+        push[0] = '>';
+        if (!enqueue_output(it->second, push)) return;
+    } else if (!enqueue_output(it->second, msg)) {
+        return;
+    }
 
     // incercam trimisul direct; daca fd-ul e plin, POLLOUT il ia mai tarziu
     const auto r = flush_output(*it->second);
@@ -198,6 +207,32 @@ static void queue_work() {
     if (write(g_eventfd, &one, sizeof(one)) < 0 && errno != EAGAIN) {
         cerr << "eventfd write esuat: " << strerror(errno) << "\n";
     }
+}
+
+// HELLO [protover [AUTH user pass] [SETNAME name]]: protocolul tine de conexiune.
+// Serverul nu are autentificare, deci AUTH e acceptat ca pentru utilizatorul
+// default fara parola, iar SETNAME e ignorat. Raspunsul: harta pe RESP3, lista
+// plata pe RESP2. "version" e nivelul de protocol Redis pe care il imitam.
+static string hello(Client& c, const vector<string>& args) {
+    if (args.size() >= 2) {
+        int proto = 0;
+        const string& v = args[1];
+        if (const auto [p, ec] = from_chars(v.data(), v.data() + v.size(), proto); ec != errc() || p != v.data() + v.size()) {
+            return "-ERR Protocol version is not an integer or out of range\r\n";
+        }
+        if (proto != 2 && proto != 3) return "-NOPROTO unsupported protocol version\r\n";
+        for (size_t i = 2; i < args.size();) {
+            if (strcasecmp(args[i].c_str(), "AUTH") == 0 && i + 2 < args.size()) i += 3;
+            else if (strcasecmp(args[i].c_str(), "SETNAME") == 0 && i + 1 < args.size()) i += 2;
+            else return "-ERR Syntax error in HELLO option '" + args[i] + "'\r\n";
+        }
+        c.resp3 = proto == 3;
+    }
+
+    const auto bulk = [](const string& s) { return "$" + to_string(s.size()) + "\r\n" + s + "\r\n"; };
+    return (c.resp3 ? "%7\r\n" : "*14\r\n") + bulk("server") + bulk("somnium") + bulk("version") + bulk("7.0.0") +
+           bulk("proto") + ":" + (c.resp3 ? "3" : "2") + "\r\n" + bulk("id") + ":" + to_string(c.fd) + "\r\n" +
+           bulk("mode") + bulk("standalone") + bulk("role") + bulk("master") + bulk("modules") + "*0\r\n";
 }
 
 // proceseaza comenzi buffered (pana la buget); true = mai exista input complet neprocesat
@@ -223,7 +258,9 @@ static bool process_buffered(const shared_ptr<Client>& c) {
             break;
         }
 
-        const string response = db.execute(c->fd, args);
+        // HELLO alege protocolul conexiunii; celelalte comenzi raspund in protocolul ales
+        const bool is_hello = !args.empty() && strcasecmp(args[0].c_str(), "HELLO") == 0;
+        const string response = is_hello ? hello(*c, args) : db.execute(c->fd, args, c->resp3);
         if (!response.empty() && !enqueue_output(c, response)) return false; // deconectat (cap output)
     }
     c->in_buf.erase(0, pos);

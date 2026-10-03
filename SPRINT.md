@@ -143,7 +143,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 **Goal:** Remove the remaining hard ceilings: inputs that can kill the server, clients that cannot connect, a log that grows forever, memory that no budget actually bounds, and a CRDT that never leaves its node.
 
-**Status:** In progress. S6 done; S7 implemented, awaiting CI verification; S8 to S10 planned. Five tickets, each inspired by one supplied word.
+**Status:** In progress. S6 and S7 done (S7 follow-up awaiting CI); S8 to S10 planned. Five tickets, each inspired by one supplied word.
 
 **Planning target:** One two-week sprint for S6 to S9; S10 may spill into the next one. Completion means meeting the acceptance checks below.
 
@@ -180,7 +180,7 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 
 ## S7 - Catholicized: Every Client Welcome
 
-**Status: IMPLEMENTED, awaiting CI verification.** `resp::parse_request` accepts inline commands (LF or CRLF, split on spaces and tabs, 64 KB line cap) and otherwise defers to the strict `resp::parse`, which AOF recovery keeps using. New commands: `PING`, `ECHO`, `EXISTS`, `MGET`, `MSET`, `EXPIRE`, `PEXPIRE`, `PERSIST`, `UNSUBSCRIBE`, and `QUIT` (handled in the event loop, since it closes the connection); `SUBSCRIBE` takes several channels, and `PING`/`UNSUBSCRIBE` work in subscribe mode. Every key access goes through `lookup()`, so the new reads see cold storage and treat expired keys as absent. `MSET` is one AOF record (atomic under a crash), and expiry commands log the absolute deadline in AOF meta so replay never restarts a TTL; a non-positive TTL reuses `DEL`, as in Redis. SET, CRDTMERGE and MSET now share one `insert()` for new records. Tests: `tests/s7_test.py`, including real `redis-cli` and `redis-benchmark -t ping,set,get,mset` runs (CI installs `redis-tools`), and inline cases in `tests/resp_test.cpp`.
+**Status: DONE.** Verified by CI on `main` (commit `1efddf7`, pushed directly rather than through a PR; real `redis-cli` and `redis-benchmark` runs green). Follow-up, awaiting CI: inline commands accept `"..."` and `'...'` quoting with the same rules as Redis's `sdssplitargs` (unbalanced quotes are a protocol error); `EXPIRE`/`PEXPIRE` take Redis 7's `NX|XX|GT|LT` (no deadline counts as infinite, options are checked before a non-positive TTL deletes the key); and `HELLO [2|3 ...]` negotiates RESP3 per connection in the event loop: nulls become `_`, `HELLO` and `ROOM.INFO` return maps, Pub/Sub confirmations and messages are pushes, and normal commands work while subscribed. The first S7 change: `resp::parse_request` accepts inline commands (LF or CRLF, split on spaces and tabs, 64 KB line cap) and otherwise defers to the strict `resp::parse`, which AOF recovery keeps using. New commands: `PING`, `ECHO`, `EXISTS`, `MGET`, `MSET`, `EXPIRE`, `PEXPIRE`, `PERSIST`, `UNSUBSCRIBE`, and `QUIT` (handled in the event loop, since it closes the connection); `SUBSCRIBE` takes several channels, and `PING`/`UNSUBSCRIBE` work in subscribe mode. Every key access goes through `lookup()`, so the new reads see cold storage and treat expired keys as absent. `MSET` is one AOF record (atomic under a crash), and expiry commands log the absolute deadline in AOF meta so replay never restarts a TTL; a non-positive TTL reuses `DEL`, as in Redis. SET, CRDTMERGE and MSET now share one `insert()` for new records. Tests: `tests/s7_test.py`, including real `redis-cli` and `redis-benchmark -t ping,set,get,mset` runs (CI installs `redis-tools`), and inline cases in `tests/resp_test.cpp`.
 
 **Inspiration:** Made universal: any Redis client, tool or library should work unmodified.
 
@@ -190,7 +190,7 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 - Inline commands (one line split on spaces) next to RESP multibulk.
 - `PING [message]`, `ECHO`, `EXISTS key [key ...]`, `MGET`, `MSET`, `EXPIRE`/`PEXPIRE`/`PERSIST` on top of S2's absolute deadlines, `UNSUBSCRIBE [channel ...]` and `QUIT`. PING and UNSUBSCRIBE also work in subscribe mode.
 - New mutations persist their resulting state through the existing AOF meta (EXPIRE logs the absolute deadline), so replay stays verbatim.
-- Keep the if-chain dispatcher until it measurably hurts; no RESP3.
+- Keep the if-chain dispatcher until it measurably hurts.
 
 **Acceptance checks:**
 - An interactive `redis-cli` session works, and `redis-benchmark -t ping,set,get,mset` runs without errors.

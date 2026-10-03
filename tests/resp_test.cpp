@@ -67,6 +67,20 @@ int main() {
     // AOF-ul ramane strict: aceeasi linie inline e respinsa de parse()
     assert(parse_all("GET a\r\n") == Status::Malformed);
 
+    // ghilimele ca la redis-cli: spatii pastrate, escape-uri, ghilimele simple
+    using Args = std::vector<std::string>;
+    const auto split = [](const std::string_view line) {
+        Args out;
+        return resp::split_inline(line, &out) ? out : Args{"<malformed>"};
+    };
+    assert((split(R"(SET k "hello world")") == Args{"SET", "k", "hello world"}));
+    assert((split(R"("a\x41\n\"b\\" 'it\'s' x"y z")") == Args{"aA\n\"b\\", "it's", "xy z"}));
+    assert((split(R"('a\nb' "")") == Args{"a\\nb", ""}));
+    for (const char* bad : {R"("abc)", R"('abc)", R"("ab"c)", R"('a'b)"}) {
+        assert(split(bad) == Args{"<malformed>"});
+    }
+    assert(resp::parse_request("SET k \"abc\r\n", 0, &end, &args) == Status::Malformed);
+
     puts("resp_test: OK");
     return 0;
 }
