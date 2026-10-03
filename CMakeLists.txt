@@ -26,6 +26,8 @@ add_executable(Redis main.cpp
         src/storage/snapshot_manager.cpp
         src/storage/eviction_manager.h
         src/storage/eviction_manager.cpp
+        src/storage/replicator.h
+        src/storage/replicator.cpp
         src/utils/count_min_sketch.h
 )
 

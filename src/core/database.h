@@ -34,7 +34,7 @@ private:
     static constexpr const char* ROOMS_FULL =
         "-ERR ROOMS FULL: active room budget reached, ROOM.HIBERNATE one or wait\r\n";
     static constexpr long long ROOM_IDLE_MS = 10000;
-    static constexpr int LOCAL_NODE_ID = 1;
+    uint32_t local_node_id = 1; // SOMNIUM_NODE_ID: versiunea CRDT a scrierilor locale
 
     PubSubManager pubsub;
     PoolAllocator<Record, 1024> record_pool;
