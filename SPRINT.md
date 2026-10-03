@@ -2,7 +2,7 @@
 
 **Goal:** Make SomniumDB more dependable under storage churn, room switching, and slow clients, while adding useful command features.
 
-**Status:** S3 and S5 done; S1, S2 and S4 implemented, awaiting CI verification. These are five implementation tickets, each inspired by one supplied word.
+**Status:** DONE. All five tickets implemented and verified. These are five implementation tickets, each inspired by one supplied word.
 
 **Planning target:** One two-week sprint. Size the tickets against available capacity at kickoff; completion means meeting the acceptance checks below.
 
@@ -18,7 +18,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 ## S1 - Excrescencies: Prune the Growth
 
-**Status: IMPLEMENTED, awaiting CI verification.** Cold storage moved to `cold.bin` with an in-RAM `(room, key)` index that points at the latest record; reads are a single `pread`, misses never touch the disk, and the index replaces the Bloom filter (deleted). Records carry value, absolute expiry and CRDT version. A key lives in RAM or in the index, never both: every access goes through one `lookup()` that moves a cold key back into RAM, so DEL and expiry cannot resurrect a disk value. Because the AOF replays the full state into RAM at startup, the cold file lasts for the process lifetime (truncated on start), which removes the need for on-disk deletion markers, index rebuilds and legacy migration. `COMPACT` rewrites live, unexpired records and publishes file and index together only after every write succeeded. Metrics: `db_cold_file_bytes`, `db_cold_obsolete_bytes`, `db_cold_reclaimed_bytes`. `SOMNIUM_MAX_KEYS` sets the per-room limit (0 makes eviction deterministic for tests). Tests: `tests/s1_test.py`.
+**Status: DONE.** Verified by CI on PR #1 (AddressSanitizer suite and the ThreadSanitizer S4 stress job, both green). Cold storage moved to `cold.bin` with an in-RAM `(room, key)` index that points at the latest record; reads are a single `pread`, misses never touch the disk, and the index replaces the Bloom filter (deleted). Records carry value, absolute expiry and CRDT version. A key lives in RAM or in the index, never both: every access goes through one `lookup()` that moves a cold key back into RAM, so DEL and expiry cannot resurrect a disk value. Because the AOF replays the full state into RAM at startup, the cold file lasts for the process lifetime (truncated on start), which removes the need for on-disk deletion markers, index rebuilds and legacy migration. `COMPACT` rewrites live, unexpired records and publishes file and index together only after every write succeeded. Metrics: `db_cold_file_bytes`, `db_cold_obsolete_bytes`, `db_cold_reclaimed_bytes`. `SOMNIUM_MAX_KEYS` sets the per-room limit (0 makes eviction deterministic for tests). Tests: `tests/s1_test.py`.
 
 **Inspiration:** Unwanted outgrowths become obsolete records accumulating in cold storage.
 
@@ -40,7 +40,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 ## S2 - Sundaes: Build Your Own SET
 
-**Status: IMPLEMENTED, awaiting CI verification.** `SET key value [NX|XX] [EX|PX]` validates every option before any effect (conflicts, duplicates, missing values, nonpositive or overflowing durations), evaluates NX/XX through the same `lookup()` as reads (cold storage included, expired keys absent), and writes nothing to the AOF when a condition fails. `TTL`/`PTTL` follow Redis (`-1`/`-2`). Deadlines are absolute and already travel through AOF meta, snapshots and cold records. Replay now applies CRDTMERGE verbatim like SET (live, an expired key counts as absent, so re-comparing at replay could diverge). `SOMNIUM_CLOCK_OFFSET_MS` is the controllable clock used to simulate time passing while the server is down. Tests: `tests/s2_test.py`.
+**Status: DONE.** Verified by CI on PR #1 (AddressSanitizer suite and the ThreadSanitizer S4 stress job, both green). `SET key value [NX|XX] [EX|PX]` validates every option before any effect (conflicts, duplicates, missing values, nonpositive or overflowing durations), evaluates NX/XX through the same `lookup()` as reads (cold storage included, expired keys absent), and writes nothing to the AOF when a condition fails. `TTL`/`PTTL` follow Redis (`-1`/`-2`). Deadlines are absolute and already travel through AOF meta, snapshots and cold records. Replay now applies CRDTMERGE verbatim like SET (live, an expired key counts as absent, so re-comparing at replay could diverge). `SOMNIUM_CLOCK_OFFSET_MS` is the controllable clock used to simulate time passing while the server is down. Tests: `tests/s2_test.py`.
 
 **Inspiration:** A base scoop with optional toppings becomes a write with composable conditions and expiration.
 
@@ -86,7 +86,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 ## S4 - Rezoned: Rooms With Rules
 
-**Status: IMPLEMENTED, awaiting CI verification.** Rooms have an explicit atomic state (`sleeping`, `loading`, `active`, `hibernating`) with the contract documented in `src/core/room.h`: registry lock before room lock, never the reverse. The active budget is an atomic slot counter reserved with a CAS on both creation and wake, so it holds without scanning the registry under a lock; a full budget returns `-ERR ROOMS FULL` (no implicit LRU eviction: that would put snapshot I/O on the command thread). INFO reads counters only, removing the room-lock then registry-lock inversion. Rooms are never erased from the registry, so a write racing with hibernation of an empty room stays reachable. New commands: `ROOMS`, `ROOM.INFO`, `ROOM.HIBERNATE`, `ROOM.WAKE`; `ROOM name` still selects. Recovery bypasses the budget. Tests: `tests/s4_test.py`, plus a ThreadSanitizer CI job running the S4 stress section.
+**Status: DONE.** Verified by CI on PR #1 (AddressSanitizer suite and the ThreadSanitizer S4 stress job, both green). Rooms have an explicit atomic state (`sleeping`, `loading`, `active`, `hibernating`) with the contract documented in `src/core/room.h`: registry lock before room lock, never the reverse. The active budget is an atomic slot counter reserved with a CAS on both creation and wake, so it holds without scanning the registry under a lock; a full budget returns `-ERR ROOMS FULL` (no implicit LRU eviction: that would put snapshot I/O on the command thread). INFO reads counters only, removing the room-lock then registry-lock inversion. Rooms are never erased from the registry, so a write racing with hibernation of an empty room stays reachable. New commands: `ROOMS`, `ROOM.INFO`, `ROOM.HIBERNATE`, `ROOM.WAKE`; `ROOM name` still selects. Recovery bypasses the budget. Tests: `tests/s4_test.py`, plus a ThreadSanitizer CI job running the S4 stress section.
 
 **Inspiration:** Changing how space is allocated becomes explicit control of which rooms occupy RAM.
 
@@ -131,7 +131,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 ## Execution and completion
 
-- ~~Start with S5's storage contracts and regression fixtures~~ (S5 DONE), ~~then S4 and S1. Build S2 on the resulting record/expiry semantics.~~ (S4, S1, S2 implemented) S3 is independent of the storage work.
+- ~~Start with S5's storage contracts and regression fixtures~~ (S5 DONE), ~~then S4 and S1. Build S2 on the resulting record/expiry semantics.~~ (S4, S1, S2 DONE) S3 is independent of the storage work.
 - Each ticket includes its acceptance tests and documentation in its implementation change.
 - Integration tests use a fresh temporary data directory, an explicitly selected free port, and verification that the launched process owns the endpoint. Development data and an existing Redis service are not test fixtures.
 - Add the regression suite to CTest and run it from a clean build. Record benchmark conditions for the slow-client and compaction demonstrations.
@@ -143,7 +143,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 **Goal:** Remove the remaining hard ceilings: inputs that can kill the server, clients that cannot connect, a log that grows forever, memory that no budget actually bounds, and a CRDT that never leaves its node.
 
-**Status:** Planned. Five tickets, each inspired by one supplied word.
+**Status:** In progress. S6 implemented, awaiting CI verification; S7 to S10 planned. Five tickets, each inspired by one supplied word.
 
 **Planning target:** One two-week sprint for S6 to S9; S10 may spill into the next one. Completion means meeting the acceptance checks below.
 
