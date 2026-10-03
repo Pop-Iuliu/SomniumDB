@@ -11,6 +11,7 @@
 struct DbMetrics {
     std::atomic<uint64_t> keys_in_ram{0};
     std::atomic<uint64_t> resident_bytes{0}; // estimare, vezi record_cost()
+    std::atomic<uint64_t> tombstones{0};     // delete markers inca neuitati (S13)
     std::atomic<uint64_t> total_gets{0};
     std::atomic<uint64_t> total_sets{0};
     std::atomic<uint64_t> cache_hits{0};

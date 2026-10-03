@@ -397,7 +397,7 @@ int main() {
     watchdog.start();
 
     // replicare CRDT catre SOMNIUM_PEERS (nimic fara peers)
-    static Replicator replicator;
+    static Replicator replicator(db.replication_frontier());
     replicator.start();
 
     bool first_wait = true; // doar prima asteptare e sensibila la CQE-uri pierdute

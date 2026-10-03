@@ -59,6 +59,8 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 | `EXPIRE key seconds [NX\|XX\|GT\|LT]`, `PEXPIRE key ms [...]`, `PERSIST key` | Set or remove a deadline (Redis 7 options; no deadline counts as infinite); a non-positive TTL deletes the key |
 | `TTL key`, `PTTL key` | Remaining lifetime; `-1` persistent, `-2` missing |
 | `CRDTMERGE key value timestamp node [expire_at]` | Last-writer-wins merge on `(timestamp, node)`; timestamps are Hybrid Logical Clock values (48-bit ms, 16-bit counter), plain milliseconds are accepted and converted; the optional absolute deadline (ms) travels with the state |
+| `CRDTDEL key timestamp node` | Versioned delete (replication); loses against a newer write |
+| `REPLFRONTIER node frontier` | Replication heartbeat: every write of `node` up to `frontier` has been delivered |
 | `ROOM name` | Select (and wake) a room |
 | `ROOMS` | List known rooms |
 | `ROOM.INFO name` | State, last access, resident keys and estimated bytes |
@@ -72,7 +74,7 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 
 Commands can be sent as RESP arrays or inline (one line split on spaces, with `"..."` and `'...'` quoting as in `redis-cli`, e.g. from `telnet`), so `redis-cli` and `redis-benchmark` work unmodified, in RESP2 or RESP3.
 
-Environment: `REDIS_PORT`, `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_MAXMEMORY` (global budget in bytes for resident keys and values, estimated; default unlimited), `SOMNIUM_AOF_REWRITE_MIN_BYTES` (the AOF is rewritten automatically once it doubles past this size, default 64 MB), `SOMNIUM_NODE_ID` (CRDT node id of local writes, default 1), `SOMNIUM_PEERS` (`host:port,...`: replicate local writes to these nodes as batched CRDT merges, one thread per peer; DEL, EXPIRE and PERSIST stay local; per-peer phi and lag appear in `INFO` and `/metrics`), `SOMNIUM_MAX_CLOCK_OFFSET_MS` (reject merges whose timestamp is further in the future, default 10 minutes), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
+Environment: `REDIS_PORT`, `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_MAXMEMORY` (global budget in bytes for resident keys and values, estimated; default unlimited), `SOMNIUM_AOF_REWRITE_MIN_BYTES` (the AOF is rewritten automatically once it doubles past this size, default 64 MB), `SOMNIUM_NODE_ID` (CRDT node id of local writes, default 1), `SOMNIUM_PEERS` (`host:port,...`: replicate local writes and deletes to these nodes as batched CRDT merges, one thread per peer, assuming a symmetric peer list; delete markers are garbage-collected once every peer's frontier has passed them; per-peer phi and lag appear in `INFO` and `/metrics`), `SOMNIUM_MAX_CLOCK_OFFSET_MS` (reject merges whose timestamp is further in the future, default 10 minutes), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
 
 ---
 

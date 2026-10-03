@@ -277,7 +277,7 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 
 **Goal:** Ground the next steps in published distributed-systems results: versions that respect causality, replication that tolerates its own failure detector, deletes that converge, maintenance that never pauses clients, and a cache that only admits what is warm.
 
-**Status:** In progress. S11 and S12 (the P0s) implemented, awaiting CI verification; S13 to S15 planned.
+**Status:** In progress. S11 and S12 done; S13 implemented, awaiting CI verification; S14 and S15 planned.
 
 | ID | Inspiration | Deliverable | Science | Priority | Depends on |
 | --- | --- | --- | --- | --- | --- |
@@ -291,7 +291,7 @@ P0 fixes a live convergence bug and a replication stall. P1 closes the replicati
 
 ## S11 - Glidder: Slippery Clocks
 
-**Status: IMPLEMENTED, awaiting CI verification.** `hlc::Clock` (`src/core/hlc.h`) packs 48 bits of milliseconds and a 16-bit logical counter into the existing 64-bit version. A local write gets a version strictly above the local clock and above the version it overwrites, and every version seen (incoming merge, AOF replay) advances the clock, so later local writes exceed it, including after a restart. Values below 2^47 are legacy milliseconds and are converted at every entry point (merge, replay, snapshot load), so old data and clients that send milliseconds keep their order. Merges more than `SOMNIUM_MAX_CLOCK_OFFSET_MS` (default 10 minutes) in the future are rejected, so no client can freeze a key. Tests: `tests/hlc_test.cpp` (assert-based, run by `run_all.sh`), `tests/s11_test.py`.
+**Status: DONE.** Verified by CI on PR #7 (AddressSanitizer suite and ThreadSanitizer green). `hlc::Clock` (`src/core/hlc.h`) packs 48 bits of milliseconds and a 16-bit logical counter into the existing 64-bit version. A local write gets a version strictly above the local clock and above the version it overwrites, and every version seen (incoming merge, AOF replay) advances the clock, so later local writes exceed it, including after a restart. Values below 2^47 are legacy milliseconds and are converted at every entry point (merge, replay, snapshot load), so old data and clients that send milliseconds keep their order. Merges more than `SOMNIUM_MAX_CLOCK_OFFSET_MS` (default 10 minutes) in the future are rejected, so no client can freeze a key. Tests: `tests/hlc_test.cpp` (assert-based, run by `run_all.sh`), `tests/s11_test.py`.
 
 **Inspiration:** Slippery clocks become hybrid clocks that cannot slide backwards.
 
@@ -306,7 +306,7 @@ P0 fixes a live convergence bug and a replication stall. P1 closes the replicati
 
 ## S12 - Indulgently: Tolerant of Mistakes
 
-**Status: IMPLEMENTED, awaiting CI verification.** Each peer gets its own replication thread, `connect` is nonblocking and bounded by `poll` (2 seconds), failures back off exponentially up to 30 seconds, and an idle peer receives a `PING` heartbeat. Successful round trips feed a phi accrual detector; phi is computed at report time from the heartbeat history, so suspicion grows while a peer stays silent. `INFO` and `/metrics` show phi and the unacknowledged AOF bytes per peer. Replication stays indulgent: merges are idempotent, so a false suspicion only delays delivery and never affects convergence. Tests: `tests/s12_test.py`.
+**Status: DONE.** Verified by CI on PR #7 (AddressSanitizer suite and ThreadSanitizer green). Each peer gets its own replication thread, `connect` is nonblocking and bounded by `poll` (2 seconds), failures back off exponentially up to 30 seconds, and an idle peer receives a `PING` heartbeat. Successful round trips feed a phi accrual detector; phi is computed at report time from the heartbeat history, so suspicion grows while a peer stays silent. `INFO` and `/metrics` show phi and the unacknowledged AOF bytes per peer. Replication stays indulgent: merges are idempotent, so a false suspicion only delays delivery and never affects convergence. Tests: `tests/s12_test.py`.
 
 **Inspiration:** Indulgent algorithms never lose safety when the failure detector is wrong.
 
@@ -319,6 +319,8 @@ P0 fixes a live convergence bug and a replication stall. P1 closes the replicati
 **Primary files:** `src/storage/replicator.*`, `metrics.*`.
 
 ## S13 - Eldermen: The Council That Decides What Can Be Forgotten
+
+**Status: IMPLEMENTED, awaiting CI verification.** With replication configured, `DEL` writes a tombstone (key, HLC version above the deleted one, node) that replicates as `CRDTDEL`; merges compare against it and new writes are versioned above it. `EXPIRE` and `PERSIST` became versioned writes logged as their full resulting state (`SET` + deadline), so they replicate with no new shipping code. The frontier is exact: the command thread publishes a fresh HLC version only between commands (on each incoming heartbeat), so every earlier local version is already in the AOF; the replicator loads it before reading the AOF and sends `REPLFRONTIER` only after a batch that reached the end of the file. That heartbeat replaces `PING` and also keeps an idle node's frontier moving. Watermark = minimum frontier over all configured peers; tombstones at or below it are dropped, and an incoming write at or below it for a key with no record and no tombstone is ignored, since a tombstone for it may already be gone. Tombstones survive restarts (AOF replay) and rewrites; a single node keeps none, so it pays nothing. Assumes a symmetric peer list. Tests: `tests/s13_test.py`; `tests/s10_test.py` now asserts that DEL replicates.
 
 **Inspiration:** Elders who must all agree before something is forgotten become causal stability.
 

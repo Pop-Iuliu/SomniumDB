@@ -30,6 +30,7 @@ run_suite() {
     python3 tests/s10_test.py
     python3 tests/s11_test.py
     python3 tests/s12_test.py
+    python3 tests/s13_test.py
     python3 tests/s3_test.py
     python3 tests/hib_test.py
 }

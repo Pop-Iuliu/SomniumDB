@@ -3,8 +3,7 @@
 Verifica: scrieri concurente pe acelasi set de chei converg la valori
 identice; camerele si termenele se replica; nimic nu se intoarce in ecou; un
 peer oprit in timpul scrierilor converge dupa repornire; replicarea continua
-dupa o rescriere a AOF-ului (S8). DEL ramane local: limita asumata, testata
-explicit ca sa nu se schimbe pe nesimtite.
+dupa o rescriere a AOF-ului (S8); DEL se replica (S13).
 """
 
 import os
@@ -68,8 +67,7 @@ def sec_converge(check):
               aof(a).count(b"only_a") == 1 and aof(b).count(b"only_a") == 1)
 
         ca.cmd("DEL", "only_a")
-        time.sleep(1.5)
-        check("DEL ramane local (limita asumata)", cb.cmd("GET", "only_a") == ("bulk", b"1"))
+        check("DEL se replica (S13)", wait_until(lambda: cb.cmd("GET", "only_a")[0] == "nil"))
         ca.close()
         cb.close()
     finally:

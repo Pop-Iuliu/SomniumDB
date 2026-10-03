@@ -29,6 +29,14 @@ Database::Database() {
         if (fsutil::parse_u64(env, &id) && id >= 1 && id <= UINT32_MAX) local_node_id = static_cast<uint32_t>(id);
         else fprintf(stderr, "SOMNIUM_NODE_ID invalid: '%s' (folosesc 1)\n", env);
     }
+    if (const char* env = getenv("SOMNIUM_PEERS")) {
+        const std::string peers = env;
+        for (size_t start = 0; start < peers.size();) {
+            const size_t comma = std::min(peers.find(',', start), peers.size());
+            peer_count_ += comma > start;
+            start = comma + 1;
+        }
+    }
     if (const char* env = getenv("SOMNIUM_MAX_CLOCK_OFFSET_MS"); env && !fsutil::parse_i64(env, &max_clock_offset_ms)) {
         fprintf(stderr, "SOMNIUM_MAX_CLOCK_OFFSET_MS invalid: '%s'\n", env);
     }
@@ -49,6 +57,7 @@ Database::Database() {
     if (!aof.open_file()) {
         fprintf(stderr, "AOF: serverul ruleaza FARA persistenta (deschiderea a esuat)!\n");
     }
+    frontier_ = clock_.next(get_current_time_ms(), 0); // tot istoricul redat e deja in AOF
 }
 
 Database::~Database() = default;
@@ -92,6 +101,11 @@ bool Database::rewrite_aof() {
         }
     }
     if (ok && !eviction.for_each(emit)) ok = false;
+    for (const auto& [room, keys] : tombstones_) {
+        for (const auto& [key, v] : keys) {
+            if (ok) ok = aof.append_rewrite({room, {"DEL", key}, 0, v.ts, v.node});
+        }
+    }
 
     if (!ok) {
         aof.abort_rewrite();
@@ -157,8 +171,11 @@ void Database::replay_record(const AofRecord& rec) {
         return;
     }
 
-    if (command == "DEL" && rec.args.size() >= 2) {
+    if ((command == "DEL" && rec.args.size() >= 2) || (command == "CRDTDEL" && rec.args.size() >= 4)) {
         if (const auto it = room->keys.find(rec.args[1]); it != room->keys.end()) erase(*room, it);
+        const Version v{hlc::normalize(rec.timestamp_ms), rec.node_id};
+        set_tomb(rec.room, rec.args[1], v);
+        clock_.observe(v.ts);
         return;
     }
 
@@ -319,6 +336,23 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
         return handle_room_admin(command, args);
     }
 
+    // REPLFRONTIER node F: "toate scrierile mele <= F ti-au fost livrate" (S13)
+    if (command == "REPLFRONTIER") {
+        uint64_t node = 0, f = 0;
+        if (args.size() != 3 || !fsutil::parse_u64(args[1], &node) || node > UINT32_MAX ||
+            !fsutil::parse_u64(args[2], &f)) {
+            return "-ERR usage: REPLFRONTIER node frontier\r\n";
+        }
+        uint64_t& known = frontiers_[static_cast<uint32_t>(node)];
+        known = std::max(known, f);
+        // intre comenzi nu e nimic in zbor: orice versiune locala emisa pana aici
+        // e deja in AOF, deci o versiune noua e o frontiera exacta (si avanseaza
+        // cu timpul fizic chiar daca nodul nu scrie nimic)
+        frontier_ = clock_.next(get_current_time_ms(), 0);
+        collect_tombstones();
+        return "+OK\r\n";
+    }
+
     if (command == "REWRITEAOF") {
         return rewrite_aof() ? "+OK\r\n" : "-ERR AOF rewrite failed, previous AOF kept\r\n";
     }
@@ -392,6 +426,7 @@ std::string Database::execute_in_room(const std::string& room_name, const std::v
         if (command == "SET") return handle_set(room_name, *room, args);
         if (command == "DEL") return handle_del(room_name, *room, args);
         if (command == "CRDTMERGE") return handle_crdtmerge(room_name, *room, args);
+        if (command == "CRDTDEL") return handle_crdtdel(room_name, *room, args);
         if (command == "MGET") return handle_mget(room_name, *room, args);
         if (command == "MSET") return handle_mset(room_name, *room, args);
         if (command == "EXISTS") return handle_exists(room_name, *room, args);
@@ -507,8 +542,11 @@ std::string Database::handle_set(const std::string& room_name, Room& room, const
     // o conditie esuata nu produce nicio mutatie, deci nimic in AOF
     Record* r = lookup(room_name, room, key);
     if ((nx && r) || (xx && !r)) return nil();
-    const uint64_t version = clock_.next(now_ms, r ? r->timestamp_ms : 0);
-    if (!r) r = insert(room, key);
+    const uint64_t version = clock_.next(now_ms, r ? r->timestamp_ms : tomb_ts(room_name, key));
+    if (!r) {
+        r = insert(room, key);
+        clear_tomb(room_name, key);
+    }
     set_value(room, r, args[2]);
     r->expire_at = expire_at; // un SET simplu sterge si TTL-ul vechi
     r->timestamp_ms = version;
@@ -530,12 +568,16 @@ std::string Database::handle_mset(const std::string& room_name, Room& room, cons
 
     uint64_t overwritten = 0;
     for (size_t i = 1; i < args.size(); i += 2) {
-        if (const Record* r = lookup(room_name, room, args[i])) overwritten = std::max(overwritten, r->timestamp_ms);
+        const Record* r = lookup(room_name, room, args[i]);
+        overwritten = std::max(overwritten, r ? r->timestamp_ms : tomb_ts(room_name, args[i]));
     }
     const uint64_t version = clock_.next(get_current_time_ms(), overwritten);
     for (size_t i = 1; i < args.size(); i += 2) {
         Record* r = lookup(room_name, room, args[i]);
-        if (!r) r = insert(room, args[i]);
+        if (!r) {
+            r = insert(room, args[i]);
+            clear_tomb(room_name, args[i]);
+        }
         set_value(room, r, args[i + 1]);
         r->expire_at = 0; // ca la SET simplu: TTL-ul vechi dispare
         r->timestamp_ms = version;
@@ -624,8 +666,11 @@ std::string Database::handle_expire(const std::string& room_name, Room& room, co
     // un termen care a trecut deja sterge cheia
     if (scale && n <= 0) return handle_del(room_name, room, {"DEL", args[1]});
 
+    // o scriere versionata, cu starea completa: se replica si se reda ca orice SET
     r->expire_at = expire_at;
-    aof.append(room_name, args, expire_at, r->timestamp_ms, r->node_id);
+    r->timestamp_ms = clock_.next(get_current_time_ms(), r->timestamp_ms);
+    r->node_id = local_node_id;
+    aof.append(room_name, {"SET", args[1], r->value}, expire_at, r->timestamp_ms, r->node_id);
     return ":1\r\n";
 }
 
@@ -651,11 +696,112 @@ std::string Database::handle_del(const std::string& room_name, Room& room, const
 
     // lookup aduce si cheile din cold storage: stergerea le scoate din ambele
     const std::string& key = args[1];
-    if (!lookup(room_name, room, key)) return ":0\r\n";
+    const Record* r = lookup(room_name, room, key);
+    if (!r) return ":0\r\n";
 
+    // stergerea e o scriere versionata: peste versiunea cheii, deci castiga pe orice nod
+    const Version v{clock_.next(get_current_time_ms(), r->timestamp_ms), local_node_id};
     erase(room, room.keys.find(key));
-    aof.append(room_name, args, 0, clock_.next(get_current_time_ms(), 0), local_node_id);
+    set_tomb(room_name, key, v);
+    aof.append(room_name, args, 0, v.ts, v.node);
     return ":1\r\n";
+}
+
+// CRDTDEL key timestamp node: stergere replicata; pierde fata de o scriere mai noua
+std::string Database::handle_crdtdel(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
+    if (args.size() != 4) {
+        return "-ERR Wrong number of arguments for CRDTDEL\r\n";
+    }
+    Version v;
+    if (std::string err = incoming_version(args[2], args[3], &v); !err.empty()) return err;
+
+    const std::string& key = args[1];
+    const Record* r = lookup(room_name, room, key);
+    if (stale(room_name, key, r, v)) return "+OK (Ignored Stale Write)\r\n";
+    if (r) erase(room, room.keys.find(key));
+    set_tomb(room_name, key, v);
+    aof.append(room_name, args, 0, v.ts, v.node);
+    return "+OK (Deleted)\r\n";
+}
+
+std::string Database::incoming_version(const std::string& ts_arg, const std::string& node_arg, Version* out) {
+    uint64_t ts = 0;
+    uint64_t node = 0;
+    if (!fsutil::parse_u64(ts_arg, &ts) || !fsutil::parse_u64(node_arg, &node) || node > UINT32_MAX) {
+        return "-ERR invalid timestamp or node id\r\n";
+    }
+    // versiunile in ms (clienti vechi) intra in formatul HLC; o versiune prea
+    // departe in viitor ar ingheta cheia pentru totdeauna (nicio scriere n-ar mai castiga)
+    ts = hlc::normalize(ts);
+    if (static_cast<long long>(hlc::physical_ms(ts)) > get_current_time_ms() + max_clock_offset_ms) {
+        return "-ERR timestamp too far in the future (SOMNIUM_MAX_CLOCK_OFFSET_MS)\r\n";
+    }
+    clock_.observe(ts);
+    *out = {ts, static_cast<uint32_t>(node)};
+    return "";
+}
+
+bool Database::stale(const std::string& room_name, const std::string& key, const Record* r, const Version& v) const {
+    if (r) return v <= Version{r->timestamp_ms, r->node_id};
+    if (const Version* t = find_tomb(room_name, key)) return v <= *t;
+    // nimic local: o scriere sub watermark e prea veche, tombstone-ul care ar fi
+    // invins-o putea fi deja uitat (fara asta, cheile sterse ar reinvia)
+    return v.ts <= watermark_;
+}
+
+const Version* Database::find_tomb(const std::string& room_name, const std::string& key) const {
+    const auto room_it = tombstones_.find(room_name);
+    if (room_it == tombstones_.end()) return nullptr;
+    const auto it = room_it->second.find(key);
+    return it == room_it->second.end() ? nullptr : &it->second;
+}
+
+uint64_t Database::tomb_ts(const std::string& room_name, const std::string& key) const {
+    const Version* t = find_tomb(room_name, key);
+    return t ? t->ts : 0;
+}
+
+void Database::set_tomb(const std::string& room_name, const std::string& key, const Version& v) {
+    // fara replicare nu are cine sa trimita scrieri vechi; sub watermark ar fi uitat oricum
+    if (peer_count_ == 0 || v.ts <= watermark_) return;
+    const auto [it, inserted] = tombstones_[room_name].try_emplace(key, v);
+    if (inserted) global_metrics.tombstones.fetch_add(1, std::memory_order_relaxed);
+    else it->second = std::max(it->second, v);
+}
+
+void Database::clear_tomb(const std::string& room_name, const std::string& key) {
+    const auto room_it = tombstones_.find(room_name);
+    if (room_it == tombstones_.end() || room_it->second.erase(key) == 0) return;
+    global_metrics.tombstones.fetch_sub(1, std::memory_order_relaxed);
+    if (room_it->second.empty()) tombstones_.erase(room_it);
+}
+
+// watermark = minimul frontierelor tuturor peer-ilor; un tombstone sub el nu mai
+// poate fi contrazis de nicio scriere care inca n-a sosit
+// ponytail: parcurgere completa la fiecare avans; un index ordonat dupa versiune daca sunt multe
+void Database::collect_tombstones() {
+    size_t heard = 0;
+    uint64_t low = UINT64_MAX;
+    for (const auto& [node, f] : frontiers_) {
+        if (node == local_node_id) continue;
+        ++heard;
+        low = std::min(low, f);
+    }
+    if (peer_count_ == 0 || heard < peer_count_ || low <= watermark_) return;
+
+    watermark_ = low;
+    for (auto room_it = tombstones_.begin(); room_it != tombstones_.end();) {
+        auto& keys = room_it->second;
+        for (auto it = keys.begin(); it != keys.end();) {
+            if (it->second.ts > watermark_) {
+                ++it;
+                continue;
+            }
+            it = keys.erase(it);
+            global_metrics.tombstones.fetch_sub(1, std::memory_order_relaxed);
+        }
+        room_it = keys.empty() ? tombstones_.erase(room_it) : std::next(room_it);
+    }
 }
 
 std::string Database::handle_crdtmerge(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
@@ -667,38 +813,28 @@ std::string Database::handle_crdtmerge(const std::string& room_name, Room& room,
 
     // aceeasi parsare stricta ca la replay: altfel o valoare acceptata live
     // (ex. "-1" sau un nod peste 32 de biti) ar fi respinsa dupa restart
-    uint64_t incoming_ts = 0;
-    uint64_t incoming_node = 0;
-    if (!fsutil::parse_u64(args[3], &incoming_ts) || !fsutil::parse_u64(args[4], &incoming_node) ||
-        incoming_node > UINT32_MAX) {
-        return "-ERR invalid timestamp or node id for CRDTMERGE\r\n";
-    }
     long long expire_at = 0;
     if (args.size() == 6 && (!fsutil::parse_i64(args[5], &expire_at) || expire_at < 0)) {
         return "-ERR invalid expire time for CRDTMERGE\r\n";
     }
-    // versiunile in ms (clienti vechi) intra in formatul HLC; o versiune prea
-    // departe in viitor ar ingheta cheia pentru totdeauna (nicio scriere n-ar mai castiga)
-    incoming_ts = hlc::normalize(incoming_ts);
-    if (static_cast<long long>(hlc::physical_ms(incoming_ts)) > get_current_time_ms() + max_clock_offset_ms) {
-        return "-ERR CRDTMERGE timestamp too far in the future (SOMNIUM_MAX_CLOCK_OFFSET_MS)\r\n";
-    }
-    clock_.observe(incoming_ts);
+    Version v;
+    if (std::string err = incoming_version(args[3], args[4], &v); !err.empty()) return err;
 
     const std::string& key = args[1];
     Record* r = lookup(room_name, room, key);
     // Monotonic Join Semi-Lattice: actualizam doar daca starea e strict mai noua
-    if (r && std::tie(incoming_ts, incoming_node) <= std::tie(r->timestamp_ms, r->node_id)) {
-        return "+OK (Ignored Stale Write)\r\n";
+    if (stale(room_name, key, r, v)) return "+OK (Ignored Stale Write)\r\n";
+    if (!r) {
+        r = insert(room, key);
+        clear_tomb(room_name, key);
     }
-    if (!r) r = insert(room, key);
 
     set_value(room, r, args[2]);
     if (args.size() == 6) r->expire_at = expire_at;
-    r->timestamp_ms = incoming_ts;
-    r->node_id = static_cast<uint32_t>(incoming_node);
+    r->timestamp_ms = v.ts;
+    r->node_id = v.node;
     eviction.record_access(key);
-    aof.append(room_name, args, r->expire_at, incoming_ts, r->node_id);
+    aof.append(room_name, args, r->expire_at, v.ts, v.node);
     return "+OK (State Converged)\r\n";
 }
 
@@ -713,6 +849,7 @@ std::string Database::handle_info() {
         "Camere active: " + std::to_string(active_rooms.load()) + "\n" +
         "Chei totale: " + std::to_string(global_metrics.keys_in_ram.load(std::memory_order_relaxed)) + "\n" +
         "Octeti rezidenti: " + std::to_string(global_metrics.resident_bytes.load(std::memory_order_relaxed)) + "\n" +
+        "Tombstone-uri: " + std::to_string(global_metrics.tombstones.load(std::memory_order_relaxed)) + "\n" +
         "Comenzi procesate: " + std::to_string(total_commands.load(std::memory_order_relaxed)) + "\n" +
         "AOF: " + std::string(aof.policy_name()) + (aof.healthy() ? " (sanatos)" : " (ERORI SCRIERE)") + "\n" +
         peers_report(false);

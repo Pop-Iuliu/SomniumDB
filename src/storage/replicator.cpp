@@ -77,7 +77,7 @@ namespace {
     }
 } // namespace
 
-Replicator::Replicator() {
+Replicator::Replicator(const std::atomic<uint64_t>& frontier) : frontier_(frontier) {
     if (const char* env = getenv("SOMNIUM_NODE_ID")) {
         uint64_t id = 0;
         if (fsutil::parse_u64(env, &id) && id >= 1 && id <= UINT32_MAX) node_id_ = static_cast<uint32_t>(id);
@@ -165,6 +165,8 @@ void Replicator::save(const Peer& peer) {
 }
 
 bool Replicator::ship(Peer& peer) {
+    // frontiera se citeste INAINTE de AOF: tot ce e sub ea e deja in fisierul citit
+    const uint64_t frontier = frontier_.load();
     const int aof = ::open(kAofPath, O_RDONLY | O_CLOEXEC);
     if (aof < 0) return false;
     struct stat sb{};
@@ -206,23 +208,30 @@ bool Replicator::ship(Peer& peer) {
         marks.clear();
         while (resp::parse(buf, pos, &end, &t) == resp::Status::Complete) {
             pos = end;
-            // v3: [room, CMD, args..., META, expire, ts, node]; headerul, DEL/EXPIRE
-            // si inregistrarile venite de la alti noduri doar avanseaza offsetul
+            // v3: [room, CMD, args..., META, expire, ts, node]; headerul si
+            // inregistrarile venite de la alti noduri doar avanseaza offsetul
             const size_t n = t.size();
             uint64_t node = 0;
-            if (n >= 8 && t[n - 4] == "SOMNIUM-META" && fsutil::parse_u64(t[n - 1], &node) && node == node_id_) {
+            if (n >= 7 && t[n - 4] == "SOMNIUM-META" && fsutil::parse_u64(t[n - 1], &node) && node == node_id_) {
                 std::string cmd = t[1];
                 std::ranges::transform(cmd, cmd.begin(), ::toupper);
-                // SET si CRDTMERGE: o pereche; MSET: toate perechile, cu aceeasi versiune
-                const size_t pairs_end = cmd == "MSET" ? n - 4 : (cmd == "SET" || cmd == "CRDTMERGE") ? 4 : 0;
-                for (size_t i = 2; i + 1 < pairs_end; i += 2) {
+                const auto send = [&](const std::vector<std::string>& command) {
                     if (t[0] != room) {
                         out += encode({"ROOM", t[0]});
                         ++expected;
                         room = t[0];
                     }
-                    out += encode({"CRDTMERGE", t[i], t[i + 1], t[n - 2], t[n - 1], t[n - 3]});
+                    out += encode(command);
                     ++expected;
+                };
+                if (cmd == "DEL" || cmd == "CRDTDEL") {
+                    send({"CRDTDEL", t[2], t[n - 2], t[n - 1]});
+                } else {
+                    // SET si CRDTMERGE: o pereche; MSET: toate perechile, cu aceeasi versiune
+                    const size_t pairs_end = cmd == "MSET" ? n - 4 : (cmd == "SET" || cmd == "CRDTMERGE") ? 4 : 0;
+                    for (size_t i = 2; i + 1 < pairs_end; i += 2) {
+                        send({"CRDTMERGE", t[i], t[i + 1], t[n - 2], t[n - 1], t[n - 3]});
+                    }
                 }
             }
             marks.emplace_back(expected, peer.offset + pos);
@@ -238,9 +247,17 @@ bool Replicator::ship(Peer& peer) {
     }
     ::close(aof);
 
-    // fara nimic de trimis, un PING tine loc de heartbeat (marcajele nu il numara)
-    const size_t total = expected > 0 ? expected : 1;
-    if (expected == 0) out = encode({"PING"});
+    // un batch care a ajuns la capatul AOF-ului se incheie cu frontiera (si tine loc
+    // de heartbeat); altfel, fara nimic de trimis, un PING. Marcajele nu le numara.
+    const bool reached_end = read_ok && (marks.empty() ? peer.offset : marks.back().second) == size;
+    size_t total = expected;
+    if (reached_end) {
+        out += encode({"REPLFRONTIER", std::to_string(node_id_), std::to_string(frontier)});
+        ++total;
+    } else if (expected == 0) {
+        out = encode({"PING"});
+        total = 1;
+    }
 
     size_t acked = 0;
     const bool alive = deliver(peer, out, total, &acked);
