@@ -4,6 +4,7 @@
 #include "pubsub.h"
 #include <cstdio>
 #include <iostream>
+#include <vector>
 
 std::string PubSubManager::subscribe(const int client_fd, const std::string& channel) {
     std::lock_guard lock(ps_mutex);
@@ -24,29 +25,27 @@ std::string PubSubManager::subscribe(const int client_fd, const std::string& cha
 }
 
 std::string PubSubManager::publish(const std::string& channel, const std::string& message) {
-    std::lock_guard lock(ps_mutex);
+    // livram DUPA eliberarea lock-ului: sink-ul poate deconecta un abonat lent
+    // (capul de output), iar remove_client() ia acelasi mutex pe acelasi thread
+    std::vector<int> targets;
+    {
+        std::lock_guard lock(ps_mutex);
+        if (const auto it = channel_subscribers.find(channel); it != channel_subscribers.end()) {
+            targets.assign(it->second.begin(), it->second.end());
+        }
+    }
 
-    int receivers = 0;
-    if (channel_subscribers.contains(channel)) {
+    if (!targets.empty() && message_sink) {
         // RESP: [ "message", "nume_canal", "mesajul_efectiv" ]
         std::string msg_resp = "*3\r\n";
         msg_resp += "$7\r\nmessage\r\n";
         msg_resp += "$" + std::to_string(channel.length()) + "\r\n" + channel + "\r\n";
         msg_resp += "$" + std::to_string(message.length()) + "\r\n" + message + "\r\n";
-
-        // colectam fd-urile inainte de livrare: sink-ul poate deconecta un
-        // abonat lent (capul de output), iar erase-ul nu trebuie sa rupa iteratia
-        std::vector<int> targets(channel_subscribers[channel].begin(),
-                                 channel_subscribers[channel].end());
-
-        for (const int fd : targets) {
-            if (message_sink) message_sink(fd, msg_resp);
-            receivers++;
-        }
+        for (const int fd : targets) message_sink(fd, msg_resp);
     }
 
     // returnam cat au primit
-    return ":" + std::to_string(receivers) + "\r\n";
+    return ":" + std::to_string(targets.size()) + "\r\n";
 }
 
 void PubSubManager::remove_client(const int client_fd) {

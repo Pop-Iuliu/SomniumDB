@@ -75,8 +75,6 @@ public:
     const char* policy_name() const;
 
 private:
-    enum class ParseStatus { Complete, NeedMore, Malformed };
-
     int fd_ = -1;          // appendonly.aof
     int rewrite_fd_ = -1;  // appendonly.aof.tmp, doar in timpul migrarii
     SyncPolicy sync_policy_;
@@ -88,8 +86,6 @@ private:
     bool replaying_ = true;
 
     static std::string encode_record(const AofRecord& rec);
-    static ParseStatus parse_resp_array(const std::string& buf, size_t pos,
-                                        size_t* rec_end, std::vector<std::string>* tokens);
     static long long now_ms();
     bool sync_locked(int fd);
     void sync_due_locked();

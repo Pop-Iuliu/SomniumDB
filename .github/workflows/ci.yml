@@ -104,6 +104,10 @@ jobs:
             redis-benchmark -h 127.0.0.1 -p 6399 -t set,get -c 50 -n 100000 --csv
             echo "--- Redis 6.x referinta: SET/GET c=50 pipelinat -P 16 ---"
             redis-benchmark -h 127.0.0.1 -p 6399 -t set,get -c 50 -n 100000 -P 16 --csv
+            echo "--- SomniumDB: SET 100B pipelinat adanc -P 64 ---"
+            redis-benchmark -h 127.0.0.1 -p 6380 -t set -c 50 -n 100000 -d 100 -r 100000 -P 64 --csv
+            echo "--- Redis 6.x referinta: SET 100B pipelinat adanc -P 64 ---"
+            redis-benchmark -h 127.0.0.1 -p 6399 -t set -c 50 -n 100000 -d 100 -r 100000 -P 64 --csv
           } | tee bench.txt
           kill "$(cat /tmp/somnium.pid)" "$(cat /tmp/redis.pid)" || true
 

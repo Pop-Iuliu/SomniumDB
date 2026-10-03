@@ -10,6 +10,7 @@ endif()
 add_executable(Redis main.cpp
         src/core/database.h
         src/core/database.cpp
+        src/core/resp.h
         json.hpp
         watchdog.h
         watchdog.cpp
@@ -29,6 +30,9 @@ add_executable(Redis main.cpp
 )
 
 target_link_libraries(Redis uring)
+
+# verificarea parserului RESP: header-only, fara server
+add_executable(resp_test tests/resp_test.cpp)
 
 enable_testing()
 add_test(NAME somnium_suite

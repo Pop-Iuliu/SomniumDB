@@ -6,6 +6,9 @@ cd "$(dirname "$0")/.."
 BIN="${1:-build-release/Redis}"
 echo "=== SomniumDB test suite: $BIN ==="
 
+# parserul RESP, fara server (construit langa binarul testat)
+"$(dirname "$BIN")/resp_test"
+
 # farmece de serveri orfani din rulari anterioare (local; in CI nu exista)
 pkill -x Redis 2>/dev/null || true
 sleep 0.3
@@ -19,6 +22,7 @@ run_suite() {
     python3 tests/s4_test.py
     python3 tests/s1_test.py
     python3 tests/s2_test.py
+    python3 tests/s6_test.py
     python3 tests/s3_test.py
     python3 tests/hib_test.py
 }
