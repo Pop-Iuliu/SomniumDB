@@ -29,6 +29,21 @@ inline bool write_all(int fd, const char* data, size_t len) {
     return true;
 }
 
+// citire completa de la un offset (pread poate intoarce partial sau cu EINTR)
+inline bool pread_all(int fd, char* data, size_t len, off_t off) {
+    size_t got = 0;
+    while (got < len) {
+        const ssize_t n = ::pread(fd, data + got, len - got, off + static_cast<off_t>(got));
+        if (n > 0) {
+            got += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
 // fdatasync: pentru append-uri e suficient (dimensiunea modificata e acoperita)
 inline bool sync_fd(int fd) {
     return ::fdatasync(fd) == 0;

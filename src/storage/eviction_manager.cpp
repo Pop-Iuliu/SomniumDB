@@ -1,176 +1,166 @@
 #include "eviction_manager.h"
+#include "fs_util.h"
 #include "../../metrics.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <random>
 #include <ranges>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <cstring>
-#include <fstream>
-#include <string_view>
 
 namespace {
-    // format cold storage: rlen | room | klen | key | vlen | value (append-only)
-    template <typename Fn>
-    void for_each_cold_record(const char* mapped, size_t size, Fn&& fn) {
-        size_t offset = 0;
-        auto read_size = [&](size_t& out) {
-            if (offset + sizeof(size_t) > size) return false;
-            std::memcpy(&out, mapped + offset, sizeof(size_t));
-            offset += sizeof(size_t);
-            return true;
-        };
+    constexpr char kColdPath[] = "cold.bin";
+    constexpr char kColdTmp[] = "cold.bin.tmp";
 
-        while (offset < size) {
-            size_t rlen = 0;
-            if (!read_size(rlen) || offset + rlen + sizeof(size_t) > size) break;
-            const std::string_view room(mapped + offset, rlen);
-            offset += rlen;
+    // inregistrare: expire_at(i64) | timestamp_ms(u64) | node_id(u32) | valoare
+    // (lungimea valorii rezulta din lungimea tinuta in index)
+    constexpr size_t kHeader = sizeof(long long) + sizeof(uint64_t) + sizeof(uint32_t);
 
-            size_t klen = 0;
-            if (!read_size(klen) || offset + klen + sizeof(size_t) > size) break;
-            const std::string_view key(mapped + offset, klen);
-            offset += klen;
+    std::string encode(const Record& r) {
+        std::string out(kHeader, '\0');
+        std::memcpy(out.data(), &r.expire_at, sizeof(r.expire_at));
+        std::memcpy(out.data() + 8, &r.timestamp_ms, sizeof(r.timestamp_ms));
+        std::memcpy(out.data() + 16, &r.node_id, sizeof(r.node_id));
+        out += r.value;
+        return out;
+    }
 
-            size_t vlen = 0;
-            if (!read_size(vlen) || offset + vlen > size) break;
-            const std::string_view value(mapped + offset, vlen);
-            offset += vlen;
-
-            if (fn(room, key, value)) break;
-        }
+    Record decode(const std::string& raw) {
+        Record r(raw.substr(kHeader), 0);
+        std::memcpy(&r.expire_at, raw.data(), sizeof(r.expire_at));
+        std::memcpy(&r.timestamp_ms, raw.data() + 8, sizeof(r.timestamp_ms));
+        std::memcpy(&r.node_id, raw.data() + 16, sizeof(r.node_id));
+        return r;
     }
 } // namespace
 
 EvictionManager::EvictionManager() {
-    reload_disk_shield();
+    if (const char* env = getenv("SOMNIUM_MAX_KEYS"); env && !fsutil::parse_u64(env, &max_keys_per_room)) {
+        fprintf(stderr, "SOMNIUM_MAX_KEYS invalid: '%s' (folosesc %llu)\n", env,
+                static_cast<unsigned long long>(max_keys_per_room));
+    }
+    fd = ::open(kColdPath, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "Cold storage indisponibil (%s): cheile raman in RAM\n", strerror(errno));
+    }
+    publish_metrics();
 }
 
-void EvictionManager::reload_disk_shield() {
-    const int fd = open("despised_keys.bin", O_RDONLY);
-    if (fd < 0) return;
+EvictionManager::~EvictionManager() {
+    if (fd >= 0) ::close(fd);
+}
 
-    struct stat sb{};
-    if (fstat(fd, &sb) == -1 || sb.st_size == 0) {
-        close(fd);
-        return;
-    }
-
-    const auto mapped = static_cast<char*>(mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0));
-    if (mapped == MAP_FAILED) {
-        close(fd);
-        return;
-    }
-
-    size_t restored = 0;
-    for_each_cold_record(mapped, static_cast<size_t>(sb.st_size), [&](std::string_view, std::string_view key, std::string_view) {
-        disk_shield.add(std::string(key));
-        restored++;
-        return false;
-    });
-
-    munmap(mapped, sb.st_size);
-    close(fd);
-
-    if (restored > 0) {
-        printf("Disk Shield reconstruit: %zu chei evict-uite cunoscute.\n", restored);
-    }
+void EvictionManager::publish_metrics() const {
+    global_metrics.cold_file_bytes.store(file_bytes, std::memory_order_relaxed);
+    global_metrics.cold_obsolete_bytes.store(obsolete_bytes, std::memory_order_relaxed);
 }
 
 void EvictionManager::evict_despised_keys(Room& room, PoolAllocator<Record, 1024>& pool) {
-    while (room.keys.size() > MAX_KEYS_PER_ROOM) {
-        constexpr int SAMPLE_SIZE = 5;
-        std::string despised_key = "";
-        uint16_t lowest_freq = 0xFFFF;
+    constexpr int SAMPLE_SIZE = 5;
+    static std::mt19937 rng(std::random_device{}());
 
-        size_t bucket_count = room.keys.bucket_count();
-        if (bucket_count == 0) break;
-
-        static std::mt19937 rng(std::random_device{}());
-        std::uniform_int_distribution<size_t> dist(0, bucket_count - 1);
-
+    while (room.keys.size() > max_keys_per_room) {
+        // LFU aproximativ: cea mai rara dintre cateva chei esantionate
+        const std::string* victim = nullptr;
+        uint16_t lowest = 0xFFFF;
+        std::uniform_int_distribution<size_t> dist(0, room.keys.bucket_count() - 1);
         for (int i = 0; i < SAMPLE_SIZE; ++i) {
-            size_t random_bucket = dist(rng);
-            auto it = room.keys.begin(random_bucket);
-
-            while (it == room.keys.end(random_bucket)) {
-                random_bucket = (random_bucket + 1) % bucket_count;
-                it = room.keys.begin(random_bucket);
-            }
-
-            const std::string& candidate_key = it->first;
-            uint16_t freq = cms.estimate_frequency(candidate_key);
-
-            if (freq < lowest_freq) {
-                lowest_freq = freq;
-                despised_key = candidate_key;
+            size_t bucket = dist(rng);
+            while (room.keys.bucket_size(bucket) == 0) bucket = (bucket + 1) % room.keys.bucket_count();
+            const std::string& candidate = room.keys.begin(bucket)->first;
+            if (const uint16_t freq = cms.estimate_frequency(candidate); !victim || freq < lowest) {
+                lowest = freq;
+                victim = &candidate;
             }
         }
-
-        if (lowest_freq > 10) {
-            for (const auto &k: room.keys | std::views::keys) {
+        // esantionul a prins doar chei fierbinti: cautam explicit una rece
+        if (lowest > 10) {
+            for (const auto& k : room.keys | std::views::keys) {
                 if (cms.estimate_frequency(k) <= 2) {
-                    despised_key = k;
+                    victim = &k;
                     break;
                 }
             }
         }
 
-        if (!despised_key.empty() && room.keys.contains(despised_key)) {
-            global_metrics.keys_evicted.fetch_add(1, std::memory_order_relaxed);
-            global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
-
-            disk_shield.add(despised_key);
-            if (std::ofstream cold_file("despised_keys.bin", std::ios::app | std::ios::binary); cold_file.is_open()) {
-                size_t rlen = room.name.size();
-                size_t klen = despised_key.size();
-                size_t vlen = room.keys[despised_key]->value.size();
-
-                cold_file.write(reinterpret_cast<const char*>(&rlen), sizeof(rlen));
-                cold_file.write(room.name.data(), static_cast<std::streamsize>(rlen));
-                cold_file.write(reinterpret_cast<const char*>(&klen), sizeof(klen));
-                cold_file.write(despised_key.data(), static_cast<std::streamsize>(klen));
-                cold_file.write(reinterpret_cast<const char*>(&vlen), sizeof(vlen));
-                cold_file.write(room.keys[despised_key]->value.data(), static_cast<std::streamsize>(vlen));
-            }
-
-            pool.destroy(room.keys[despised_key]);
-            room.keys.erase(despised_key);
-        } else {
+        const auto it = room.keys.find(*victim);
+        const std::string data = encode(*it->second);
+        if (fd < 0 || !fsutil::write_all(fd, data.data(), data.size())) {
+            fprintf(stderr, "Cold storage: scriere esuata, cheile raman in RAM\n");
             break;
         }
+
+        index[room.name][it->first] = {file_bytes, data.size()};
+        file_bytes += data.size();
+        global_metrics.keys_evicted.fetch_add(1, std::memory_order_relaxed);
+        global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
+        pool.destroy(it->second);
+        room.keys.erase(it);
     }
+    publish_metrics();
 }
 
-std::string EvictionManager::read_from_cold_storage(const std::string& room_name, const std::string& key) {
-    const int fd = open("despised_keys.bin", O_RDONLY);
-    if (fd < 0) return "";
+std::optional<Record> EvictionManager::take(const std::string& room_name, const std::string& key) {
+    const auto room_it = index.find(room_name);
+    if (room_it == index.end()) return std::nullopt;
+    const auto it = room_it->second.find(key);
+    if (it == room_it->second.end()) return std::nullopt;
 
-    struct stat sb{};
-    if (fstat(fd, &sb) == -1 || sb.st_size == 0) {
-        close(fd);
-        return "";
+    const ColdRef ref = it->second;
+    std::string raw(ref.len, '\0');
+    if (!fsutil::pread_all(fd, raw.data(), raw.size(), static_cast<off_t>(ref.off))) {
+        // ponytail: o eroare de citire raporteaza cheia ca absenta; intrarea
+        // ramane in index ca datele sa nu se piarda
+        fprintf(stderr, "Cold storage: citire esuata: %s\n", strerror(errno));
+        return std::nullopt;
     }
 
-    const auto mapped = static_cast<char*>(mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0));
-    if (mapped == MAP_FAILED) {
-        close(fd);
-        return "";
+    room_it->second.erase(it);
+    if (room_it->second.empty()) index.erase(room_it);
+    obsolete_bytes += ref.len;
+    publish_metrics();
+    return decode(raw);
+}
+
+long long EvictionManager::compact(const long long now_ms) {
+    const int out = ::open(kColdTmp, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    if (out < 0) {
+        fprintf(stderr, "Compactare: nu pot crea %s: %s\n", kColdTmp, strerror(errno));
+        return -1;
     }
 
-    // ultima aparitie castiga: cheile re-evict-uite produc duplicate, cel mai
-    // recent append este si cea mai noua valoare
-    std::string found_value;
-    for_each_cold_record(mapped, static_cast<size_t>(sb.st_size), [&](std::string_view room, std::string_view k, std::string_view v) {
-        if (room == room_name && k == key) {
-            found_value.assign(v.begin(), v.end());
+    decltype(index) fresh;
+    uint64_t size = 0;
+    bool ok = true;
+    std::string raw;
+    for (const auto& [room_name, keys] : index) {
+        for (const auto& [key, ref] : keys) {
+            raw.resize(ref.len);
+            ok = fsutil::pread_all(fd, raw.data(), raw.size(), static_cast<off_t>(ref.off));
+            if (ok && decode(raw).expired(now_ms)) continue; // expirata: recuperata
+            ok = ok && fsutil::write_all(out, raw.data(), raw.size());
+            if (!ok) break;
+            fresh[room_name][key] = {size, ref.len};
+            size += ref.len;
         }
-        return false;
-    });
+        if (!ok) break;
+    }
 
-    munmap(mapped, sb.st_size);
-    close(fd);
+    if (!ok || ::rename(kColdTmp, kColdPath) != 0) {
+        fprintf(stderr, "Compactare esuata: %s (fisierul vechi ramane in uz)\n", strerror(errno));
+        ::close(out);
+        ::unlink(kColdTmp);
+        return -1;
+    }
 
-    return found_value;
+    ::close(fd);
+    fd = out;
+    const uint64_t reclaimed = file_bytes - size;
+    index = std::move(fresh);
+    file_bytes = size;
+    obsolete_bytes = 0;
+    global_metrics.cold_reclaimed_bytes.fetch_add(reclaimed, std::memory_order_relaxed);
+    publish_metrics();
+    return static_cast<long long>(reclaimed);
 }

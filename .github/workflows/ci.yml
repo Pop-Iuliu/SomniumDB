@@ -43,6 +43,31 @@ jobs:
       - name: Teste impotriva buildului ASan
         run: tests/run_all.sh build-asan/Redis
 
+  tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instaleaza dependente
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev cmake build-essential
+
+      # TSan din GCC 13 nu suporta entropia ASLR implicita a kernelului de pe runner
+      - name: Reduce entropia mmap pentru TSan
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure + build (Debug + TSan)
+        run: |
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=thread -g"
+          cmake --build build-tsan
+
+      - name: Stres S4 (comenzi + watchdog) sub TSan
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          SOMNIUM_BIN: build-tsan/Redis
+        run: python3 tests/s4_test.py
+
   benchmark:
     runs-on: ubuntu-24.04
     needs: tests

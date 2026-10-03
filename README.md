@@ -10,7 +10,7 @@
 
 * **Kernel-level asynchronous I/O** via Linux `io_uring`.
 * **Zero-fragmentation memory management** with a custom C++ compliant pool allocator.
-* **Cold storage tiering** using probabilistic data structures (Bloom Filters & CountMinSketch).
+* **Cold storage tiering** with an exact `(room, key)` index, LFU eviction via CountMinSketch, and online compaction.
 * **Fine-grained concurrency control** to eliminate lock contention under heavy multi-threaded workloads.
 
 ---
@@ -28,24 +28,43 @@ A high-speed memory allocator fully conforming to `std::allocator_traits`.
 * **STL Compatibility:** Works seamlessly with standard STL containers (`std::vector`, `std::unordered_map`, etc.).
 * **Performance:** Eliminates heap fragmentation and avoids expensive global locks from system `malloc`/`free`.
 
-### Fine-Grained Locking Hierarchy
+### Rooms: Partitions With a RAM Budget
 
-A multi-tiered concurrency model designed for parallel command execution:
+Keys live in rooms (partitions). At most 3 rooms are active in RAM at once; idle rooms hibernate to a validated snapshot after 10 seconds and wake on their next command.
 
-* **Global Level:** `std::shared_mutex` allows multiple concurrent read operations across the database.
-* **Partition Level:** Dedicated `std::mutex` per `Room` (partition). Commands targeting distinct partitions run completely in parallel with zero lock contention.
+* **Explicit lifecycle:** `sleeping -> loading -> active -> hibernating -> sleeping`. The budget is enforced on both creation and wake; a full budget returns a clear `-ERR ROOMS FULL` instead of silently exceeding it. The `default` room is pinned.
+* **Locking contract:** the registry `std::shared_mutex` is always taken before a room's `std::mutex`, never the reverse. Room state and last access are atomics, so the maintenance thread and `ROOM.INFO` never wait behind snapshot I/O.
 
 ### Intelligent Cold Storage & Tiering
 
 When RAM limits are reached, SomniumDB seamlessly shifts cold keys to disk:
 
-* **CountMinSketch Algorithm:** Tracks access frequency to enforce a precise Least Frequently Used (LFU) eviction policy.
-* **Bloom Filter:** Guardrail structure that prevents costly disk reads on non-existent keys (*cache miss optimization*).
-* **Transparent Tiering:** Evicted keys are read back from cold storage automatically when requested by a client.
+* **CountMinSketch Algorithm:** Tracks access frequency to drive an approximate Least Frequently Used (LFU) eviction policy.
+* **Exact index:** An in-RAM `(room, key)` index points at the latest record in `cold.bin`, so a miss never touches the disk and a lookup reads exactly one record. A key lives in RAM or in cold storage, never both, so a deleted key can never resurface from disk.
+* **Full fidelity:** Value, absolute expiry and CRDT version travel with the record through eviction and reload.
+* **Compaction:** `COMPACT` rewrites only live records; the new file and index are published together, and a failed compaction keeps the old ones. Cold storage lasts for the process lifetime: on restart the AOF replays the full state into RAM.
 
 ### Built-in Observability & Metrics
 
 An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports real-time application metrics formatted for direct scraping by Prometheus and visualization via Grafana.
+
+### Commands
+
+| Command | Description |
+| --- | --- |
+| `GET key`, `DEL key` | Read or delete; both see keys in cold storage |
+| `SET key value [NX\|XX] [EX seconds\|PX milliseconds]` | Conditional and expiring writes, strictly validated; a failed condition replies nil and writes nothing |
+| `TTL key`, `PTTL key` | Remaining lifetime; `-1` persistent, `-2` missing |
+| `CRDTMERGE key value timestamp node` | Last-writer-wins merge on `(timestamp, node)` |
+| `ROOM name` | Select (and wake) a room |
+| `ROOMS` | List known rooms |
+| `ROOM.INFO name` | State, last access, resident keys |
+| `ROOM.HIBERNATE name`, `ROOM.WAKE name` | Explicit room control |
+| `COMPACT` | Compact cold storage; replies with reclaimed bytes |
+| `SUBSCRIBE channel`, `PUBLISH channel message` | Pub/Sub |
+| `INFO`, `SAVE` | Server status, persistence health |
+
+Environment: `REDIS_PORT`, `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
 
 ---
 
@@ -135,7 +154,7 @@ Measured after the S5 (persistence contracts) milestone. Both servers measured b
 | RSS for 63k keys (100B values) | +13 MB | +17 MB | +29% |
 | CRDTMERGE, 1 client pipelined | n/a | 263,158 ops/s | SomniumDB only |
 
-For history: before the queued-output milestone, pipelined throughput collapsed to ~19k ops/s (a blocked sender stalled the whole event loop); the same workload now runs over 50x faster. The S5 milestone also removed the SET handicap — the per-command AOF append became a single POSIX `write()` and the `everysec` fsync moved off the command thread onto the watchdog.
+For history: before the queued-output milestone, pipelined throughput collapsed to ~19k ops/s (a blocked sender stalled the whole event loop); the same workload now runs over 50x faster. The S5 milestone also removed the SET handicap: the per-command AOF append became a single POSIX `write()` and the `everysec` fsync moved off the command thread onto the watchdog.
 
 ### Correctness under load
 

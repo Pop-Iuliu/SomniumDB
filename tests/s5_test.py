@@ -8,55 +8,10 @@ durabilitate.
 """
 
 import os
-import socket
 import struct
 import time
 
-from common import Server, resp_cmd, recv_until, report
-
-
-class Client:
-    """Client RESP minimal, cu drain complet per comanda."""
-
-    def __init__(self, srv):
-        self.s = srv.connect()
-
-    def cmd(self, *args):
-        self.s.sendall(resp_cmd(*args))
-        return self.read_reply()
-
-    def read_reply(self):
-        s = self.s
-        s.settimeout(10)
-        first = b""
-        while not first.endswith(b"\r\n"):
-            chunk = s.recv(4096)
-            if not chunk:
-                raise ConnectionError("serverul a inchis conexiunea")
-            first += chunk
-        t, rest = first[0:1], first[1:]
-        if t == b"+":
-            return ("ok", rest[:-2].decode())
-        if t == b"-":
-            return ("err", rest[:-2].decode())
-        if t == b":":
-            return ("int", int(rest[:-2]))
-        if t == b"$":
-            length = int(rest.split(b"\r\n", 1)[0])
-            if length == -1:
-                return ("nil", None)
-            want = len(b"$" + str(length).encode() + b"\r\n") + length + 2
-            while len(first) < want:
-                chunk = s.recv(want - len(first))
-                if not chunk:
-                    raise ConnectionError("răspuns trunchiat")
-                first += chunk
-            payload = first[len(b"$" + str(length).encode() + b"\r\n"):want - 2]
-            return ("bulk", payload)
-        raise AssertionError(f"răspuns necunoscut: {first!r}")
-
-    def close(self):
-        self.s.close()
+from common import Client, Server, report, run_with_retry
 
 
 def bulk(b: bytes) -> bytes:
@@ -98,35 +53,6 @@ def write_snapshot_v2(path, records):
             f.write(struct.pack("<q", expire))
             f.write(struct.pack("<Q", ts))
             f.write(struct.pack("<I", node))
-
-
-def run_with_retry(fn, fails, max_attempts=3):
-    """Ruleaza o sectiune de test, reiaut de la zero la deces de server.
-
-    Flake-ul io_uring documentat in AGENTS.md poate livra un server fara
-    nicio completare (conexiunile atarna sau se resateaza); sectiunile sunt
-    self-contained (Server curat de fiecare data), deci le putem re-rula.
-    Esecurile reale de asertie raman consemnate la ultima incercare.
-    """
-    for attempt in range(max_attempts):
-        local_fails = []
-
-        def check(name, cond, extra="", _lf=local_fails):
-            print(("PASS" if cond else "FAIL"), name, extra if not cond else "")
-            if not cond:
-                _lf.append(name)
-
-        try:
-            fn(check)
-            fails.extend(local_fails)
-            return
-        except (ConnectionError, TimeoutError, OSError, RuntimeError, AssertionError) as e:
-            if attempt == max_attempts - 1:
-                print(f"  sectiune esuata definitiv: {type(e).__name__} {e}")
-                fails.extend(local_fails)
-                fails.append(f"sectiune prabusita: {type(e).__name__}: {e}")
-            else:
-                print(f"  (sectiune reiauta dupa {type(e).__name__})")
 
 
 def main():

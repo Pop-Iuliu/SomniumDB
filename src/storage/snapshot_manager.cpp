@@ -23,19 +23,12 @@ namespace {
     }
 } // namespace
 
-bool SnapshotManager::has_snapshot(const std::string& room_name) {
-    struct stat sb{};
-    const std::string filename = "room_" + room_name + ".bin";
-    // doar fisiere regulate conteaza; un director cu acelasi nume nu e un
-    // snapshot (si poate servi drept injectie de esec la rename)
-    return ::stat(filename.c_str(), &sb) == 0 && S_ISREG(sb.st_mode);
-}
-
 bool SnapshotManager::wakeup_room(Room& room, PoolAllocator<Record, 1024>& pool) {
     const std::string filename = "room_" + room.name + ".bin";
     struct stat sb{};
+    // doar fisiere regulate conteaza; un director cu acelasi nume nu e un
+    // snapshot (si poate servi drept injectie de esec la rename)
     if (::stat(filename.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) {
-        room.hibernated = false;
         return false;
     }
 
@@ -45,7 +38,6 @@ bool SnapshotManager::wakeup_room(Room& room, PoolAllocator<Record, 1024>& pool)
         if (!file.is_open() || sb.st_size > 0 &&
             !file.read(data.data(), static_cast<std::streamsize>(sb.st_size))) {
             // fisierul exista dar nu poate fi citit: il pastram, nu il stergem
-            room.hibernated = false;
             return false;
         }
     }
@@ -148,25 +140,23 @@ bool SnapshotManager::wakeup_room(Room& room, PoolAllocator<Record, 1024>& pool)
             printf("Snapshot corupt pentru camera '%s'; pastrat pentru diagnostic: %s\n",
                    room.name.c_str(), dst.c_str());
         }
-        room.hibernated = false;
         return false;
     }
 
     // abia acum, dupa incarcare valida, eliberam starea veche si o substituem
     destroy_all_records(room, pool);
     room.keys = std::move(loaded);
-    room.hibernated = false;
     return true;
 }
 
-HibernateResult SnapshotManager::hibernate_room(Room& room, PoolAllocator<Record, 1024>& pool, size_t* written) {
+bool SnapshotManager::hibernate_room(Room& room, PoolAllocator<Record, 1024>& pool) {
     const std::string filename = "room_" + room.name + ".bin";
     const std::string tmpname = filename + ".tmp";
 
     const int fd = ::open(tmpname.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         fprintf(stderr, "Snapshot '%s': nu pot crea fisierul temporar: %s\n", room.name.c_str(), strerror(errno));
-        return HibernateResult::Failure;
+        return false;
     }
 
     const uint64_t num_records = room.keys.size();
@@ -211,12 +201,12 @@ HibernateResult SnapshotManager::hibernate_room(Room& room, PoolAllocator<Record
         if (ok) fprintf(stderr, "Snapshot '%s': fdatasync a esuat: %s\n", room.name.c_str(), strerror(errno));
         ::close(fd);
         ::unlink(tmpname.c_str());
-        return HibernateResult::Failure;
+        return false;
     }
     if (::close(fd) != 0) {
         fprintf(stderr, "Snapshot '%s': close esuat: %s\n", room.name.c_str(), strerror(errno));
         ::unlink(tmpname.c_str());
-        return HibernateResult::Failure;
+        return false;
     }
 
     // rename atomic, dar VALIDAT: daca esueaza, inregistrarile raman in RAM
@@ -224,12 +214,10 @@ HibernateResult SnapshotManager::hibernate_room(Room& room, PoolAllocator<Record
     if (::rename(tmpname.c_str(), filename.c_str()) != 0) {
         fprintf(stderr, "Snapshot '%s': rename esuat: %s\n", room.name.c_str(), strerror(errno));
         ::unlink(tmpname.c_str());
-        return HibernateResult::Failure;
+        return false;
     }
     fsutil::sync_dir();
 
-    *written = room.keys.size();
     destroy_all_records(room, pool);
-    room.hibernated = true;
-    return *written == 0 ? HibernateResult::Empty : HibernateResult::Written;
+    return true;
 }

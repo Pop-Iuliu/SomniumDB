@@ -10,5 +10,7 @@ struct Record {
     Record(std::string v, const long long e) : value(std::move(v)), expire_at(e) {}
     uint64_t timestamp_ms{0};
     uint32_t node_id{1};
+
+    bool expired(const long long now_ms) const { return expire_at > 0 && now_ms > expire_at; }
 };
 

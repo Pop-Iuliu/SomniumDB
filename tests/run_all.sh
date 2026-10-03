@@ -16,6 +16,9 @@ sleep 0.3
 run_suite() {
     python3 tests/smoke_test.py
     python3 tests/s5_test.py
+    python3 tests/s4_test.py
+    python3 tests/s1_test.py
+    python3 tests/s2_test.py
     python3 tests/s3_test.py
     python3 tests/hib_test.py
 }

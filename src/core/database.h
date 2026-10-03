@@ -26,10 +26,13 @@ private:
     std::chrono::steady_clock::time_point start_time;
     std::atomic<long long> total_commands{0};
 
-    std::shared_mutex rooms_mutex; // protejeaza rooms hashmap
+    std::shared_mutex rooms_mutex; // protejeaza rooms hashmap (contractul complet: room.h)
     std::mutex client_mutex;       // protejeaza client_rooms si accesul global (non-room)
+    std::atomic<size_t> active_rooms{0}; // camere care nu sunt Sleeping
 
     static constexpr size_t MAX_ACTIVE_ROOMS = 3;
+    static constexpr const char* ROOMS_FULL =
+        "-ERR ROOMS FULL: active room budget reached, ROOM.HIBERNATE one or wait\r\n";
     static constexpr long long ROOM_IDLE_MS = 10000;
     static constexpr int LOCAL_NODE_ID = 1;
 
@@ -39,9 +42,16 @@ private:
     AOFManager aof;
     EvictionManager eviction;
 
-    // intoarce nullptr daca s-a atins limita de camere active (bypass la
-    // recovery: redarea nu trebuie sa piarda camere doar din cauza bugetului)
-    std::shared_ptr<Room> get_or_create_room(const std::string& name, bool allow_over_budget = false);
+    // nullptr doar daca camera nu exista si create == false
+    std::shared_ptr<Room> find_room(const std::string& name, bool create);
+
+    // ambele presupun room_mutex prins. activate: false = buget plin (bypass
+    // la recovery: redarea nu pierde camere din cauza bugetului).
+    // hibernate: false = snapshot esuat, camera ramane activa si citibila.
+    bool activate(Room& room, bool over_budget = false);
+    bool hibernate(Room& room);
+    // creeaza la nevoie si activeaza, luand singur lock-ul camerei
+    bool wake_room(const std::string& name);
 
     // dispecerarea lock-uita pe camera; folosita si de replay-ul AOF
     std::string execute_in_room(const std::string& room_name, const std::vector<std::string>& args);
@@ -54,11 +64,17 @@ private:
     // migrarea fisierelor AOF vechi (v1/v2) sau corupte catre formatul v3
     void migrate_aof_to_v3();
 
+    // cheia logica: RAM, apoi cold storage (reincarcata in RAM); cheile expirate
+    // conteaza ca absente. nullptr = cheia nu exista.
+    Record* lookup(const std::string& room_name, Room& room, const std::string& key);
+
     std::string handle_get(const std::string& room_name, Room& room, const std::vector<std::string>& args);
     std::string handle_set(const std::string& room_name, Room& room, const std::vector<std::string>& args);
+    std::string handle_ttl(const std::string& room_name, Room& room, const std::vector<std::string>& args, bool millis);
     std::string handle_del(const std::string& room_name, Room& room, const std::vector<std::string>& args);
     std::string handle_crdtmerge(const std::string& room_name, Room& room, const std::vector<std::string>& args);
-    std::string handle_info(Room& room);
+    std::string handle_info();
+    std::string handle_room_admin(const std::string& command, const std::vector<std::string>& args);
 
     static std::string bulk_string(const std::string& payload);
 

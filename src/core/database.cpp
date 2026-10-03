@@ -4,12 +4,21 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <climits>
+#include <cstdlib>
 
 namespace {
     long long get_current_time_ms() {
+        // SOMNIUM_CLOCK_OFFSET_MS muta ceasul: ceas controlabil pentru testele
+        // de expirare peste restart (timp "trecut" cat serverul era oprit)
+        static const long long offset = [] {
+            long long v = 0;
+            const char* env = getenv("SOMNIUM_CLOCK_OFFSET_MS");
+            return env && fsutil::parse_i64(env, &v) ? v : 0;
+        }();
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()
-        ).count();
+        ).count() + offset;
     }
 }
 
@@ -45,7 +54,7 @@ void Database::migrate_aof_to_v3() {
     {
         std::shared_lock rooms_lock(rooms_mutex);
         for (auto& [name, room] : rooms) {
-            if (room->hibernated) continue; // camera adormita: snapshot-ul ei este persistenta
+            if (room->state == RoomState::Sleeping) continue; // snapshot-ul ei este persistenta
             std::lock_guard room_lock(room->room_mutex);
             for (const auto& [key, rec] : room->keys) {
                 AofRecord out;
@@ -77,37 +86,34 @@ void Database::replay_record(const AofRecord& rec) {
     std::string command = rec.args[0];
     std::ranges::transform(command, command.begin(), ::toupper);
 
-    // recovery-ul trece peste bugetul de camere active: redarea nu are voie
-    // sa piarda mutatii doar pentru ca istoricul are mai multe camere
-    const std::shared_ptr<Room> room = get_or_create_room(rec.room, true);
-    if (!room) return;
-
+    // camera adormita: snapshot-ul (mai vechi) se incarca acum, sub lock-ul ei,
+    // si mutatiile din AOF se aplica peste el in ordinea istorica. Recovery-ul
+    // trece peste buget: redarea nu are voie sa piarda mutatii.
+    const std::shared_ptr<Room> room = find_room(rec.room, true);
     std::lock_guard room_lock(room->room_mutex);
-    room->last_access_time = get_current_time_ms();
+    activate(*room, true);
 
-    // camera era adormita: snapshot-ul (mai vechi) se incarca acum, sub lock-ul
-    // ei, si mutatiile din AOF se aplica peste el in ordinea istorica
-    if (room->hibernated) {
-        SnapshotManager::wakeup_room(*room, record_pool);
-    }
-
-    if (command == "SET" && rec.args.size() >= 3) {
-        const std::string& key = rec.args[1];
-        const std::string& value = rec.args[2];
-
-        if (const auto it = room->keys.find(key); it != room->keys.end()) {
-            Record* r = it->second;
-            r->value = value;
-            r->expire_at = rec.expire_at;
-            r->timestamp_ms = rec.timestamp_ms;
-            r->node_id = rec.node_id;
-        } else {
-            Record* new_rec = record_pool.construct(value, rec.expire_at);
-            new_rec->timestamp_ms = rec.timestamp_ms;
-            new_rec->node_id = rec.node_id;
-            room->keys.emplace(key, new_rec);
+    // starea rezultata, aplicata verbatim. Live, CRDTMERGE ajunge in AOF doar
+    // cand a convers, deci nu se re-evalueaza nici el (live, o cheie expirata
+    // conteaza ca absenta; o comparatie la replay ar putea da alt rezultat)
+    const bool is_merge = command == "CRDTMERGE" && rec.args.size() >= 5;
+    if (is_merge || (command == "SET" && rec.args.size() >= 3)) {
+        uint64_t ts = rec.timestamp_ms;
+        uint64_t node = rec.node_id;
+        // formatele vechi nu au meta: versiunea merge-ului vine din argumente
+        if (is_merge && (!fsutil::parse_u64(rec.args[3], &ts) || !fsutil::parse_u64(rec.args[4], &node) ||
+                         node > UINT32_MAX)) {
+            return;
+        }
+        Record*& r = room->keys[rec.args[1]];
+        if (!r) {
+            r = record_pool.construct();
             global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
         }
+        r->value = rec.args[2];
+        r->expire_at = rec.expire_at;
+        r->timestamp_ms = ts;
+        r->node_id = static_cast<uint32_t>(node);
         return;
     }
 
@@ -116,37 +122,6 @@ void Database::replay_record(const AofRecord& rec) {
             record_pool.destroy(it->second);
             room->keys.erase(it);
             global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
-        }
-        return;
-    }
-
-    if (command == "CRDTMERGE" && rec.args.size() >= 5) {
-        uint64_t incoming_ts = 0;
-        uint64_t incoming_node = 0;
-        if (!fsutil::parse_u64(rec.args[3], &incoming_ts) ||
-            !fsutil::parse_u64(rec.args[4], &incoming_node) ||
-            incoming_node > UINT32_MAX) {
-            return;
-        }
-        const std::string& key = rec.args[1];
-        const std::string& incoming_val = rec.args[2];
-        const auto incoming_state = std::tie(incoming_ts, incoming_node);
-
-        if (const auto it = room->keys.find(key); it != room->keys.end()) {
-            Record* r = it->second;
-            const auto current_state = std::tie(r->timestamp_ms, r->node_id);
-            if (incoming_state > current_state) {
-                r->value = incoming_val;
-                r->timestamp_ms = incoming_ts;
-                r->node_id = static_cast<uint32_t>(incoming_node);
-            }
-            // stale: ignorat, ca si live
-        } else {
-            Record* new_rec = record_pool.construct(incoming_val, 0);
-            new_rec->timestamp_ms = incoming_ts;
-            new_rec->node_id = static_cast<uint32_t>(incoming_node);
-            room->keys.emplace(key, new_rec);
-            global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
         }
         return;
     }
@@ -178,36 +153,58 @@ std::string Database::get_client_room(const int client_fd) {
     return client_rooms[client_fd];
 }
 
-std::shared_ptr<Room> Database::get_or_create_room(const std::string& name, const bool allow_over_budget) {
+std::shared_ptr<Room> Database::find_room(const std::string& name, const bool create) {
     {
         std::shared_lock lock(rooms_mutex);
         if (const auto it = rooms.find(name); it != rooms.end()) {
             return it->second;
         }
     }
+    if (!create) return nullptr;
 
     std::unique_lock lock(rooms_mutex);
-    if (const auto it = rooms.find(name); it != rooms.end()) {
-        return it->second;
-    }
-
-    if (!allow_over_budget) {
-        size_t active = 0;
-        for (const auto& [room_name, room] : rooms) {
-            if (!room->hibernated) active++;
-        }
-        if (active >= MAX_ACTIVE_ROOMS) {
-            return nullptr;
-        }
-    }
-
-    auto room = std::make_shared<Room>(name);
-    // daca exista snapshot pe disk, camera porneste "adormita": prima comanda
-    // va apela wakeup_room si va incarca exact o singura data datele
-    room->hibernated = SnapshotManager::has_snapshot(name);
-    rooms[name] = room;
-    lock.unlock();
+    auto& room = rooms[name];
+    if (!room) room = std::make_shared<Room>(name);
     return room;
+}
+
+bool Database::activate(Room& room, const bool over_budget) {
+    room.last_access_time = get_current_time_ms();
+    if (room.state == RoomState::Active) return true;
+
+    // rezervam locul inainte de I/O: bugetul nu poate fi depasit nici de
+    // activari concurente, fara sa parcurgem registrul sub lock
+    size_t active = active_rooms.load();
+    do {
+        if (active >= MAX_ACTIVE_ROOMS && !over_budget) return false;
+    } while (!active_rooms.compare_exchange_weak(active, active + 1));
+
+    room.state = RoomState::Loading;
+    SnapshotManager::wakeup_room(room, record_pool);
+    global_metrics.keys_in_ram.fetch_add(room.keys.size(), std::memory_order_relaxed);
+    room.state = RoomState::Active;
+    return true;
+}
+
+bool Database::hibernate(Room& room) {
+    if (room.state == RoomState::Sleeping) return true;
+
+    room.state = RoomState::Hibernating;
+    const size_t resident = room.keys.size();
+    if (!SnapshotManager::hibernate_room(room, record_pool)) {
+        room.state = RoomState::Active;
+        return false;
+    }
+    global_metrics.keys_in_ram.fetch_sub(resident, std::memory_order_relaxed);
+    room.state = RoomState::Sleeping;
+    active_rooms.fetch_sub(1);
+    return true;
+}
+
+bool Database::wake_room(const std::string& name) {
+    const std::shared_ptr<Room> room = find_room(name, true);
+    std::lock_guard lock(room->room_mutex);
+    return activate(*room);
 }
 
 std::string Database::execute(const int client_fd, const std::vector<std::string>& args) {
@@ -237,16 +234,67 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
         return "*0\r\n";
     }
 
+    // ROOM selecteaza (si trezeste); comenzile de administrare au prefixul
+    // "ROOM." ca nume precum LIST sa ramana camere valide
     if (command == "ROOM") {
-        if (args.size() < 2) return "-ERR Wrong number of arguments for ROOM\r\n";
-        if (!get_or_create_room(args[1])) {
-            return "-ERR RAM FULL. Te rog asteapta ca o alta camera sa hiberneze!\r\n";
-        }
+        if (args.size() != 2) return "-ERR Wrong number of arguments for ROOM\r\n";
+        if (!wake_room(args[1])) return ROOMS_FULL;
         set_client_room(client_fd, args[1]);
         return "+OK\r\n";
     }
 
+    if (command == "ROOMS" || command.starts_with("ROOM.")) {
+        return handle_room_admin(command, args);
+    }
+
+    if (command == "COMPACT") {
+        const long long reclaimed = eviction.compact(get_current_time_ms());
+        return reclaimed < 0 ? "-ERR compaction failed, previous cold file kept\r\n"
+                             : ":" + std::to_string(reclaimed) + "\r\n";
+    }
+
     return execute_in_room(current_room, args);
+}
+
+std::string Database::handle_room_admin(const std::string& command, const std::vector<std::string>& args) {
+    if (command == "ROOMS") {
+        std::shared_lock lock(rooms_mutex);
+        std::string out = "*" + std::to_string(rooms.size()) + "\r\n";
+        for (const auto& [name, room] : rooms) out += bulk_string(name);
+        return out;
+    }
+
+    if (args.size() != 2) return "-ERR Wrong number of arguments for " + command + "\r\n";
+    const std::string& name = args[1];
+
+    if (command == "ROOM.WAKE") return wake_room(name) ? "+OK\r\n" : ROOMS_FULL;
+
+    const std::shared_ptr<Room> room = find_room(name, false);
+    if (!room) return "-ERR no such room\r\n";
+
+    if (command == "ROOM.HIBERNATE") {
+        if (name == "default") return "-ERR the default room is pinned\r\n";
+        std::lock_guard lock(room->room_mutex);
+        return hibernate(*room) ? "+OK\r\n" : "-ERR snapshot failed, room stays active\r\n";
+    }
+
+    if (command == "ROOM.INFO") {
+        // starea se citeste fara lock (nu asteptam dupa I/O-ul de snapshot);
+        // cheile rezidente doar pentru camerele active, sub lock-ul lor
+        RoomState state = room->state;
+        size_t keys = 0;
+        if (state == RoomState::Active) {
+            std::lock_guard lock(room->room_mutex);
+            state = room->state;
+            keys = room->keys.size();
+        }
+        static constexpr const char* STATE_NAMES[] = {"sleeping", "loading", "active", "hibernating"};
+        return "*6\r\n" + bulk_string("state") + bulk_string(STATE_NAMES[static_cast<int>(state)]) +
+               bulk_string("last_access_ms") + ":" + std::to_string(room->last_access_time) + "\r\n" +
+               bulk_string("keys") + ":" + std::to_string(keys) + "\r\n";
+    }
+
+    return "-ERR unknown command\r\n";
 }
 
 std::string Database::execute_in_room(const std::string& room_name, const std::vector<std::string>& args) {
@@ -255,24 +303,18 @@ std::string Database::execute_in_room(const std::string& room_name, const std::v
     std::string command = args[0];
     std::ranges::transform(command, command.begin(), ::toupper);
 
-    std::shared_ptr<Room> room = get_or_create_room(room_name);
-    if (!room) {
-        return "-ERR RAM FULL. Te rog asteapta ca o alta camera sa hiberneze!\r\n";
-    }
-
+    const std::shared_ptr<Room> room = find_room(room_name, true);
+    // camera adormita se trezeste sub lock-ul ei, nu sub lock-ul global
     std::lock_guard room_lock(room->room_mutex);
-    room->last_access_time = get_current_time_ms();
-
-    // camera era adormita: o trezim sub lock-ul ei, nu sub lock-ul global
-    if (room->hibernated) {
-        SnapshotManager::wakeup_room(*room, record_pool);
-    }
+    if (!activate(*room)) return ROOMS_FULL;
 
     if (command == "GET") return handle_get(room_name, *room, args);
     if (command == "SET") return handle_set(room_name, *room, args);
     if (command == "DEL") return handle_del(room_name, *room, args);
     if (command == "CRDTMERGE") return handle_crdtmerge(room_name, *room, args);
-    if (command == "INFO") return handle_info(*room);
+    if (command == "TTL") return handle_ttl(room_name, *room, args, false);
+    if (command == "PTTL") return handle_ttl(room_name, *room, args, true);
+    if (command == "INFO") return handle_info();
     if (command == "SAVE") {
         // nu confirmam niciodata o persistenta suspectata
         return aof.healthy() ? "+OK AOF is active and up to date\r\n"
@@ -282,81 +324,111 @@ std::string Database::execute_in_room(const std::string& room_name, const std::v
     return "-ERR unknown command\r\n";
 }
 
+Record* Database::lookup(const std::string& room_name, Room& room, const std::string& key) {
+    const long long now = get_current_time_ms();
+    if (const auto it = room.keys.find(key); it != room.keys.end()) {
+        if (!it->second->expired(now)) {
+            global_metrics.cache_hits.fetch_add(1, std::memory_order_relaxed);
+            return it->second;
+        }
+        record_pool.destroy(it->second);
+        room.keys.erase(it);
+        global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+
+    global_metrics.cache_misses.fetch_add(1, std::memory_order_relaxed);
+    std::optional<Record> cold = eviction.take(room_name, key);
+    if (!cold || cold->expired(now)) return nullptr;
+
+    Record* r = record_pool.construct(std::move(*cold));
+    room.keys.emplace(key, r);
+    global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
+    return r;
+}
+
 std::string Database::handle_get(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
     if (args.size() != 2) {
         return "-ERR Wrong number of arguments for GET\r\n";
     }
 
-    const std::string& key = args[1];
     global_metrics.total_gets.fetch_add(1, std::memory_order_relaxed);
+    const Record* r = lookup(room_name, room, args[1]);
+    if (!r) return "$-1\r\n";
 
-    const auto it = room.keys.find(key);
-    if (it != room.keys.end()) {
-        eviction.record_access(key);
-        global_metrics.cache_hits.fetch_add(1, std::memory_order_relaxed);
-
-        Record* r = it->second;
-        if (r->expire_at > 0 && get_current_time_ms() > r->expire_at) {
-            record_pool.destroy(r);
-            room.keys.erase(it);
-            global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
-            return "$-1\r\n";
-        }
-        return bulk_string(r->value);
-    }
-
-    global_metrics.cache_misses.fetch_add(1, std::memory_order_relaxed);
-
-    if (!eviction.possibly_on_disk(key)) {
-        global_metrics.bloom_prevented_disk_reads.fetch_add(1, std::memory_order_relaxed);
-        return "$-1\r\n";
-    }
-
-    std::string cold_val = eviction.read_from_cold_storage(room_name, key);
-    if (cold_val.empty()) {
-        return "$-1\r\n";
-    }
-
-    room.keys[key] = record_pool.construct(cold_val, 0);
-    global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
-    eviction.record_access(key);
-
-    return bulk_string(cold_val);
+    eviction.record_access(args[1]);
+    return bulk_string(r->value);
 }
 
+// SET key value [NX|XX] [EX seconds|PX milliseconds]
 std::string Database::handle_set(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
     if (args.size() < 3) {
         return "-ERR Wrong number of arguments for SET\r\n";
     }
 
-    const std::string& key = args[1];
-    const std::string& value = args[2];
-    global_metrics.total_sets.fetch_add(1, std::memory_order_relaxed);
-
+    // validare completa inainte de orice efect: o comanda invalida nu atinge nimic
     const long long now_ms = get_current_time_ms();
-    const long long expire_at = 0;
-
-    if (const auto it = room.keys.find(key); it != room.keys.end()) {
-        Record* r = it->second;
-        r->value = value;
-        r->expire_at = expire_at;
-        r->timestamp_ms = now_ms;
-        r->node_id = LOCAL_NODE_ID;
-    } else {
-        global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
-        Record* new_rec = record_pool.construct(value, expire_at);
-        new_rec->timestamp_ms = now_ms;
-        new_rec->node_id = LOCAL_NODE_ID;
-        room.keys[key] = new_rec;
+    bool nx = false;
+    bool xx = false;
+    long long expire_at = 0; // termen absolut; 0 = persistent
+    for (size_t i = 3; i < args.size(); ++i) {
+        std::string opt = args[i];
+        std::ranges::transform(opt, opt.begin(), ::toupper);
+        if ((opt == "NX" || opt == "XX") && !nx && !xx) {
+            nx = opt == "NX";
+            xx = opt == "XX";
+        } else if ((opt == "EX" || opt == "PX") && expire_at == 0 && i + 1 < args.size()) {
+            const long long scale = opt == "EX" ? 1000 : 1;
+            long long n = 0;
+            if (!fsutil::parse_i64(args[++i], &n) || n <= 0 || n > (LLONG_MAX - now_ms) / scale) {
+                return "-ERR invalid expire time in 'set' command\r\n";
+            }
+            expire_at = now_ms + n * scale;
+        } else {
+            return "-ERR syntax error\r\n";
+        }
     }
 
+    const std::string& key = args[1];
+    global_metrics.total_sets.fetch_add(1, std::memory_order_relaxed);
+
+    // conditia vede starea logica (cold storage inclus, expiratele absente);
+    // o conditie esuata nu produce nicio mutatie, deci nimic in AOF
+    Record* r = lookup(room_name, room, key);
+    if ((nx && r) || (xx && !r)) return "$-1\r\n";
+
+    if (!r) {
+        r = record_pool.construct();
+        room.keys.emplace(key, r);
+        global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
+    }
+    r->value = args[2];
+    r->expire_at = expire_at; // un SET simplu sterge si TTL-ul vechi
+    r->timestamp_ms = now_ms;
+    r->node_id = LOCAL_NODE_ID;
+
     eviction.record_access(key);
-    // mutatia rezultata pleaca in AOF cu metadata ei: expirare (0 = persistent),
-    // timestamp CRDT si nod. Replay-ul o aplica verbatim.
+    // mutatia rezultata pleaca in AOF cu termenul absolut si versiunea CRDT:
+    // replay-ul o aplica verbatim, fara sa re-evalueze NX/XX sau sa reporneasca TTL-ul
     aof.append(room_name, args, expire_at, now_ms, LOCAL_NODE_ID);
     eviction.evict_despised_keys(room, record_pool);
 
     return "+OK\r\n";
+}
+
+// TTL/PTTL: -2 cheie absenta, -1 cheie persistenta
+std::string Database::handle_ttl(const std::string& room_name, Room& room, const std::vector<std::string>& args,
+                                 const bool millis) {
+    if (args.size() != 2) {
+        return "-ERR Wrong number of arguments for " + args[0] + "\r\n";
+    }
+
+    const Record* r = lookup(room_name, room, args[1]);
+    if (!r) return ":-2\r\n";
+    if (r->expire_at == 0) return ":-1\r\n";
+
+    const long long left = std::max(0LL, r->expire_at - get_current_time_ms());
+    return ":" + std::to_string(millis ? left : (left + 500) / 1000) + "\r\n";
 }
 
 std::string Database::handle_del(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
@@ -364,17 +436,16 @@ std::string Database::handle_del(const std::string& room_name, Room& room, const
         return "-ERR Wrong number of arguments for DEL\r\n";
     }
 
+    // lookup aduce si cheile din cold storage: stergerea le scoate din ambele
     const std::string& key = args[1];
-    if (const auto it = room.keys.find(key); it != room.keys.end()) {
-        record_pool.destroy(it->second);
-        room.keys.erase(it);
-        global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
-        // stergerea primeste si ea o versiune (timestamp + nod): baza pentru
-        // morminte coerente la evict/reload (S1 le va folosi)
-        aof.append(room_name, args, 0, get_current_time_ms(), LOCAL_NODE_ID);
-        return ":1\r\n";
-    }
-    return ":0\r\n";
+    if (!lookup(room_name, room, key)) return ":0\r\n";
+
+    const auto it = room.keys.find(key);
+    record_pool.destroy(it->second);
+    room.keys.erase(it);
+    global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
+    aof.append(room_name, args, 0, get_current_time_ms(), LOCAL_NODE_ID);
+    return ":1\r\n";
 }
 
 std::string Database::handle_crdtmerge(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
@@ -382,70 +453,44 @@ std::string Database::handle_crdtmerge(const std::string& room_name, Room& room,
         return "-ERR Wrong number of arguments for CRDTMERGE\r\n";
     }
 
-    const std::string& key = args[1];
-    const std::string& incoming_val = args[2];
-
+    // aceeasi parsare stricta ca la replay: altfel o valoare acceptata live
+    // (ex. "-1" sau un nod peste 32 de biti) ar fi respinsa dupa restart
     uint64_t incoming_ts = 0;
-    uint32_t incoming_node = 0;
-    try {
-        incoming_ts = std::stoull(args[3]);
-        incoming_node = std::stoul(args[4]);
-    } catch (const std::exception&) {
+    uint64_t incoming_node = 0;
+    if (!fsutil::parse_u64(args[3], &incoming_ts) || !fsutil::parse_u64(args[4], &incoming_node) ||
+        incoming_node > UINT32_MAX) {
         return "-ERR invalid timestamp or node id for CRDTMERGE\r\n";
     }
 
-    const auto it = room.keys.find(key);
-    if (it != room.keys.end()) {
-        Record* r = it->second;
-
-        const auto current_state = std::tie(r->timestamp_ms, r->node_id);
-        const auto incoming_state = std::tie(incoming_ts, incoming_node);
-
+    const std::string& key = args[1];
+    Record* r = lookup(room_name, room, key);
+    if (!r) {
+        r = record_pool.construct();
+        room.keys.emplace(key, r);
+        global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
+    } else if (std::tie(incoming_ts, incoming_node) <= std::tie(r->timestamp_ms, r->node_id)) {
         // Monotonic Join Semi-Lattice: actualizam doar daca starea e strict mai noua
-        if (incoming_state > current_state) {
-            r->value = incoming_val;
-            r->timestamp_ms = incoming_ts;
-            r->node_id = incoming_node;
-            eviction.record_access(key);
-            aof.append(room_name, args, r->expire_at, incoming_ts, incoming_node);
-            return "+OK (State Converged)\r\n";
-        }
         return "+OK (Ignored Stale Write)\r\n";
     }
 
-    // Cheie noua adusa prin reconciliere
-    Record* new_rec = record_pool.construct(incoming_val, 0);
-    new_rec->timestamp_ms = incoming_ts;
-    new_rec->node_id = incoming_node;
-
-    room.keys[key] = new_rec;
-    global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
+    r->value = args[2];
+    r->timestamp_ms = incoming_ts;
+    r->node_id = static_cast<uint32_t>(incoming_node);
     eviction.record_access(key);
-    aof.append(room_name, args, 0, incoming_ts, incoming_node);
-
+    aof.append(room_name, args, r->expire_at, incoming_ts, r->node_id);
     return "+OK (State Converged)\r\n";
 }
 
-std::string Database::handle_info(Room& room) {
+std::string Database::handle_info() {
     const auto now = std::chrono::steady_clock::now();
     const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
 
-    size_t total_keys = room.keys.size();
-    size_t active_rooms = 0;
-    {
-        std::shared_lock shared_rooms_lock(rooms_mutex);
-        for (const auto& [name, r] : rooms) {
-            if (!r->hibernated) active_rooms++;
-            if (r.get() == &room) continue;
-            std::lock_guard r_lock(r->room_mutex);
-            total_keys += r->keys.size();
-        }
-    }
-
+    // doar contoare atomice: INFO nu ia lock-ul altor camere (ar inversa
+    // ordinea rooms_mutex -> room_mutex, camera curenta fiind deja prinsa)
     const std::string info_text =
         "Uptime: " + std::to_string(uptime) + "s\n" +
-        "Camere active: " + std::to_string(active_rooms) + "\n" +
-        "Chei totale: " + std::to_string(total_keys) + "\n" +
+        "Camere active: " + std::to_string(active_rooms.load()) + "\n" +
+        "Chei totale: " + std::to_string(global_metrics.keys_in_ram.load(std::memory_order_relaxed)) + "\n" +
         "Comenzi procesate: " + std::to_string(total_commands.load(std::memory_order_relaxed)) + "\n" +
         "AOF: " + std::string(aof.policy_name()) + (aof.healthy() ? " (sanatos)" : " (ERORI SCRIERE)") + "\n";
 
@@ -465,9 +510,9 @@ void Database::hibernate_inactive_rooms() {
 
     {
         std::shared_lock shared_rooms_lock(rooms_mutex);
-        candidates.reserve(rooms.size());
         for (const auto& [room_name, room] : rooms) {
-            if (!room->hibernated && room_name != "default" && now - room->last_access_time > ROOM_IDLE_MS) {
+            if (room->state == RoomState::Active && room_name != "default" &&
+                now - room->last_access_time > ROOM_IDLE_MS) {
                 candidates.push_back(room);
             }
         }
@@ -478,27 +523,12 @@ void Database::hibernate_inactive_rooms() {
         std::lock_guard room_lock(room->room_mutex);
 
         // re-verificam sub lock: o comanda poate a ajuns la camera intre timp
-        if (room->hibernated || get_current_time_ms() - room->last_access_time <= ROOM_IDLE_MS) {
+        if (room->state != RoomState::Active || get_current_time_ms() - room->last_access_time <= ROOM_IDLE_MS) {
             continue;
         }
-
-        size_t written = 0;
-        switch (SnapshotManager::hibernate_room(*room, record_pool, &written)) {
-            case HibernateResult::Written:
-                break; // snapshot validat; inregistrarile au fost eliberate abia dupa rename
-            case HibernateResult::Empty:
-                {
-                    // coada goala fara date: stergem camera inactiva ca sa nu se acumuleze
-                    std::unique_lock exclusive_rooms_lock(rooms_mutex);
-                    if (rooms[room->name] == room) {
-                        rooms.erase(room->name);
-                    }
-                }
-                break;
-            case HibernateResult::Failure:
-                printf("Hibernare esuata pentru camera '%s': persistenta nereusita, camera ramane activa.\n",
-                       room->name.c_str());
-                break;
+        if (!hibernate(*room)) {
+            printf("Hibernare esuata pentru camera '%s': persistenta nereusita, camera ramane activa.\n",
+                   room->name.c_str());
         }
     }
 }
@@ -510,7 +540,7 @@ void Database::clean_expired_keys() {
     for (const auto& [name, room] : rooms) {
         std::lock_guard room_lock(room->room_mutex);
         for (auto it = room->keys.begin(); it != room->keys.end();) {
-            if (it->second->expire_at > 0 && it->second->expire_at < now) {
+            if (it->second->expired(now)) {
                 record_pool.destroy(it->second);
                 it = room->keys.erase(it);
                 global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);

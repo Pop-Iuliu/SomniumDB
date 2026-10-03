@@ -60,12 +60,18 @@ static void prometheus_thread(int port) {
             "# HELP db_cache_hits Total successful memory reads\n"
             "# TYPE db_cache_hits counter\n"
             "db_cache_hits " + std::to_string(global_metrics.cache_hits.load()) + "\n"
-            "# HELP db_bloom_prevented Total disk reads prevented by Bloom Filter\n"
-            "# TYPE db_bloom_prevented counter\n"
-            "db_bloom_prevented " + std::to_string(global_metrics.bloom_prevented_disk_reads.load()) + "\n"
             "# HELP db_keys_evicted Total keys sent to Cold Storage\n"
             "# TYPE db_keys_evicted counter\n"
-            "db_keys_evicted " + std::to_string(global_metrics.keys_evicted.load()) + "\n";
+            "db_keys_evicted " + std::to_string(global_metrics.keys_evicted.load()) + "\n"
+            "# HELP db_cold_file_bytes Current size of the cold storage file\n"
+            "# TYPE db_cold_file_bytes gauge\n"
+            "db_cold_file_bytes " + std::to_string(global_metrics.cold_file_bytes.load()) + "\n"
+            "# HELP db_cold_obsolete_bytes Cold storage bytes no longer referenced by the index\n"
+            "# TYPE db_cold_obsolete_bytes gauge\n"
+            "db_cold_obsolete_bytes " + std::to_string(global_metrics.cold_obsolete_bytes.load()) + "\n"
+            "# HELP db_cold_reclaimed_bytes Total bytes reclaimed by cold storage compaction\n"
+            "# TYPE db_cold_reclaimed_bytes counter\n"
+            "db_cold_reclaimed_bytes " + std::to_string(global_metrics.cold_reclaimed_bytes.load()) + "\n";
 
         std::string response =
             "HTTP/1.1 200 OK\r\n"
