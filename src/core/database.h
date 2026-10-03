@@ -67,8 +67,11 @@ private:
     // cheia logica: RAM, apoi cold storage (reincarcata in RAM); cheile expirate
     // conteaza ca absente. nullptr = cheia nu exista.
     Record* lookup(const std::string& room_name, Room& room, const std::string& key);
-    // inregistrare noua, goala; apelantul o completeaza
-    Record* insert(Room& room, const std::string& key);
+    // singurele locuri care schimba continutul RAM al unei camere, ca numarul
+    // de chei si octetii rezidenti sa nu poata diverge (presupun room_mutex prins)
+    Record* insert(Room& room, const std::string& key); // goala; apelantul o completeaza
+    void set_value(Room& room, Record* r, const std::string& value);
+    void erase(Room& room, std::unordered_map<std::string, Record*>::iterator it);
 
     std::string handle_get(const std::string& room_name, Room& room, const std::vector<std::string>& args);
     std::string handle_set(const std::string& room_name, Room& room, const std::vector<std::string>& args);

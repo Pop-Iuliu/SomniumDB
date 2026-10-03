@@ -61,21 +61,20 @@ def sec_rewrite_and_restart(check):
 
 
 def sec_cold_sleeping_stale(check):
-    srv = Server(env_extra={**ENV, "SOMNIUM_MAX_KEYS": "0"})  # fiecare SET muta cheile in cold storage
+    # o cheie pe camera incape in RAM; a doua muta una dintre ele in cold storage
+    srv = Server(env_extra={**ENV, "SOMNIUM_MAX_KEYS": "1"})
     try:
         srv.start()
         c = Client(srv)
         c.cmd("ROOM", "a")
-        c.cmd("SET", "k1", "v1")  # ramane in cold storage
+        c.cmd("MSET", "k1", "v1", "k1b", "v1b")
 
         c.cmd("ROOM", "b")
-        c.cmd("SET", "k2", "v2")
-        c.cmd("GET", "k2")  # reincarcata in RAM, deci intra in snapshot
+        c.cmd("SET", "k2", "v2")  # in RAM, deci intra in snapshot
         c.cmd("ROOM.HIBERNATE", "b")
 
         c.cmd("ROOM", "c")
         c.cmd("SET", "x", "1")
-        c.cmd("GET", "x")
         c.cmd("ROOM.HIBERNATE", "c")
         c.cmd("ROOM", "c")  # trezire: snapshot-ul ramane pe disc, dar se va invechi
         check("DEL dupa trezire", c.cmd("DEL", "x") == ("int", 1))
@@ -88,7 +87,8 @@ def sec_cold_sleeping_stale(check):
         srv.restart()
         c = Client(srv)
         c.cmd("ROOM", "a")
-        check("cheia din cold storage supravietuieste", c.cmd("GET", "k1") == ("bulk", b"v1"))
+        check("cheile din RAM si din cold storage supravietuiesc",
+              c.cmd("MGET", "k1", "k1b") == ("array", [("bulk", b"v1"), ("bulk", b"v1b")]))
         c.cmd("ROOM", "b")
         check("camera adormita supravietuieste", c.cmd("GET", "k2") == ("bulk", b"v2"))
         c.cmd("ROOM", "c")
