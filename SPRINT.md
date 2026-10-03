@@ -143,7 +143,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 **Goal:** Remove the remaining hard ceilings: inputs that can kill the server, clients that cannot connect, a log that grows forever, memory that no budget actually bounds, and a CRDT that never leaves its node.
 
-**Status:** In progress. S6, S7 and S8 done; S9 implemented, awaiting CI verification; S10 planned. Five tickets, each inspired by one supplied word.
+**Status:** In progress. S6 to S9 done; S10 implemented, awaiting CI verification. Five tickets, each inspired by one supplied word.
 
 **Planning target:** One two-week sprint for S6 to S9; S10 may spill into the next one. Completion means meeting the acceptance checks below.
 
@@ -224,7 +224,7 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 
 ## S9 - Scolog: Rooms Pay Rent
 
-**Status: IMPLEMENTED, awaiting CI verification.** Each room tracks estimated resident bytes (key + value + a fixed per-record overhead) and `Room::charge()` keeps a global total in step. All changes to a room's RAM contents go through `insert()`, `set_value()` and `erase()` in Database, plus the eviction manager and bulk charges on wake and hibernate, so key counts and bytes cannot drift. `SOMNIUM_MAXMEMORY` sets one global budget: eviction now runs once at the end of every room command (which also covers keys reloaded from cold storage by reads, and CRDTMERGE, which used to grow RAM without evicting) while the total is over budget, in the room being written; that room can end up with no RAM while others hold the budget, marked as a known ceiling. Waking a room that does not fit discards what it loaded and leaves it sleeping with its snapshot untouched. Bytes are reported in `ROOM.INFO`, `INFO` and `db_resident_bytes`. Tests: `tests/s9_test.py`.
+**Status: DONE.** Verified by CI on PR #5 (AddressSanitizer suite and ThreadSanitizer green). Each room tracks estimated resident bytes (key + value + a fixed per-record overhead) and `Room::charge()` keeps a global total in step. All changes to a room's RAM contents go through `insert()`, `set_value()` and `erase()` in Database, plus the eviction manager and bulk charges on wake and hibernate, so key counts and bytes cannot drift. `SOMNIUM_MAXMEMORY` sets one global budget: eviction now runs once at the end of every room command (which also covers keys reloaded from cold storage by reads, and CRDTMERGE, which used to grow RAM without evicting) while the total is over budget, in the room being written; that room can end up with no RAM while others hold the budget, marked as a known ceiling. Waking a room that does not fit discards what it loaded and leaves it sleeping with its snapshot untouched. Bytes are reported in `ROOM.INFO`, `INFO` and `db_resident_bytes`. Tests: `tests/s9_test.py`.
 
 **Inspiration:** A tenant farmer paying rent for church land becomes rooms paying for RAM in bytes.
 
@@ -243,6 +243,8 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 **Primary files:** `src/core/database.*`, `src/core/room.h`, `src/storage/eviction_manager.*`, `metrics.*`.
 
 ## S10 - Koreish: Caravans Between Nodes
+
+**Status: IMPLEMENTED, awaiting CI verification.** `SOMNIUM_NODE_ID` replaces the hard-coded node 1 and `SOMNIUM_PEERS` lists the peers. A `Replicator` with its own thread (network I/O must never delay the watchdog's AOF fsync) reads the local AOF every 500 ms from a per-peer offset and ships the records written on this node (SET, MSET, CRDTMERGE) as one pipelined batch of `CRDTMERGE`, switching `ROOM` where needed. Records received from other nodes carry their node in the AOF meta and are never re-sent. Delivery is at-least-once; the offset advances only to the last acknowledged record and is saved with the AOF's inode, so a restart resumes and an S8 rewrite (new file, new inode) simply resends from the start. `CRDTMERGE` accepts an optional absolute deadline so `SET ... PX` replicates its expiry. Delete markers are deferred: DEL, EXPIRE and PERSIST carry no version of their own and stay local, which is the documented first limit and tested explicitly. A peer that keeps refusing `ROOM` (its own active-room budget) stalls replication to it until a slot frees. Tests: `tests/s10_test.py` (two nodes).
 
 **Inspiration:** The merchant caravans of the Koreish become batches of CRDT merges carried between nodes.
 

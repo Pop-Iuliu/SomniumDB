@@ -24,6 +24,11 @@ namespace {
 
 Database::Database() {
     start_time = std::chrono::steady_clock::now();
+    if (const char* env = getenv("SOMNIUM_NODE_ID")) {
+        uint64_t id = 0;
+        if (fsutil::parse_u64(env, &id) && id >= 1 && id <= UINT32_MAX) local_node_id = static_cast<uint32_t>(id);
+        else fprintf(stderr, "SOMNIUM_NODE_ID invalid: '%s' (folosesc 1)\n", env);
+    }
 
     // 1) redare istoric (snapshot-urile se incarca sub prima mutatie a fiecarei camere,
     //    apoi mutatiile AOF se aplica peste ele: un snapshot vechi nu poate
@@ -502,12 +507,12 @@ std::string Database::handle_set(const std::string& room_name, Room& room, const
     set_value(room, r, args[2]);
     r->expire_at = expire_at; // un SET simplu sterge si TTL-ul vechi
     r->timestamp_ms = now_ms;
-    r->node_id = LOCAL_NODE_ID;
+    r->node_id = local_node_id;
 
     eviction.record_access(key);
     // mutatia rezultata pleaca in AOF cu termenul absolut si versiunea CRDT:
     // replay-ul o aplica verbatim, fara sa re-evalueze NX/XX sau sa reporneasca TTL-ul
-    aof.append(room_name, args, expire_at, now_ms, LOCAL_NODE_ID);
+    aof.append(room_name, args, expire_at, now_ms, local_node_id);
 
     return "+OK\r\n";
 }
@@ -525,12 +530,12 @@ std::string Database::handle_mset(const std::string& room_name, Room& room, cons
         set_value(room, r, args[i + 1]);
         r->expire_at = 0; // ca la SET simplu: TTL-ul vechi dispare
         r->timestamp_ms = now_ms;
-        r->node_id = LOCAL_NODE_ID;
+        r->node_id = local_node_id;
         eviction.record_access(args[i]);
     }
     global_metrics.total_sets.fetch_add(args.size() / 2, std::memory_order_relaxed);
 
-    aof.append(room_name, args, 0, now_ms, LOCAL_NODE_ID);
+    aof.append(room_name, args, 0, now_ms, local_node_id);
     return "+OK\r\n";
 }
 
@@ -640,12 +645,14 @@ std::string Database::handle_del(const std::string& room_name, Room& room, const
     if (!lookup(room_name, room, key)) return ":0\r\n";
 
     erase(room, room.keys.find(key));
-    aof.append(room_name, args, 0, get_current_time_ms(), LOCAL_NODE_ID);
+    aof.append(room_name, args, 0, get_current_time_ms(), local_node_id);
     return ":1\r\n";
 }
 
 std::string Database::handle_crdtmerge(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
-    if (args.size() < 5) {
+    // CRDTMERGE key value timestamp node [expire_at]: termenul absolut optional
+    // calatoreste cu starea (replicarea S10 trimite si expirarea unui SET ... PX)
+    if (args.size() < 5 || args.size() > 6) {
         return "-ERR Wrong number of arguments for CRDTMERGE\r\n";
     }
 
@@ -657,6 +664,10 @@ std::string Database::handle_crdtmerge(const std::string& room_name, Room& room,
         incoming_node > UINT32_MAX) {
         return "-ERR invalid timestamp or node id for CRDTMERGE\r\n";
     }
+    long long expire_at = 0;
+    if (args.size() == 6 && (!fsutil::parse_i64(args[5], &expire_at) || expire_at < 0)) {
+        return "-ERR invalid expire time for CRDTMERGE\r\n";
+    }
 
     const std::string& key = args[1];
     Record* r = lookup(room_name, room, key);
@@ -667,6 +678,7 @@ std::string Database::handle_crdtmerge(const std::string& room_name, Room& room,
     if (!r) r = insert(room, key);
 
     set_value(room, r, args[2]);
+    if (args.size() == 6) r->expire_at = expire_at;
     r->timestamp_ms = incoming_ts;
     r->node_id = static_cast<uint32_t>(incoming_node);
     eviction.record_access(key);

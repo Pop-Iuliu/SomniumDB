@@ -20,6 +20,7 @@
 #include "metrics.h"
 #include "src/core/database.h"
 #include "src/core/resp.h"
+#include "src/storage/replicator.h"
 #include "watchdog.h"
 
 using namespace std;
@@ -394,6 +395,10 @@ int main() {
 
     cout << "Server pornit (io_uring) pe portul " << port << "...\n";
     watchdog.start();
+
+    // replicare CRDT catre SOMNIUM_PEERS (nimic fara peers)
+    static Replicator replicator;
+    replicator.start();
 
     bool first_wait = true; // doar prima asteptare e sensibila la CQE-uri pierdute
 
