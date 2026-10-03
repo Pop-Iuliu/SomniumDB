@@ -113,7 +113,7 @@ def sec_rewrite(check):
         ca, cb = Client(a), Client(b)
         ca.cmd("SET", "pre", "1")
         check("inainte de rescriere", wait_until(lambda: cb.cmd("GET", "pre") == ("bulk", b"1")))
-        check("REWRITEAOF", ca.cmd("REWRITEAOF") == ("ok", "OK"))
+        check("REWRITEAOF", ca.cmd("REWRITEAOF")[0] == "ok")
         ca.cmd("SET", "post", "1")
         check("replicarea continua dupa rescriere", wait_until(lambda: cb.cmd("GET", "post") == ("bulk", b"1")))
         check("starea veche ramane", cb.cmd("GET", "pre") == ("bulk", b"1"))

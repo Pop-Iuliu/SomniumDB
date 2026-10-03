@@ -63,6 +63,14 @@ public:
     bool append_rewrite(const AofRecord& rec);
     bool commit_rewrite();
     void abort_rewrite();
+
+    // rescrierea in fundal (S14): copilul fork-ului scrie direct in fd-ul temporar
+    // (fara mutexul de aici, pe care il putea tine alt thread la fork), iar
+    // parintele adauga apoi coada fisierului curent de la offsetul fork-ului
+    int rewrite_fd() const { return rewrite_fd_; }
+    uint64_t size() const { return size_.load(std::memory_order_relaxed); }
+    bool append_tail(uint64_t from);
+    static std::string encode_record(const AofRecord& rec);
     // true daca fisierul redat nu era v3 (sau era corupt): necesita reserializare
     bool needs_rewrite() const { return needs_rewrite_; }
 
@@ -93,13 +101,11 @@ private:
     bool needs_rewrite_ = false;
     std::atomic<uint64_t> size_{0};      // octetii fisierului curent
     std::atomic<uint64_t> base_size_{0}; // dimensiunea dupa ultima rescriere (sau la pornire)
-    uint64_t rewrite_bytes_ = 0;         // octetii scrisi in fisierul temporar
     uint64_t rewrite_min_ = 64ull << 20;
 
     void publish_sizes() const;
     bool replaying_ = true;
 
-    static std::string encode_record(const AofRecord& rec);
     static long long now_ms();
     bool sync_locked(int fd);
     void sync_due_locked();

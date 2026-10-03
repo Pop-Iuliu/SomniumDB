@@ -277,7 +277,7 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 
 **Goal:** Ground the next steps in published distributed-systems results: versions that respect causality, replication that tolerates its own failure detector, deletes that converge, maintenance that never pauses clients, and a cache that only admits what is warm.
 
-**Status:** In progress. S11 and S12 done; S13 implemented, awaiting CI verification; S14 and S15 planned.
+**Status:** In progress. S11 to S13 done; S14 implemented, awaiting CI verification; S15 planned.
 
 | ID | Inspiration | Deliverable | Science | Priority | Depends on |
 | --- | --- | --- | --- | --- | --- |
@@ -320,7 +320,7 @@ P0 fixes a live convergence bug and a replication stall. P1 closes the replicati
 
 ## S13 - Eldermen: The Council That Decides What Can Be Forgotten
 
-**Status: IMPLEMENTED, awaiting CI verification.** With replication configured, `DEL` writes a tombstone (key, HLC version above the deleted one, node) that replicates as `CRDTDEL`; merges compare against it and new writes are versioned above it. `EXPIRE` and `PERSIST` became versioned writes logged as their full resulting state (`SET` + deadline), so they replicate with no new shipping code. The frontier is exact: the command thread publishes a fresh HLC version only between commands (on each incoming heartbeat), so every earlier local version is already in the AOF; the replicator loads it before reading the AOF and sends `REPLFRONTIER` only after a batch that reached the end of the file. That heartbeat replaces `PING` and also keeps an idle node's frontier moving. Watermark = minimum frontier over all configured peers; tombstones at or below it are dropped, and an incoming write at or below it for a key with no record and no tombstone is ignored, since a tombstone for it may already be gone. Tombstones survive restarts (AOF replay) and rewrites; a single node keeps none, so it pays nothing. Assumes a symmetric peer list. Tests: `tests/s13_test.py`; `tests/s10_test.py` now asserts that DEL replicates.
+**Status: DONE.** Verified by CI on PR #8 (AddressSanitizer suite, ThreadSanitizer and benchmark jobs green). With replication configured, `DEL` writes a tombstone (key, HLC version above the deleted one, node) that replicates as `CRDTDEL`; merges compare against it and new writes are versioned above it. `EXPIRE` and `PERSIST` became versioned writes logged as their full resulting state (`SET` + deadline), so they replicate with no new shipping code. The frontier is exact: the command thread publishes a fresh HLC version only between commands (on each incoming heartbeat), so every earlier local version is already in the AOF; the replicator loads it before reading the AOF and sends `REPLFRONTIER` only after a batch that reached the end of the file. That heartbeat replaces `PING` and also keeps an idle node's frontier moving. Watermark = minimum frontier over all configured peers; tombstones at or below it are dropped, and an incoming write at or below it for a key with no record and no tombstone is ignored, since a tombstone for it may already be gone. Tombstones survive restarts (AOF replay) and rewrites; a single node keeps none, so it pays nothing. Assumes a symmetric peer list. Tests: `tests/s13_test.py`; `tests/s10_test.py` now asserts that DEL replicates.
 
 **Inspiration:** Elders who must all agree before something is forgotten become causal stability.
 
@@ -338,6 +338,8 @@ P0 fixes a live convergence bug and a replication stall. P1 closes the replicati
 **Primary files:** `src/core/database.*`, `src/storage/replicator.*`, `src/storage/aof_manager.*`.
 
 ## S14 - Padnags: A Smooth Ride
+
+**Status: IMPLEMENTED, awaiting CI verification.** `REWRITEAOF` and the automatic trigger now run in the background. The parent opens the temp file, discards stale snapshots of active rooms, records the AOF offset, and forks while briefly holding the room registry and every room lock, so no thread is in the middle of a change. The child serializes its copy-on-write image through the same `dump_state()` as the synchronous path, but with no locks, no stdio and no `AOFManager` mutex (another thread may have held them at fork time), then `fdatasync`s and `_exit`s. At the start of the next command the parent reaps it, copies the old AOF's tail since the fork onto the new file, and commits; records carry resulting state, so snapshot plus tail replays to the current state no matter when the child read each key. A failed child or a failed splice leaves the old AOF in use. Startup migration stays synchronous (no clients yet). `INFO` shows `Rescriere AOF: in curs/inactiva`. Costs: memory pages modified while the child runs are copied, and `fork` copies page tables. Tests: `tests/s14_test.py`; `tests/s8_test.py` waits for completion via `INFO`.
 
 **Inspiration:** An easy-gaited horse becomes maintenance that never jolts clients.
 

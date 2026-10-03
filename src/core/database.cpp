@@ -6,6 +6,8 @@
 #include <chrono>
 #include <climits>
 #include <cstdlib>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
     long long get_current_time_ms() {
@@ -69,19 +71,41 @@ Database::~Database() = default;
 // ponytail: sincron pe thread-ul de comenzi; rescriere in fundal cand pauza se masoara
 bool Database::rewrite_aof() {
     if (!aof.start_rewrite()) return false;
+    discard_active_snapshots();
+    if (!dump_state([this](const AofRecord& rec) { return aof.append_rewrite(rec); }, true)) {
+        aof.abort_rewrite();
+        printf("AOF: rescrierea a esuat; fisierul vechi ramane in uz\n");
+        return false;
+    }
+    return aof.commit_rewrite();
+}
 
+// noul AOF nu mai contine DEL-urile: un snapshot ramas de la ultima trezire a unei
+// camere active s-ar incarca la replay si ar invia cheile sterse de atunci
+void Database::discard_active_snapshots() {
+    std::shared_lock rooms_lock(rooms_mutex);
+    for (const auto& [name, room] : rooms) {
+        std::lock_guard room_lock(room->room_mutex);
+        if (room->state != RoomState::Sleeping) SnapshotManager::discard(name);
+    }
+}
+
+// camerele active din RAM, cele adormite din snapshot (citit intr-o camera
+// temporara, fara trezire si fara buget), cheile din cold storage si
+// tombstone-urile. Cheile expirate nu se scriu.
+bool Database::dump_state(const std::function<bool(const AofRecord&)>& write, const bool lock) {
     const long long now = get_current_time_ms();
     bool ok = true;
     const auto emit = [&](const std::string& room, const std::string& key, const Record& r) {
-        if (ok && !r.expired(now)) {
-            ok = aof.append_rewrite({room, {"SET", key, r.value}, r.expire_at, r.timestamp_ms, r.node_id});
-        }
+        if (ok && !r.expired(now)) ok = write({room, {"SET", key, r.value}, r.expire_at, r.timestamp_ms, r.node_id});
     };
 
     {
-        std::shared_lock rooms_lock(rooms_mutex);
+        std::shared_lock rooms_lock(rooms_mutex, std::defer_lock);
+        if (lock) rooms_lock.lock();
         for (const auto& [name, room] : rooms) {
-            std::lock_guard room_lock(room->room_mutex);
+            std::unique_lock room_lock(room->room_mutex, std::defer_lock);
+            if (lock) room_lock.lock();
             if (room->state == RoomState::Sleeping) {
                 Room snapshot(name);
                 if (SnapshotManager::has_snapshot(name) && !SnapshotManager::wakeup_room(snapshot, record_pool)) {
@@ -93,26 +117,73 @@ bool Database::rewrite_aof() {
                 }
             } else {
                 for (const auto& [key, r] : room->keys) emit(name, key, *r);
-                // noul AOF nu mai contine DEL-urile: un snapshot ramas de la ultima
-                // trezire s-ar incarca la replay si ar invia cheile sterse de atunci
-                SnapshotManager::discard(name);
             }
-            if (!ok) break;
+            if (!ok) return false;
         }
     }
     if (ok && !eviction.for_each(emit)) ok = false;
     for (const auto& [room, keys] : tombstones_) {
         for (const auto& [key, v] : keys) {
-            if (ok) ok = aof.append_rewrite({room, {"DEL", key}, 0, v.ts, v.node});
+            if (ok) ok = write({room, {"DEL", key}, 0, v.ts, v.node});
         }
     }
+    return ok;
+}
 
-    if (!ok) {
-        aof.abort_rewrite();
-        printf("AOF: rescrierea a esuat; fisierul vechi ramane in uz\n");
-        return false;
+std::string Database::start_background_rewrite() {
+    if (rewrite_child_ > 0) return "-ERR AOF rewrite already in progress\r\n";
+    if (!aof.start_rewrite()) return "-ERR AOF rewrite failed, previous AOF kept\r\n";
+    discard_active_snapshots();
+    rewrite_from_ = aof.size();
+
+    pid_t pid;
+    {
+        // instantaneu copy-on-write (Kemper & Neumann, HyPer, ICDE 2011): cu registrul
+        // si toate camerele prinse, niciun thread nu e la jumatatea unei modificari
+        std::shared_lock rooms_lock(rooms_mutex);
+        std::vector<std::unique_lock<std::mutex>> room_locks;
+        for (const auto& [name, room] : rooms) room_locks.emplace_back(room->room_mutex);
+        pid = fork();
+        if (pid == 0) {
+            // copilul: fara lacate (raman "prinse" de copia acestui thread), fara stdio
+            // si fara mutexul AOF (alt thread le putea tine la fork); doar write()
+            const int fd = aof.rewrite_fd();
+            std::string buf;
+            bool ok = true;
+            const auto write = [&](const AofRecord& rec) {
+                buf += AOFManager::encode_record(rec);
+                if (buf.size() >= (1 << 16)) {
+                    ok = fsutil::write_all(fd, buf.data(), buf.size());
+                    buf.clear();
+                }
+                return ok;
+            };
+            ok = dump_state(write, false) && fsutil::write_all(fd, buf.data(), buf.size()) && fsutil::sync_fd(fd);
+            _exit(ok ? 0 : 1);
+        }
     }
-    return aof.commit_rewrite();
+    if (pid < 0) {
+        aof.abort_rewrite();
+        return "-ERR AOF rewrite failed (fork), previous AOF kept\r\n";
+    }
+    rewrite_child_ = pid;
+    printf("AOF: rescriere in fundal pornita (pid %d)\n", static_cast<int>(pid));
+    return "+Background AOF rewrite started\r\n";
+}
+
+void Database::finish_background_rewrite() {
+    if (rewrite_child_ <= 0) return;
+    int status = 0;
+    const pid_t done = waitpid(rewrite_child_, &status, WNOHANG);
+    if (done == 0) return;
+    rewrite_child_ = 0;
+
+    // instantaneul + coada AOF-ului vechi de la fork: inregistrarile poarta starea
+    // rezultata, deci se redau exact la starea curenta, oricand a citit copilul
+    const bool child_ok = done > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (child_ok && aof.append_tail(rewrite_from_) && aof.commit_rewrite()) return;
+    aof.abort_rewrite();
+    printf("AOF: rescrierea in fundal a esuat; fisierul vechi ramane in uz\n");
 }
 
 void Database::replay_record(const AofRecord& rec) {
@@ -277,7 +348,8 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
     if (args.empty()) return "";
     resp3_ = resp3;
     // aici nu e prins niciun lock: rescrierea ia singura registrul si camerele
-    if (aof.rewrite_due()) rewrite_aof();
+    finish_background_rewrite();
+    if (rewrite_child_ == 0 && aof.rewrite_due()) start_background_rewrite();
 
     const std::string current_room = get_client_room(client_fd);
     std::string command = args[0];
@@ -354,7 +426,7 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
     }
 
     if (command == "REWRITEAOF") {
-        return rewrite_aof() ? "+OK\r\n" : "-ERR AOF rewrite failed, previous AOF kept\r\n";
+        return start_background_rewrite();
     }
 
     if (command == "COMPACT") {
@@ -850,6 +922,7 @@ std::string Database::handle_info() {
         "Chei totale: " + std::to_string(global_metrics.keys_in_ram.load(std::memory_order_relaxed)) + "\n" +
         "Octeti rezidenti: " + std::to_string(global_metrics.resident_bytes.load(std::memory_order_relaxed)) + "\n" +
         "Tombstone-uri: " + std::to_string(global_metrics.tombstones.load(std::memory_order_relaxed)) + "\n" +
+        "Rescriere AOF: " + (rewrite_child_ > 0 ? "in curs" : "inactiva") + "\n" +
         "Comenzi procesate: " + std::to_string(total_commands.load(std::memory_order_relaxed)) + "\n" +
         "AOF: " + std::string(aof.policy_name()) + (aof.healthy() ? " (sanatos)" : " (ERORI SCRIERE)") + "\n" +
         peers_report(false);

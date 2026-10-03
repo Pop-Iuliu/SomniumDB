@@ -9,6 +9,7 @@
 #include <memory>
 #include <atomic>
 #include <functional>
+#include <sys/types.h>
 #include "../../pubsub.h"
 #include "../../pool_allocator.h"
 #include "../storage/aof_manager.h"
@@ -80,8 +81,17 @@ private:
     // regenereze timestampuri sau sa re-evalueze comanda
     void replay_record(const AofRecord& rec);
 
-    // AOF rescris ca stare curenta; folosit si pentru migrarea v1/v2 -> v3
+    // AOF rescris ca stare curenta, sincron (migrarea v1/v2 -> v3 la pornire)
     bool rewrite_aof();
+    // rescrierea in fundal (S14): fork + instantaneu copy-on-write in copil,
+    // apoi coada AOF-ului vechi de la fork; raspunsul RESP al comenzii
+    std::string start_background_rewrite();
+    void finish_background_rewrite(); // la inceputul fiecarei comenzi
+    // starea curenta ca inregistrari AOF; lock = false in copilul fork-ului
+    bool dump_state(const std::function<bool(const AofRecord&)>& write, bool lock);
+    void discard_active_snapshots();
+    pid_t rewrite_child_ = 0;   // copilul care scrie instantaneul, 0 = niciunul
+    uint64_t rewrite_from_ = 0; // offsetul AOF-ului curent la fork
 
     // cheia logica: RAM, apoi cold storage (reincarcata in RAM); cheile expirate
     // conteaza ca absente. nullptr = cheia nu exista.
