@@ -23,6 +23,17 @@ namespace {
     }
 } // namespace
 
+bool SnapshotManager::has_snapshot(const std::string& room_name) {
+    struct stat sb{};
+    const std::string filename = "room_" + room_name + ".bin";
+    return ::stat(filename.c_str(), &sb) == 0 && S_ISREG(sb.st_mode);
+}
+
+void SnapshotManager::discard(const std::string& room_name) {
+    const std::string filename = "room_" + room_name + ".bin";
+    if (has_snapshot(room_name)) ::unlink(filename.c_str());
+}
+
 bool SnapshotManager::wakeup_room(Room& room, PoolAllocator<Record, 1024>& pool) {
     const std::string filename = "room_" + room.name + ".bin";
     struct stat sb{};

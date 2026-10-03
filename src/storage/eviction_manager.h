@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -37,6 +38,10 @@ public:
     // publica impreuna, doar daca toate scrierile au reusit. Intoarce octetii
     // recuperati sau -1 la esec (fisierul si indexul vechi raman in uz).
     long long compact(long long now_ms);
+
+    // fiecare cheie din cold storage, cu inregistrarea ei (rescrierea AOF);
+    // false = o citire a esuat
+    bool for_each(const std::function<void(const std::string& room, const std::string& key, const Record&)>& fn) const;
 
 private:
     struct ColdRef {

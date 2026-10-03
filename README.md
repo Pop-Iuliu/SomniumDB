@@ -64,6 +64,7 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 | `ROOM.INFO name` | State, last access, resident keys |
 | `ROOM.HIBERNATE name`, `ROOM.WAKE name` | Explicit room control |
 | `COMPACT` | Compact cold storage; replies with reclaimed bytes |
+| `REWRITEAOF` | Rewrite the AOF as current state (also automatic, see below) |
 | `SUBSCRIBE channel [channel ...]`, `UNSUBSCRIBE [channel ...]`, `PUBLISH channel message` | Pub/Sub; `PING` and `UNSUBSCRIBE` also work while subscribed |
 | `PING [message]`, `ECHO message`, `QUIT` | Connection commands |
 | `HELLO [2\|3 [AUTH user pass] [SETNAME name]]` | Protocol negotiation; `HELLO 3` switches the connection to RESP3 (nulls, maps, Pub/Sub pushes, normal commands while subscribed) |
@@ -71,7 +72,7 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 
 Commands can be sent as RESP arrays or inline (one line split on spaces, with `"..."` and `'...'` quoting as in `redis-cli`, e.g. from `telnet`), so `redis-cli` and `redis-benchmark` work unmodified, in RESP2 or RESP3.
 
-Environment: `REDIS_PORT`, `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
+Environment: `REDIS_PORT`, `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_AOF_REWRITE_MIN_BYTES` (the AOF is rewritten automatically once it doubles past this size, default 64 MB), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
 
 ---
 

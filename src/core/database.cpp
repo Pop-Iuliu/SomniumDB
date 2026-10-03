@@ -34,7 +34,7 @@ Database::Database() {
 
     // 2) migrare explicita: AOF-urile vechi (v1/v2) sau corupte ajung in v3
     if (aof.needs_rewrite()) {
-        migrate_aof_to_v3();
+        rewrite_aof();
     }
 
     // 3) abia acum deschidem append-ul; fisier nou primeste header v3
@@ -45,39 +45,52 @@ Database::Database() {
 
 Database::~Database() = default;
 
-// migrarea nu schimba starea, doar o re-serialiaza in formatul v3 atomically:
-// temporar -> fsync -> rename. Esuarea in orice punct lasa fisierul vechi neatins.
-void Database::migrate_aof_to_v3() {
-    if (!aof.start_rewrite()) return;
+// AOF-ul rescris ca stare curenta (si migrarea v1/v2 -> v3, aceeasi operatie):
+// camerele active din RAM, cele adormite din snapshot (citit intr-o camera
+// temporara, fara trezire si fara buget) si cheile din cold storage. Cheile
+// expirate nu se scriu. Temporar -> fsync -> rename: un esec lasa AOF-ul vechi.
+// ponytail: sincron pe thread-ul de comenzi; rescriere in fundal cand pauza se masoara
+bool Database::rewrite_aof() {
+    if (!aof.start_rewrite()) return false;
 
+    const long long now = get_current_time_ms();
     bool ok = true;
+    const auto emit = [&](const std::string& room, const std::string& key, const Record& r) {
+        if (ok && !r.expired(now)) {
+            ok = aof.append_rewrite({room, {"SET", key, r.value}, r.expire_at, r.timestamp_ms, r.node_id});
+        }
+    };
+
     {
         std::shared_lock rooms_lock(rooms_mutex);
-        for (auto& [name, room] : rooms) {
-            if (room->state == RoomState::Sleeping) continue; // snapshot-ul ei este persistenta
+        for (const auto& [name, room] : rooms) {
             std::lock_guard room_lock(room->room_mutex);
-            for (const auto& [key, rec] : room->keys) {
-                AofRecord out;
-                out.room = name;
-                out.args = {"SET", key, rec->value};
-                out.expire_at = rec->expire_at;
-                out.timestamp_ms = rec->timestamp_ms;
-                out.node_id = rec->node_id;
-                if (!aof.append_rewrite(out)) {
-                    ok = false;
-                    break;
+            if (room->state == RoomState::Sleeping) {
+                Room snapshot(name);
+                if (SnapshotManager::has_snapshot(name) && !SnapshotManager::wakeup_room(snapshot, record_pool)) {
+                    ok = false; // snapshot ilizibil: AOF-ul vechi ramane singura copie
                 }
+                for (const auto& [key, r] : snapshot.keys) {
+                    emit(name, key, *r);
+                    record_pool.destroy(r);
+                }
+            } else {
+                for (const auto& [key, r] : room->keys) emit(name, key, *r);
+                // noul AOF nu mai contine DEL-urile: un snapshot ramas de la ultima
+                // trezire s-ar incarca la replay si ar invia cheile sterse de atunci
+                SnapshotManager::discard(name);
             }
             if (!ok) break;
         }
     }
+    if (ok && !eviction.for_each(emit)) ok = false;
 
     if (!ok) {
         aof.abort_rewrite();
-        printf("AOF: migrarea v3 a esuat; fisierul vechi ramane neatins (se reincearca la urmatorul restart)\n");
-        return;
+        printf("AOF: rescrierea a esuat; fisierul vechi ramane in uz\n");
+        return false;
     }
-    aof.commit_rewrite();
+    return aof.commit_rewrite();
 }
 
 void Database::replay_record(const AofRecord& rec) {
@@ -231,6 +244,8 @@ bool Database::wake_room(const std::string& name) {
 std::string Database::execute(const int client_fd, const std::vector<std::string>& args, const bool resp3) {
     if (args.empty()) return "";
     resp3_ = resp3;
+    // aici nu e prins niciun lock: rescrierea ia singura registrul si camerele
+    if (aof.rewrite_due()) rewrite_aof();
 
     const std::string current_room = get_client_room(client_fd);
     std::string command = args[0];
@@ -287,6 +302,10 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
 
     if (command == "ROOMS" || command.starts_with("ROOM.")) {
         return handle_room_admin(command, args);
+    }
+
+    if (command == "REWRITEAOF") {
+        return rewrite_aof() ? "+OK\r\n" : "-ERR AOF rewrite failed, previous AOF kept\r\n";
     }
 
     if (command == "COMPACT") {

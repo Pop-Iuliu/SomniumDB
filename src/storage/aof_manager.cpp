@@ -1,6 +1,7 @@
 #include "aof_manager.h"
 #include "fs_util.h"
 #include "../core/resp.h"
+#include "../../metrics.h"
 #include <cstdio>
 #include <cerrno>
 #include <cstdlib>
@@ -68,6 +69,14 @@ AOFManager::AOFManager() {
         sync_policy_ = SyncPolicy::Everysec;
         fprintf(stderr, "SOMNIUM_AOF_SYNC necunoscut: '%s' (folosesc everysec)\n", val.c_str());
     }
+    if (const char* min = getenv("SOMNIUM_AOF_REWRITE_MIN_BYTES"); min && !fsutil::parse_u64(min, &rewrite_min_)) {
+        fprintf(stderr, "SOMNIUM_AOF_REWRITE_MIN_BYTES invalid: '%s'\n", min);
+    }
+}
+
+void AOFManager::publish_sizes() const {
+    global_metrics.aof_bytes.store(size_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    global_metrics.aof_base_bytes.store(base_size_.load(std::memory_order_relaxed), std::memory_order_relaxed);
 }
 
 AOFManager::~AOFManager() {
@@ -159,7 +168,8 @@ bool AOFManager::open_file() {
     // fisier nou: header de format, ca deschiderile viitoare sa nu mai
     // ghiceasca nimic din continut
     struct stat sb{};
-    if (::fstat(fd_, &sb) == 0 && sb.st_size == 0) {
+    const bool has_size = ::fstat(fd_, &sb) == 0;
+    if (has_size && sb.st_size == 0) {
         if (!fsutil::write_all(fd_, kAofHeader, sizeof(kAofHeader) - 1) || !sync_locked(fd_)) {
             fprintf(stderr, "AOF: nu pot scrie headerul v3\n");
             healthy_ = false;
@@ -170,6 +180,10 @@ bool AOFManager::open_file() {
         fsutil::sync_dir();
     }
 
+    // ca Redis: dimensiunea de la pornire e baza pentru rescrierea automata
+    size_ = has_size && sb.st_size > 0 ? static_cast<uint64_t>(sb.st_size) : sizeof(kAofHeader) - 1;
+    base_size_ = size_.load();
+    publish_sizes();
     printf("AOF: format v3, politica durabilitate: %s\n", policy_name());
     return true;
 }
@@ -203,6 +217,8 @@ bool AOFManager::append(const std::string& room_name, const std::vector<std::str
         fd_ = -1;
         return false;
     }
+    size_.fetch_add(data.size(), std::memory_order_relaxed);
+    publish_sizes();
 
     switch (sync_policy_) {
         case SyncPolicy::Always:
@@ -343,18 +359,21 @@ void AOFManager::recover(const std::function<void(const AofRecord&)>& replay) {
 bool AOFManager::start_rewrite() {
     std::lock_guard lock(mutex_);
     if (rewrite_fd_ >= 0) return true;
+    base_size_ = size_.load(); // orice incercare reseteaza baza (vezi rewrite_due)
+    publish_sizes();
     rewrite_fd_ = ::open("appendonly.aof.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (rewrite_fd_ < 0) {
-        fprintf(stderr, "AOF: migrare v3: nu pot crea fisierul temporar: %s\n", strerror(errno));
+        fprintf(stderr, "AOF: rescriere: nu pot crea fisierul temporar: %s\n", strerror(errno));
         return false;
     }
     if (!fsutil::write_all(rewrite_fd_, kAofHeader, sizeof(kAofHeader) - 1)) {
-        fprintf(stderr, "AOF: migrare v3: headerul nu a putut fi scris\n");
+        fprintf(stderr, "AOF: rescriere: headerul nu a putut fi scris\n");
         ::close(rewrite_fd_);
         rewrite_fd_ = -1;
         ::unlink("appendonly.aof.tmp");
         return false;
     }
+    rewrite_bytes_ = sizeof(kAofHeader) - 1;
     return true;
 }
 
@@ -363,9 +382,10 @@ bool AOFManager::append_rewrite(const AofRecord& rec) {
     if (rewrite_fd_ < 0) return false;
     const std::string data = encode_record(rec);
     if (!fsutil::write_all(rewrite_fd_, data.data(), data.size())) {
-        fprintf(stderr, "AOF: migrare v3: scriere esuata: %s\n", strerror(errno));
+        fprintf(stderr, "AOF: rescriere: scriere esuata: %s\n", strerror(errno));
         return false;
     }
+    rewrite_bytes_ += data.size();
     return true;
 }
 
@@ -375,7 +395,7 @@ void AOFManager::abort_locked() {
         rewrite_fd_ = -1;
     }
     ::unlink("appendonly.aof.tmp");
-    // fisierul original (vechi) ramane neatins: migrarea poate fi reincercata
+    // fisierul original (vechi) ramane neatins: rescrierea poate fi reincercata
 }
 
 void AOFManager::abort_rewrite() {
@@ -388,13 +408,13 @@ bool AOFManager::commit_rewrite() {
     if (rewrite_fd_ < 0) return false;
 
     if (!fsutil::sync_fd(rewrite_fd_)) {
-        fprintf(stderr, "AOF: migrare v3: fdatasync esuat: %s\n", strerror(errno));
+        fprintf(stderr, "AOF: rescriere: fdatasync esuat: %s\n", strerror(errno));
         abort_locked();
         return false;
     }
     if (::close(rewrite_fd_) != 0) {
         healthy_ = false;
-        fprintf(stderr, "AOF: migrare v3: close esuat: %s\n", strerror(errno));
+        fprintf(stderr, "AOF: rescriere: close esuat: %s\n", strerror(errno));
         rewrite_fd_ = -1;
         ::unlink("appendonly.aof.tmp");
         return false;
@@ -404,7 +424,7 @@ bool AOFManager::commit_rewrite() {
     // substitutie atomica: ori vechiul fisier, ori cel nou v3, niciodata unul partial
     if (::rename("appendonly.aof.tmp", kAofPath) != 0) {
         healthy_ = false;
-        fprintf(stderr, "AOF: migrare v3: rename esuat: %s\n", strerror(errno));
+        fprintf(stderr, "AOF: rescriere: rename esuat: %s\n", strerror(errno));
         ::unlink("appendonly.aof.tmp");
         return false;
     }
@@ -417,6 +437,9 @@ bool AOFManager::commit_rewrite() {
     fd_ = ::open(kAofPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
     healthy_ = fd_ >= 0;
     needs_rewrite_ = false;
-    printf("AOF: migrare catre formatul v3 finalizata\n");
+    size_ = rewrite_bytes_;
+    base_size_ = rewrite_bytes_;
+    publish_sizes();
+    printf("AOF: rescriere finalizata (%llu octeti)\n", static_cast<unsigned long long>(rewrite_bytes_));
     return healthy_;
 }
