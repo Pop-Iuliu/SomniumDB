@@ -108,12 +108,9 @@ void Database::replay_record(const AofRecord& rec) {
 
     // starea rezultata, aplicata verbatim: valoare, termen absolut si versiune
     const auto put = [&](const std::string& key, const std::string& value, const uint64_t ts, const uint64_t node) {
-        Record*& r = room->keys[key];
-        if (!r) {
-            r = record_pool.construct();
-            global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
-        }
-        r->value = value;
+        const auto it = room->keys.find(key);
+        Record* r = it != room->keys.end() ? it->second : insert(*room, key);
+        set_value(*room, r, value);
         r->expire_at = rec.expire_at;
         r->timestamp_ms = ts;
         r->node_id = static_cast<uint32_t>(node);
@@ -152,11 +149,7 @@ void Database::replay_record(const AofRecord& rec) {
     }
 
     if (command == "DEL" && rec.args.size() >= 2) {
-        if (const auto it = room->keys.find(rec.args[1]); it != room->keys.end()) {
-            record_pool.destroy(it->second);
-            room->keys.erase(it);
-            global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
-        }
+        if (const auto it = room->keys.find(rec.args[1]); it != room->keys.end()) erase(*room, it);
         return;
     }
 
@@ -215,7 +208,18 @@ bool Database::activate(Room& room, const bool over_budget) {
 
     room.state = RoomState::Loading;
     SnapshotManager::wakeup_room(room, record_pool);
+    const size_t cost = room.keys_cost();
+    if (!over_budget && !eviction.fits(cost)) {
+        // camera nu incape in SOMNIUM_MAXMEMORY: renuntam la ce am incarcat;
+        // snapshot-ul a ramas neatins, deci nu se schimba nimic
+        for (const auto& [key, r] : room.keys) record_pool.destroy(r);
+        room.keys.clear();
+        room.state = RoomState::Sleeping;
+        active_rooms.fetch_sub(1);
+        return false;
+    }
     global_metrics.keys_in_ram.fetch_add(room.keys.size(), std::memory_order_relaxed);
+    room.charge(static_cast<long long>(cost));
     room.state = RoomState::Active;
     return true;
 }
@@ -225,11 +229,13 @@ bool Database::hibernate(Room& room) {
 
     room.state = RoomState::Hibernating;
     const size_t resident = room.keys.size();
+    const size_t cost = room.keys_cost();
     if (!SnapshotManager::hibernate_room(room, record_pool)) {
         room.state = RoomState::Active;
         return false;
     }
     global_metrics.keys_in_ram.fetch_sub(resident, std::memory_order_relaxed);
+    room.charge(-static_cast<long long>(cost));
     room.state = RoomState::Sleeping;
     active_rooms.fetch_sub(1);
     return true;
@@ -344,15 +350,18 @@ std::string Database::handle_room_admin(const std::string& command, const std::v
         // cheile rezidente doar pentru camerele active, sub lock-ul lor
         RoomState state = room->state;
         size_t keys = 0;
+        size_t bytes = 0;
         if (state == RoomState::Active) {
             std::lock_guard lock(room->room_mutex);
             state = room->state;
             keys = room->keys.size();
+            bytes = room->bytes;
         }
         static constexpr const char* STATE_NAMES[] = {"sleeping", "loading", "active", "hibernating"};
-        return map_header(3) + bulk_string("state") + bulk_string(STATE_NAMES[static_cast<int>(state)]) +
+        return map_header(4) + bulk_string("state") + bulk_string(STATE_NAMES[static_cast<int>(state)]) +
                bulk_string("last_access_ms") + ":" + std::to_string(room->last_access_time) + "\r\n" +
-               bulk_string("keys") + ":" + std::to_string(keys) + "\r\n";
+               bulk_string("keys") + ":" + std::to_string(keys) + "\r\n" +
+               bulk_string("bytes") + ":" + std::to_string(bytes) + "\r\n";
     }
 
     return "-ERR unknown command\r\n";
@@ -369,26 +378,33 @@ std::string Database::execute_in_room(const std::string& room_name, const std::v
     std::lock_guard room_lock(room->room_mutex);
     if (!activate(*room)) return ROOMS_FULL;
 
-    if (command == "GET") return handle_get(room_name, *room, args);
-    if (command == "SET") return handle_set(room_name, *room, args);
-    if (command == "DEL") return handle_del(room_name, *room, args);
-    if (command == "CRDTMERGE") return handle_crdtmerge(room_name, *room, args);
-    if (command == "MGET") return handle_mget(room_name, *room, args);
-    if (command == "MSET") return handle_mset(room_name, *room, args);
-    if (command == "EXISTS") return handle_exists(room_name, *room, args);
-    if (command == "EXPIRE") return handle_expire(room_name, *room, args, 1000);
-    if (command == "PEXPIRE") return handle_expire(room_name, *room, args, 1);
-    if (command == "PERSIST") return handle_expire(room_name, *room, args, 0);
-    if (command == "TTL") return handle_ttl(room_name, *room, args, false);
-    if (command == "PTTL") return handle_ttl(room_name, *room, args, true);
-    if (command == "INFO") return handle_info();
-    if (command == "SAVE") {
-        // nu confirmam niciodata o persistenta suspectata
-        return aof.healthy() ? "+OK AOF is active and up to date\r\n"
-                             : "-ERR AOF write error, persistenta suspecta\r\n";
-    }
+    const std::string reply = [&]() -> std::string {
+        if (command == "GET") return handle_get(room_name, *room, args);
+        if (command == "SET") return handle_set(room_name, *room, args);
+        if (command == "DEL") return handle_del(room_name, *room, args);
+        if (command == "CRDTMERGE") return handle_crdtmerge(room_name, *room, args);
+        if (command == "MGET") return handle_mget(room_name, *room, args);
+        if (command == "MSET") return handle_mset(room_name, *room, args);
+        if (command == "EXISTS") return handle_exists(room_name, *room, args);
+        if (command == "EXPIRE") return handle_expire(room_name, *room, args, 1000);
+        if (command == "PEXPIRE") return handle_expire(room_name, *room, args, 1);
+        if (command == "PERSIST") return handle_expire(room_name, *room, args, 0);
+        if (command == "TTL") return handle_ttl(room_name, *room, args, false);
+        if (command == "PTTL") return handle_ttl(room_name, *room, args, true);
+        if (command == "INFO") return handle_info();
+        if (command == "SAVE") {
+            // nu confirmam niciodata o persistenta suspectata
+            return aof.healthy() ? "+OK AOF is active and up to date\r\n"
+                                 : "-ERR AOF write error, persistenta suspecta\r\n";
+        }
 
-    return "-ERR unknown command\r\n";
+        return "-ERR unknown command\r\n";
+    }();
+
+    // evictare o singura data, dupa comanda: acopera scrierile, dar si cheile
+    // reincarcate din cold storage de citiri (raspunsul e deja construit)
+    eviction.evict_despised_keys(*room, record_pool);
+    return reply;
 }
 
 Record* Database::lookup(const std::string& room_name, Room& room, const std::string& key) {
@@ -398,9 +414,7 @@ Record* Database::lookup(const std::string& room_name, Room& room, const std::st
             global_metrics.cache_hits.fetch_add(1, std::memory_order_relaxed);
             return it->second;
         }
-        record_pool.destroy(it->second);
-        room.keys.erase(it);
-        global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
+        erase(room, it);
         return nullptr;
     }
 
@@ -411,6 +425,7 @@ Record* Database::lookup(const std::string& room_name, Room& room, const std::st
     Record* r = record_pool.construct(std::move(*cold));
     room.keys.emplace(key, r);
     global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
+    room.charge(static_cast<long long>(record_cost(key, *r)));
     return r;
 }
 
@@ -418,7 +433,20 @@ Record* Database::insert(Room& room, const std::string& key) {
     Record* r = record_pool.construct();
     room.keys.emplace(key, r);
     global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
+    room.charge(static_cast<long long>(record_cost(key, *r)));
     return r;
+}
+
+void Database::set_value(Room& room, Record* r, const std::string& value) {
+    room.charge(static_cast<long long>(value.size()) - static_cast<long long>(r->value.size()));
+    r->value = value;
+}
+
+void Database::erase(Room& room, const std::unordered_map<std::string, Record*>::iterator it) {
+    room.charge(-static_cast<long long>(record_cost(it->first, *it->second)));
+    global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
+    record_pool.destroy(it->second);
+    room.keys.erase(it);
 }
 
 std::string Database::handle_get(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
@@ -471,7 +499,7 @@ std::string Database::handle_set(const std::string& room_name, Room& room, const
     Record* r = lookup(room_name, room, key);
     if ((nx && r) || (xx && !r)) return nil();
     if (!r) r = insert(room, key);
-    r->value = args[2];
+    set_value(room, r, args[2]);
     r->expire_at = expire_at; // un SET simplu sterge si TTL-ul vechi
     r->timestamp_ms = now_ms;
     r->node_id = LOCAL_NODE_ID;
@@ -480,7 +508,6 @@ std::string Database::handle_set(const std::string& room_name, Room& room, const
     // mutatia rezultata pleaca in AOF cu termenul absolut si versiunea CRDT:
     // replay-ul o aplica verbatim, fara sa re-evalueze NX/XX sau sa reporneasca TTL-ul
     aof.append(room_name, args, expire_at, now_ms, LOCAL_NODE_ID);
-    eviction.evict_despised_keys(room, record_pool);
 
     return "+OK\r\n";
 }
@@ -495,7 +522,7 @@ std::string Database::handle_mset(const std::string& room_name, Room& room, cons
     for (size_t i = 1; i < args.size(); i += 2) {
         Record* r = lookup(room_name, room, args[i]);
         if (!r) r = insert(room, args[i]);
-        r->value = args[i + 1];
+        set_value(room, r, args[i + 1]);
         r->expire_at = 0; // ca la SET simplu: TTL-ul vechi dispare
         r->timestamp_ms = now_ms;
         r->node_id = LOCAL_NODE_ID;
@@ -504,7 +531,6 @@ std::string Database::handle_mset(const std::string& room_name, Room& room, cons
     global_metrics.total_sets.fetch_add(args.size() / 2, std::memory_order_relaxed);
 
     aof.append(room_name, args, 0, now_ms, LOCAL_NODE_ID);
-    eviction.evict_despised_keys(room, record_pool);
     return "+OK\r\n";
 }
 
@@ -613,10 +639,7 @@ std::string Database::handle_del(const std::string& room_name, Room& room, const
     const std::string& key = args[1];
     if (!lookup(room_name, room, key)) return ":0\r\n";
 
-    const auto it = room.keys.find(key);
-    record_pool.destroy(it->second);
-    room.keys.erase(it);
-    global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
+    erase(room, room.keys.find(key));
     aof.append(room_name, args, 0, get_current_time_ms(), LOCAL_NODE_ID);
     return ":1\r\n";
 }
@@ -643,7 +666,7 @@ std::string Database::handle_crdtmerge(const std::string& room_name, Room& room,
     }
     if (!r) r = insert(room, key);
 
-    r->value = args[2];
+    set_value(room, r, args[2]);
     r->timestamp_ms = incoming_ts;
     r->node_id = static_cast<uint32_t>(incoming_node);
     eviction.record_access(key);
@@ -661,6 +684,7 @@ std::string Database::handle_info() {
         "Uptime: " + std::to_string(uptime) + "s\n" +
         "Camere active: " + std::to_string(active_rooms.load()) + "\n" +
         "Chei totale: " + std::to_string(global_metrics.keys_in_ram.load(std::memory_order_relaxed)) + "\n" +
+        "Octeti rezidenti: " + std::to_string(global_metrics.resident_bytes.load(std::memory_order_relaxed)) + "\n" +
         "Comenzi procesate: " + std::to_string(total_commands.load(std::memory_order_relaxed)) + "\n" +
         "AOF: " + std::string(aof.policy_name()) + (aof.healthy() ? " (sanatos)" : " (ERORI SCRIERE)") + "\n";
 
@@ -711,9 +735,7 @@ void Database::clean_expired_keys() {
         std::lock_guard room_lock(room->room_mutex);
         for (auto it = room->keys.begin(); it != room->keys.end();) {
             if (it->second->expired(now)) {
-                record_pool.destroy(it->second);
-                it = room->keys.erase(it);
-                global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
+                erase(*room, it++);
             } else {
                 ++it;
             }

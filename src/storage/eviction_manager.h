@@ -26,8 +26,14 @@ public:
 
     void record_access(const std::string& key) { cms.record_access(key); }
 
+    // true daca inca `extra` octeti rezidenti incap in SOMNIUM_MAXMEMORY (0 = fara limita)
+    bool fits(const size_t extra) const {
+        return max_bytes == 0 || global_metrics.resident_bytes.load(std::memory_order_relaxed) + extra <= max_bytes;
+    }
+
     // muta cheile cele mai putin folosite in cold storage pana camera respecta
-    // limita (SOMNIUM_MAX_KEYS); o scriere esuata lasa inregistrarea in RAM
+    // limita de chei (SOMNIUM_MAX_KEYS) si totalul respecta bugetul in octeti
+    // (SOMNIUM_MAXMEMORY); o scriere esuata lasa inregistrarea in RAM
     void evict_despised_keys(Room& room, PoolAllocator<Record, 1024>& pool);
 
     // scoate cheia din cold storage (apelantul o muta in RAM);
@@ -55,6 +61,7 @@ private:
     uint64_t file_bytes = 0;
     uint64_t obsolete_bytes = 0;
     uint64_t max_keys_per_room = 1000000;
+    uint64_t max_bytes = 0;
 
     void publish_metrics() const;
 };

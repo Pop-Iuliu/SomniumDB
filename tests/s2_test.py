@@ -104,9 +104,17 @@ def sec_transitions(check):
         check("expirata in cold: absenta", c.cmd("GET", "d")[0] == "nil")
         check("XX pe cheie expirata in cold", c.cmd("SET", "d", "v", "XX") == ("nil", None))
 
+        c.close()
+    finally:
+        srv.cleanup()
+
+    srv = Server(env_extra=ENV)  # fara evictare: cheia ramane in RAM si intra in snapshot
+    try:
+        srv.start()
+        c = Client(srv)
         c.cmd("ROOM", "h")
         c.cmd("SET", "x", "v", "PX", "60000")
-        p1 = c.cmd("PTTL", "x")[1]  # reincarcarea o aduce in RAM, deci intra in snapshot
+        p1 = c.cmd("PTTL", "x")[1]
         check("ROOM.HIBERNATE", c.cmd("ROOM.HIBERNATE", "h") == ("ok", "OK"))
         p2 = c.cmd("PTTL", "x")[1]  # trezire din snapshot
         check("fara viata in plus dupa hibernare", 0 < p2 <= p1, (p1, p2))

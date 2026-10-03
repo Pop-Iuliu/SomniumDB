@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <mutex>
 #include "../../record.h"
+#include "../../metrics.h"
 
 // Ciclul de viata: Sleeping -> Loading -> Active -> Hibernating -> Sleeping.
 //
@@ -20,6 +21,13 @@
 //     hibernare indica mereu camera inregistrata
 enum class RoomState { Sleeping, Loading, Active, Hibernating };
 
+// costul estimat al unei inregistrari in RAM: cheie, valoare si o regie fixa
+// (Record, nodul din hashmap, headerul cheii). O estimare, nu contabilitate de alocator.
+constexpr size_t kRecordOverhead = sizeof(Record) + sizeof(std::string) + 2 * sizeof(void*);
+inline size_t record_cost(const std::string& key, const Record& r) {
+    return key.size() + r.value.size() + kRecordOverhead;
+}
+
 class Room {
 public:
     std::string name;
@@ -27,6 +35,19 @@ public:
     std::mutex room_mutex;
     std::atomic<long long> last_access_time{0};
     std::atomic<RoomState> state{RoomState::Sleeping};
+    size_t bytes = 0; // octetii rezidenti estimati, sub room_mutex
 
     explicit Room(std::string name) : name(std::move(name)) {}
+
+    // singurul loc prin care se schimba octetii: camera si totalul global
+    void charge(const long long delta) {
+        bytes += delta;
+        global_metrics.resident_bytes.fetch_add(delta, std::memory_order_relaxed);
+    }
+
+    size_t keys_cost() const {
+        size_t total = 0;
+        for (const auto& [key, r] : keys) total += record_cost(key, *r);
+        return total;
+    }
 };

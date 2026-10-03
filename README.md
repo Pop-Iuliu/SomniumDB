@@ -61,7 +61,7 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 | `CRDTMERGE key value timestamp node` | Last-writer-wins merge on `(timestamp, node)` |
 | `ROOM name` | Select (and wake) a room |
 | `ROOMS` | List known rooms |
-| `ROOM.INFO name` | State, last access, resident keys |
+| `ROOM.INFO name` | State, last access, resident keys and estimated bytes |
 | `ROOM.HIBERNATE name`, `ROOM.WAKE name` | Explicit room control |
 | `COMPACT` | Compact cold storage; replies with reclaimed bytes |
 | `REWRITEAOF` | Rewrite the AOF as current state (also automatic, see below) |
@@ -72,7 +72,7 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 
 Commands can be sent as RESP arrays or inline (one line split on spaces, with `"..."` and `'...'` quoting as in `redis-cli`, e.g. from `telnet`), so `redis-cli` and `redis-benchmark` work unmodified, in RESP2 or RESP3.
 
-Environment: `REDIS_PORT`, `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_AOF_REWRITE_MIN_BYTES` (the AOF is rewritten automatically once it doubles past this size, default 64 MB), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
+Environment: `REDIS_PORT`, `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_MAXMEMORY` (global budget in bytes for resident keys and values, estimated; default unlimited), `SOMNIUM_AOF_REWRITE_MIN_BYTES` (the AOF is rewritten automatically once it doubles past this size, default 64 MB), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
 
 ---
 

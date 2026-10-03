@@ -40,6 +40,9 @@ EvictionManager::EvictionManager() {
         fprintf(stderr, "SOMNIUM_MAX_KEYS invalid: '%s' (folosesc %llu)\n", env,
                 static_cast<unsigned long long>(max_keys_per_room));
     }
+    if (const char* env = getenv("SOMNIUM_MAXMEMORY"); env && !fsutil::parse_u64(env, &max_bytes)) {
+        fprintf(stderr, "SOMNIUM_MAXMEMORY invalid: '%s' (fara limita)\n", env);
+    }
     fd = ::open(kColdPath, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0644);
     if (fd < 0) {
         fprintf(stderr, "Cold storage indisponibil (%s): cheile raman in RAM\n", strerror(errno));
@@ -60,7 +63,9 @@ void EvictionManager::evict_despised_keys(Room& room, PoolAllocator<Record, 1024
     constexpr int SAMPLE_SIZE = 5;
     static std::mt19937 rng(std::random_device{}());
 
-    while (room.keys.size() > max_keys_per_room) {
+    // ponytail: evictam doar din camera scrisa; daca alte camere tin bugetul,
+    // aceasta ramane fara RAM (cheile ei raman citibile din cold storage)
+    while (!room.keys.empty() && (room.keys.size() > max_keys_per_room || !fits(0))) {
         // LFU aproximativ: cea mai rara dintre cateva chei esantionate
         const std::string* victim = nullptr;
         uint16_t lowest = 0xFFFF;
@@ -95,6 +100,7 @@ void EvictionManager::evict_despised_keys(Room& room, PoolAllocator<Record, 1024
         file_bytes += data.size();
         global_metrics.keys_evicted.fetch_add(1, std::memory_order_relaxed);
         global_metrics.keys_in_ram.fetch_sub(1, std::memory_order_relaxed);
+        room.charge(-static_cast<long long>(record_cost(it->first, *it->second)));
         pool.destroy(it->second);
         room.keys.erase(it);
     }

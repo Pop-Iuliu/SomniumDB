@@ -143,7 +143,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 **Goal:** Remove the remaining hard ceilings: inputs that can kill the server, clients that cannot connect, a log that grows forever, memory that no budget actually bounds, and a CRDT that never leaves its node.
 
-**Status:** In progress. S6 and S7 done; S8 implemented, awaiting CI verification; S9 and S10 planned. Five tickets, each inspired by one supplied word.
+**Status:** In progress. S6, S7 and S8 done; S9 implemented, awaiting CI verification; S10 planned. Five tickets, each inspired by one supplied word.
 
 **Planning target:** One two-week sprint for S6 to S9; S10 may spill into the next one. Completion means meeting the acceptance checks below.
 
@@ -202,7 +202,7 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 
 ## S8 - Rebag: Pack the Log Again
 
-**Status: IMPLEMENTED, awaiting CI verification.** `Database::rewrite_aof()` serializes current state through the existing `start_rewrite` / `append_rewrite` / `commit_rewrite` path and also replaces the v1/v2 migration, which was the same operation. Active rooms come from RAM, sleeping rooms from their snapshot read into a temporary room (no wake, no budget), and cold keys through the index; expired keys are skipped. Sleeping rooms keep their snapshot as a cache (it is current), but snapshots of active rooms are deleted during the rewrite: the new AOF carries no DELs, so a snapshot left over from the last wake would otherwise resurrect keys deleted since. `REWRITEAOF` runs it on request, and it also runs automatically before a command once the AOF has doubled since the last rewrite and passed `SOMNIUM_AOF_REWRITE_MIN_BYTES` (default 64 MB). Every attempt resets the baseline, so a failing rewrite is not retried on each command. Synchronous on the command thread, marked as a known ceiling. Metrics: `db_aof_bytes`, `db_aof_base_bytes`. Tests: `tests/s8_test.py`; write, sync and rename failures share the abort path but only the create failure is injected.
+**Status: DONE.** Verified by CI on PR #4 (AddressSanitizer suite, ThreadSanitizer and benchmark jobs green). `Database::rewrite_aof()` serializes current state through the existing `start_rewrite` / `append_rewrite` / `commit_rewrite` path and also replaces the v1/v2 migration, which was the same operation. Active rooms come from RAM, sleeping rooms from their snapshot read into a temporary room (no wake, no budget), and cold keys through the index; expired keys are skipped. Sleeping rooms keep their snapshot as a cache (it is current), but snapshots of active rooms are deleted during the rewrite: the new AOF carries no DELs, so a snapshot left over from the last wake would otherwise resurrect keys deleted since. `REWRITEAOF` runs it on request, and it also runs automatically before a command once the AOF has doubled since the last rewrite and passed `SOMNIUM_AOF_REWRITE_MIN_BYTES` (default 64 MB). Every attempt resets the baseline, so a failing rewrite is not retried on each command. Synchronous on the command thread, marked as a known ceiling. Metrics: `db_aof_bytes`, `db_aof_base_bytes`. Tests: `tests/s8_test.py`; write, sync and rename failures share the abort path but only the create failure is injected.
 
 **Inspiration:** Repacking a bag becomes rewriting the append-only log as current state instead of full history.
 
@@ -223,6 +223,8 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 **Primary files:** `src/storage/aof_manager.*`, `src/core/database.cpp`, `src/storage/eviction_manager.*`, `src/storage/snapshot_manager.*`.
 
 ## S9 - Scolog: Rooms Pay Rent
+
+**Status: IMPLEMENTED, awaiting CI verification.** Each room tracks estimated resident bytes (key + value + a fixed per-record overhead) and `Room::charge()` keeps a global total in step. All changes to a room's RAM contents go through `insert()`, `set_value()` and `erase()` in Database, plus the eviction manager and bulk charges on wake and hibernate, so key counts and bytes cannot drift. `SOMNIUM_MAXMEMORY` sets one global budget: eviction now runs once at the end of every room command (which also covers keys reloaded from cold storage by reads, and CRDTMERGE, which used to grow RAM without evicting) while the total is over budget, in the room being written; that room can end up with no RAM while others hold the budget, marked as a known ceiling. Waking a room that does not fit discards what it loaded and leaves it sleeping with its snapshot untouched. Bytes are reported in `ROOM.INFO`, `INFO` and `db_resident_bytes`. Tests: `tests/s9_test.py`.
 
 **Inspiration:** A tenant farmer paying rent for church land becomes rooms paying for RAM in bytes.
 
