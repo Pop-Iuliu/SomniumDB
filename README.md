@@ -56,7 +56,7 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 | `SET key value [NX\|XX] [EX seconds\|PX milliseconds]` | Conditional and expiring writes, strictly validated; a failed condition replies nil and writes nothing |
 | `MGET key [key ...]`, `MSET key value [key value ...]` | Multi-key read and atomic multi-key write (one AOF record) |
 | `EXISTS key [key ...]` | Number of existing keys; repeated keys count each time |
-| `EXPIRE key seconds`, `PEXPIRE key ms`, `PERSIST key` | Set or remove a deadline; a non-positive TTL deletes the key |
+| `EXPIRE key seconds [NX\|XX\|GT\|LT]`, `PEXPIRE key ms [...]`, `PERSIST key` | Set or remove a deadline (Redis 7 options; no deadline counts as infinite); a non-positive TTL deletes the key |
 | `TTL key`, `PTTL key` | Remaining lifetime; `-1` persistent, `-2` missing |
 | `CRDTMERGE key value timestamp node` | Last-writer-wins merge on `(timestamp, node)` |
 | `ROOM name` | Select (and wake) a room |
@@ -66,9 +66,10 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 | `COMPACT` | Compact cold storage; replies with reclaimed bytes |
 | `SUBSCRIBE channel [channel ...]`, `UNSUBSCRIBE [channel ...]`, `PUBLISH channel message` | Pub/Sub; `PING` and `UNSUBSCRIBE` also work while subscribed |
 | `PING [message]`, `ECHO message`, `QUIT` | Connection commands |
+| `HELLO [2\|3 [AUTH user pass] [SETNAME name]]` | Protocol negotiation; `HELLO 3` switches the connection to RESP3 (nulls, maps, Pub/Sub pushes, normal commands while subscribed) |
 | `INFO`, `SAVE` | Server status, persistence health |
 
-Commands can be sent as RESP arrays or inline (one line split on spaces, as from `telnet`), so `redis-cli` and `redis-benchmark` work unmodified.
+Commands can be sent as RESP arrays or inline (one line split on spaces, with `"..."` and `'...'` quoting as in `redis-cli`, e.g. from `telnet`), so `redis-cli` and `redis-benchmark` work unmodified, in RESP2 or RESP3.
 
 Environment: `REDIS_PORT`, `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
 

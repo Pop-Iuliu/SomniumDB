@@ -228,8 +228,9 @@ bool Database::wake_room(const std::string& name) {
     return activate(*room);
 }
 
-std::string Database::execute(const int client_fd, const std::vector<std::string>& args) {
+std::string Database::execute(const int client_fd, const std::vector<std::string>& args, const bool resp3) {
     if (args.empty()) return "";
+    resp3_ = resp3;
 
     const std::string current_room = get_client_room(client_fd);
     std::string command = args[0];
@@ -238,18 +239,18 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
     if (command == "SUBSCRIBE") {
         if (args.size() < 2) return "-ERR Wrong number of arguments for SUBSCRIBE\r\n";
         std::string replies;
-        for (size_t i = 1; i < args.size(); ++i) replies += pubsub.subscribe(client_fd, args[i]);
+        for (size_t i = 1; i < args.size(); ++i) replies += pubsub.subscribe(client_fd, args[i], resp3);
         return replies;
     }
 
     if (command == "UNSUBSCRIBE") {
-        return pubsub.unsubscribe(client_fd, {args.begin() + 1, args.end()});
+        return pubsub.unsubscribe(client_fd, {args.begin() + 1, args.end()}, resp3);
     }
 
     if (command == "PING") {
         if (args.size() > 2) return "-ERR Wrong number of arguments for PING\r\n";
-        // in modul subscribe, ca Redis: raspuns sub forma de mesaj ["pong", payload]
-        if (pubsub.is_subscribed(client_fd)) {
+        // in modul subscribe pe RESP2, ca Redis: raspuns sub forma de mesaj ["pong", payload]
+        if (!resp3 && pubsub.is_subscribed(client_fd)) {
             return "*2\r\n$4\r\npong\r\n" + bulk_string(args.size() == 2 ? args[1] : "");
         }
         return args.size() == 2 ? bulk_string(args[1]) : "+PONG\r\n";
@@ -260,13 +261,14 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
         return "-ERR Wrong number of arguments for PUBLISH\r\n";
     }
 
-    if (pubsub.is_subscribed(client_fd)) {
+    // pe RESP3 mesajele push se disting de raspunsuri, deci orice comanda e permisa
+    if (!resp3 && pubsub.is_subscribed(client_fd)) {
         return "-ERR Clientul este in mod SUBSCRIBE. Nu poti trimite comenzi de Database!\r\n";
     }
 
     total_commands.fetch_add(1, std::memory_order_relaxed);
 
-    if (command == "COMMAND" || command == "HELLO") {
+    if (command == "COMMAND") {
         return "*0\r\n";
     }
 
@@ -329,7 +331,7 @@ std::string Database::handle_room_admin(const std::string& command, const std::v
             keys = room->keys.size();
         }
         static constexpr const char* STATE_NAMES[] = {"sleeping", "loading", "active", "hibernating"};
-        return "*6\r\n" + bulk_string("state") + bulk_string(STATE_NAMES[static_cast<int>(state)]) +
+        return map_header(3) + bulk_string("state") + bulk_string(STATE_NAMES[static_cast<int>(state)]) +
                bulk_string("last_access_ms") + ":" + std::to_string(room->last_access_time) + "\r\n" +
                bulk_string("keys") + ":" + std::to_string(keys) + "\r\n";
     }
@@ -407,7 +409,7 @@ std::string Database::handle_get(const std::string& room_name, Room& room, const
 
     global_metrics.total_gets.fetch_add(1, std::memory_order_relaxed);
     const Record* r = lookup(room_name, room, args[1]);
-    if (!r) return "$-1\r\n";
+    if (!r) return nil();
 
     eviction.record_access(args[1]);
     return bulk_string(r->value);
@@ -448,7 +450,7 @@ std::string Database::handle_set(const std::string& room_name, Room& room, const
     // conditia vede starea logica (cold storage inclus, expiratele absente);
     // o conditie esuata nu produce nicio mutatie, deci nimic in AOF
     Record* r = lookup(room_name, room, key);
-    if ((nx && r) || (xx && !r)) return "$-1\r\n";
+    if ((nx && r) || (xx && !r)) return nil();
     if (!r) r = insert(room, key);
     r->value = args[2];
     r->expire_at = expire_at; // un SET simplu sterge si TTL-ul vechi
@@ -496,7 +498,7 @@ std::string Database::handle_mget(const std::string& room_name, Room& room, cons
     for (size_t i = 1; i < args.size(); ++i) {
         const Record* r = lookup(room_name, room, args[i]);
         if (!r) {
-            out += "$-1\r\n";
+            out += nil();
             continue;
         }
         eviction.record_access(args[i]);
@@ -517,28 +519,51 @@ std::string Database::handle_exists(const std::string& room_name, Room& room, co
     return ":" + std::to_string(found) + "\r\n";
 }
 
-// EXPIRE key seconds (scale 1000), PEXPIRE key ms (scale 1), PERSIST key (scale 0).
-// In AOF ajunge termenul absolut, deci replay-ul nu reporneste TTL-ul.
+// EXPIRE key seconds [NX|XX|GT|LT] (scale 1000), PEXPIRE key ms [...] (scale 1),
+// PERSIST key (scale 0). In AOF ajunge termenul absolut, deci replay-ul nu
+// reporneste TTL-ul (si nu re-evalueaza optiunile).
 std::string Database::handle_expire(const std::string& room_name, Room& room, const std::vector<std::string>& args,
                                     const long long scale) {
-    if (args.size() != (scale ? 3u : 2u)) {
+    if (scale ? args.size() < 3 : args.size() != 2) {
         return "-ERR Wrong number of arguments for " + args[0] + "\r\n";
     }
 
+    bool nx = false, xx = false, gt = false, lt = false;
+    for (size_t i = 3; i < args.size(); ++i) {
+        std::string opt = args[i];
+        std::ranges::transform(opt, opt.begin(), ::toupper);
+        if (opt == "NX") nx = true;
+        else if (opt == "XX") xx = true;
+        else if (opt == "GT") gt = true;
+        else if (opt == "LT") lt = true;
+        else return "-ERR Unsupported option " + args[i] + "\r\n";
+    }
+    if (nx && (xx || gt || lt)) return "-ERR NX and XX, GT or LT options at the same time are not compatible\r\n";
+    if (gt && lt) return "-ERR GT and LT options at the same time are not compatible\r\n";
+
+    long long n = 0;
     long long expire_at = 0;
     if (scale) {
         const long long now_ms = get_current_time_ms();
-        long long n = 0;
-        if (!fsutil::parse_i64(args[2], &n) || n > (LLONG_MAX - now_ms) / scale) {
+        if (!fsutil::parse_i64(args[2], &n) || n < LLONG_MIN / scale || n > (LLONG_MAX - now_ms) / scale) {
             return "-ERR invalid expire time\r\n";
         }
-        // ca Redis: un termen care a trecut deja sterge cheia
-        if (n <= 0) return handle_del(room_name, room, {"DEL", args[1]});
         expire_at = now_ms + n * scale;
     }
 
     Record* r = lookup(room_name, room, args[1]);
     if (!r || (!scale && r->expire_at == 0)) return ":0\r\n";
+
+    // ca Redis 7: o cheie fara termen are un TTL infinit, deci GT nu se aplica
+    // niciodata, iar LT mereu; optiunile se verifica inainte de stergere
+    const bool has_ttl = r->expire_at != 0;
+    if ((nx && has_ttl) || (xx && !has_ttl) || (gt && (!has_ttl || expire_at <= r->expire_at)) ||
+        (lt && has_ttl && expire_at >= r->expire_at)) {
+        return ":0\r\n";
+    }
+
+    // un termen care a trecut deja sterge cheia
+    if (scale && n <= 0) return handle_del(room_name, room, {"DEL", args[1]});
 
     r->expire_at = expire_at;
     aof.append(room_name, args, expire_at, r->timestamp_ms, r->node_id);

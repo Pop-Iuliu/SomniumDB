@@ -207,6 +207,13 @@ class Client:
             return ("int", int(rest))
         if t == b"*":
             return ("array", [self.read_reply() for _ in range(int(rest))])
+        # RESP3: null distinct de $-1, harti si mesaje push
+        if t == b"_":
+            return ("null", None)
+        if t == b"%":
+            return ("map", [(self.read_reply(), self.read_reply()) for _ in range(int(rest))])
+        if t == b">":
+            return ("push", [self.read_reply() for _ in range(int(rest))])
         if t == b"$":
             n = int(rest)
             if n == -1:

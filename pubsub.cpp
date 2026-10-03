@@ -6,7 +6,7 @@
 #include <iostream>
 #include <vector>
 
-std::string PubSubManager::subscribe(const int client_fd, const std::string& channel) {
+std::string PubSubManager::subscribe(const int client_fd, const std::string& channel, const bool resp3) {
     std::lock_guard lock(ps_mutex);
 
     channel_subscribers[channel].insert(client_fd);
@@ -15,7 +15,7 @@ std::string PubSubManager::subscribe(const int client_fd, const std::string& cha
     int sub_count = client_subscriptions[client_fd].size();
 
     // facem raspunsul in RESP
-    std::string resp = "*3\r\n";
+    std::string resp = resp3 ? ">3\r\n" : "*3\r\n";
     resp += "$9\r\nsubscribe\r\n";
     resp += "$" + std::to_string(channel.length()) + "\r\n" + channel + "\r\n";
     resp += ":" + std::to_string(sub_count) + "\r\n";
@@ -48,14 +48,15 @@ std::string PubSubManager::publish(const std::string& channel, const std::string
     return ":" + std::to_string(targets.size()) + "\r\n";
 }
 
-std::string PubSubManager::unsubscribe(const int client_fd, std::vector<std::string> channels) {
+std::string PubSubManager::unsubscribe(const int client_fd, std::vector<std::string> channels, const bool resp3) {
     std::lock_guard lock(ps_mutex);
 
     const auto mine = client_subscriptions.find(client_fd);
     if (channels.empty() && mine != client_subscriptions.end()) {
         channels.assign(mine->second.begin(), mine->second.end());
     }
-    if (channels.empty()) return "*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n";
+    const std::string header = resp3 ? ">3\r\n$11\r\nunsubscribe\r\n" : "*3\r\n$11\r\nunsubscribe\r\n";
+    if (channels.empty()) return header + (resp3 ? "_\r\n" : "$-1\r\n") + ":0\r\n";
 
     std::string replies;
     for (const std::string& channel : channels) {
@@ -68,7 +69,7 @@ std::string PubSubManager::unsubscribe(const int client_fd, std::vector<std::str
             mine->second.erase(channel);
             remaining = mine->second.size();
         }
-        replies += "*3\r\n$11\r\nunsubscribe\r\n$" + std::to_string(channel.size()) + "\r\n" + channel + "\r\n:" +
+        replies += header + "$" + std::to_string(channel.size()) + "\r\n" + channel + "\r\n:" +
                    std::to_string(remaining) + "\r\n";
     }
     // fara abonamente clientul iese din modul subscribe

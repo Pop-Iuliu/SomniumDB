@@ -85,6 +85,14 @@ private:
 
     static std::string bulk_string(const std::string& payload);
 
+    // protocolul clientului a carui comanda ruleaza acum; il citesc doar
+    // raspunsurile care difera intre RESP2 si RESP3 (thread-ul de comenzi)
+    bool resp3_ = false;
+    std::string nil() const { return resp3_ ? "_\r\n" : "$-1\r\n"; }
+    std::string map_header(const size_t pairs) const {
+        return resp3_ ? "%" + std::to_string(pairs) + "\r\n" : "*" + std::to_string(2 * pairs) + "\r\n";
+    }
+
 public:
     Database();
     ~Database();
@@ -97,7 +105,8 @@ public:
         pubsub.set_message_sink(std::move(fn));
     }
 
-    std::string execute(int client_fd, const std::vector<std::string>& args);
+    // resp3: protocolul negociat de conexiune prin HELLO (tinut de server)
+    std::string execute(int client_fd, const std::vector<std::string>& args, bool resp3 = false);
 
     // sincronizare AOF granulata (politica everysec); apelata de watchdog
     void sync_aof_if_due() { aof.sync_if_due(); }
