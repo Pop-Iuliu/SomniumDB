@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <functional>
+#include <vector>
 
 class PubSubManager {
 private:
@@ -31,6 +32,9 @@ public:
     std::string subscribe(int client_fd, const std::string& channel);
 
     std::string publish(const std::string& channel, const std::string& message);
+
+    // fara canale = dezabonare de la toate; un raspuns per canal, ca la Redis
+    std::string unsubscribe(int client_fd, std::vector<std::string> channels);
 
     void remove_client(int client_fd);
 

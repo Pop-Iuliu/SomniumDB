@@ -4,6 +4,7 @@
 // (apelantul sterge octetii consumati o singura data pe batch), fara copii
 // temporare, si nu aloca pana nu stie ca octetii exista in buffer.
 
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <string>
@@ -54,6 +55,34 @@ inline Status parse(const std::string& buf, const size_t pos, size_t* end, std::
     }
 
     *end = p;
+    return Status::Complete;
+}
+
+constexpr size_t kMaxInline = 64 * 1024; // ca PROTO_INLINE_MAX_SIZE din Redis
+
+// Cererile clientilor: array RESP sau comanda inline (telnet, redis-benchmark
+// PING_INLINE), o linie terminata cu LF sau CRLF, impartita pe spatii si
+// taburi. Fara ghilimele: clientii reali trimit array-uri. AOF-ul ramane strict.
+inline Status parse_request(const std::string& buf, const size_t pos, size_t* end, std::vector<std::string>* args) {
+    if (pos >= buf.size() || buf[pos] == '*') return parse(buf, pos, end, args);
+
+    const std::string_view window = std::string_view(buf).substr(pos, kMaxInline);
+    const size_t nl = window.find('\n');
+    if (nl == std::string_view::npos) {
+        return window.size() < kMaxInline ? Status::NeedMore : Status::Malformed;
+    }
+
+    std::string_view line = window.substr(0, nl);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+
+    args->clear();
+    for (size_t i = line.find_first_not_of(" \t"); i != std::string_view::npos;
+         i = line.find_first_not_of(" \t", i)) {
+        const size_t stop = std::min(line.find_first_of(" \t", i), line.size());
+        args->emplace_back(line.substr(i, stop - i));
+        i = stop;
+    }
+    *end = pos + nl + 1; // o linie goala e o comanda goala: ignorata
     return Status::Complete;
 }
 

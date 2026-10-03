@@ -14,7 +14,8 @@ jobs:
       - name: Instaleaza dependente
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev cmake build-essential
+          # redis-tools: redis-cli si redis-benchmark pentru testul de compatibilitate (S7)
+          sudo apt-get install -y liburing-dev cmake build-essential redis-tools
           cmake --version
           g++ --version
 

@@ -48,6 +48,34 @@ std::string PubSubManager::publish(const std::string& channel, const std::string
     return ":" + std::to_string(targets.size()) + "\r\n";
 }
 
+std::string PubSubManager::unsubscribe(const int client_fd, std::vector<std::string> channels) {
+    std::lock_guard lock(ps_mutex);
+
+    const auto mine = client_subscriptions.find(client_fd);
+    if (channels.empty() && mine != client_subscriptions.end()) {
+        channels.assign(mine->second.begin(), mine->second.end());
+    }
+    if (channels.empty()) return "*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n";
+
+    std::string replies;
+    for (const std::string& channel : channels) {
+        if (const auto it = channel_subscribers.find(channel); it != channel_subscribers.end()) {
+            it->second.erase(client_fd);
+            if (it->second.empty()) channel_subscribers.erase(it);
+        }
+        size_t remaining = 0;
+        if (mine != client_subscriptions.end()) {
+            mine->second.erase(channel);
+            remaining = mine->second.size();
+        }
+        replies += "*3\r\n$11\r\nunsubscribe\r\n$" + std::to_string(channel.size()) + "\r\n" + channel + "\r\n:" +
+                   std::to_string(remaining) + "\r\n";
+    }
+    // fara abonamente clientul iese din modul subscribe
+    if (mine != client_subscriptions.end() && mine->second.empty()) client_subscriptions.erase(mine);
+    return replies;
+}
+
 void PubSubManager::remove_client(const int client_fd) {
     std::lock_guard lock(ps_mutex);
 

@@ -93,9 +93,22 @@ void Database::replay_record(const AofRecord& rec) {
     std::lock_guard room_lock(room->room_mutex);
     activate(*room, true);
 
-    // starea rezultata, aplicata verbatim. Live, CRDTMERGE ajunge in AOF doar
-    // cand a convers, deci nu se re-evalueaza nici el (live, o cheie expirata
-    // conteaza ca absenta; o comparatie la replay ar putea da alt rezultat)
+    // starea rezultata, aplicata verbatim: valoare, termen absolut si versiune
+    const auto put = [&](const std::string& key, const std::string& value, const uint64_t ts, const uint64_t node) {
+        Record*& r = room->keys[key];
+        if (!r) {
+            r = record_pool.construct();
+            global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
+        }
+        r->value = value;
+        r->expire_at = rec.expire_at;
+        r->timestamp_ms = ts;
+        r->node_id = static_cast<uint32_t>(node);
+    };
+
+    // live, CRDTMERGE ajunge in AOF doar cand a convers, deci nu se re-evalueaza
+    // nici el (live, o cheie expirata conteaza ca absenta; o comparatie la
+    // replay ar putea da alt rezultat)
     const bool is_merge = command == "CRDTMERGE" && rec.args.size() >= 5;
     if (is_merge || (command == "SET" && rec.args.size() >= 3)) {
         uint64_t ts = rec.timestamp_ms;
@@ -105,15 +118,23 @@ void Database::replay_record(const AofRecord& rec) {
                          node > UINT32_MAX)) {
             return;
         }
-        Record*& r = room->keys[rec.args[1]];
-        if (!r) {
-            r = record_pool.construct();
-            global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
+        put(rec.args[1], rec.args[2], ts, node);
+        return;
+    }
+
+    // MSET: o singura inregistrare pentru toate perechile (atomica la crash)
+    if (command == "MSET") {
+        for (size_t i = 1; i + 1 < rec.args.size(); i += 2) {
+            put(rec.args[i], rec.args[i + 1], rec.timestamp_ms, rec.node_id);
         }
-        r->value = rec.args[2];
-        r->expire_at = rec.expire_at;
-        r->timestamp_ms = ts;
-        r->node_id = static_cast<uint32_t>(node);
+        return;
+    }
+
+    // termenul absolut din meta, nu TTL-ul relativ din argumente: fara viata in plus
+    if ((command == "EXPIRE" || command == "PEXPIRE" || command == "PERSIST") && rec.args.size() >= 2) {
+        if (const auto it = room->keys.find(rec.args[1]); it != room->keys.end()) {
+            it->second->expire_at = rec.expire_at;
+        }
         return;
     }
 
@@ -215,8 +236,23 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
     std::ranges::transform(command, command.begin(), ::toupper);
 
     if (command == "SUBSCRIBE") {
-        if (args.size() >= 2) return pubsub.subscribe(client_fd, args[1]);
-        return "-ERR Wrong number of arguments for SUBSCRIBE\r\n";
+        if (args.size() < 2) return "-ERR Wrong number of arguments for SUBSCRIBE\r\n";
+        std::string replies;
+        for (size_t i = 1; i < args.size(); ++i) replies += pubsub.subscribe(client_fd, args[i]);
+        return replies;
+    }
+
+    if (command == "UNSUBSCRIBE") {
+        return pubsub.unsubscribe(client_fd, {args.begin() + 1, args.end()});
+    }
+
+    if (command == "PING") {
+        if (args.size() > 2) return "-ERR Wrong number of arguments for PING\r\n";
+        // in modul subscribe, ca Redis: raspuns sub forma de mesaj ["pong", payload]
+        if (pubsub.is_subscribed(client_fd)) {
+            return "*2\r\n$4\r\npong\r\n" + bulk_string(args.size() == 2 ? args[1] : "");
+        }
+        return args.size() == 2 ? bulk_string(args[1]) : "+PONG\r\n";
     }
 
     if (command == "PUBLISH") {
@@ -232,6 +268,10 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
 
     if (command == "COMMAND" || command == "HELLO") {
         return "*0\r\n";
+    }
+
+    if (command == "ECHO") {
+        return args.size() == 2 ? bulk_string(args[1]) : "-ERR Wrong number of arguments for ECHO\r\n";
     }
 
     // ROOM selecteaza (si trezeste); comenzile de administrare au prefixul
@@ -312,6 +352,12 @@ std::string Database::execute_in_room(const std::string& room_name, const std::v
     if (command == "SET") return handle_set(room_name, *room, args);
     if (command == "DEL") return handle_del(room_name, *room, args);
     if (command == "CRDTMERGE") return handle_crdtmerge(room_name, *room, args);
+    if (command == "MGET") return handle_mget(room_name, *room, args);
+    if (command == "MSET") return handle_mset(room_name, *room, args);
+    if (command == "EXISTS") return handle_exists(room_name, *room, args);
+    if (command == "EXPIRE") return handle_expire(room_name, *room, args, 1000);
+    if (command == "PEXPIRE") return handle_expire(room_name, *room, args, 1);
+    if (command == "PERSIST") return handle_expire(room_name, *room, args, 0);
     if (command == "TTL") return handle_ttl(room_name, *room, args, false);
     if (command == "PTTL") return handle_ttl(room_name, *room, args, true);
     if (command == "INFO") return handle_info();
@@ -342,6 +388,13 @@ Record* Database::lookup(const std::string& room_name, Room& room, const std::st
     if (!cold || cold->expired(now)) return nullptr;
 
     Record* r = record_pool.construct(std::move(*cold));
+    room.keys.emplace(key, r);
+    global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
+    return r;
+}
+
+Record* Database::insert(Room& room, const std::string& key) {
+    Record* r = record_pool.construct();
     room.keys.emplace(key, r);
     global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
     return r;
@@ -396,12 +449,7 @@ std::string Database::handle_set(const std::string& room_name, Room& room, const
     // o conditie esuata nu produce nicio mutatie, deci nimic in AOF
     Record* r = lookup(room_name, room, key);
     if ((nx && r) || (xx && !r)) return "$-1\r\n";
-
-    if (!r) {
-        r = record_pool.construct();
-        room.keys.emplace(key, r);
-        global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
-    }
+    if (!r) r = insert(room, key);
     r->value = args[2];
     r->expire_at = expire_at; // un SET simplu sterge si TTL-ul vechi
     r->timestamp_ms = now_ms;
@@ -414,6 +462,87 @@ std::string Database::handle_set(const std::string& room_name, Room& room, const
     eviction.evict_despised_keys(room, record_pool);
 
     return "+OK\r\n";
+}
+
+// MSET key value [key value ...]: atomic, o singura inregistrare in AOF
+std::string Database::handle_mset(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
+    if (args.size() < 3 || args.size() % 2 == 0) {
+        return "-ERR Wrong number of arguments for MSET\r\n";
+    }
+
+    const long long now_ms = get_current_time_ms();
+    for (size_t i = 1; i < args.size(); i += 2) {
+        Record* r = lookup(room_name, room, args[i]);
+        if (!r) r = insert(room, args[i]);
+        r->value = args[i + 1];
+        r->expire_at = 0; // ca la SET simplu: TTL-ul vechi dispare
+        r->timestamp_ms = now_ms;
+        r->node_id = LOCAL_NODE_ID;
+        eviction.record_access(args[i]);
+    }
+    global_metrics.total_sets.fetch_add(args.size() / 2, std::memory_order_relaxed);
+
+    aof.append(room_name, args, 0, now_ms, LOCAL_NODE_ID);
+    eviction.evict_despised_keys(room, record_pool);
+    return "+OK\r\n";
+}
+
+std::string Database::handle_mget(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        return "-ERR Wrong number of arguments for MGET\r\n";
+    }
+
+    std::string out = "*" + std::to_string(args.size() - 1) + "\r\n";
+    for (size_t i = 1; i < args.size(); ++i) {
+        const Record* r = lookup(room_name, room, args[i]);
+        if (!r) {
+            out += "$-1\r\n";
+            continue;
+        }
+        eviction.record_access(args[i]);
+        out += bulk_string(r->value);
+    }
+    global_metrics.total_gets.fetch_add(args.size() - 1, std::memory_order_relaxed);
+    return out;
+}
+
+// EXISTS key [key ...]: cheile repetate se numara de fiecare data, ca la Redis
+std::string Database::handle_exists(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        return "-ERR Wrong number of arguments for EXISTS\r\n";
+    }
+
+    size_t found = 0;
+    for (size_t i = 1; i < args.size(); ++i) found += lookup(room_name, room, args[i]) != nullptr;
+    return ":" + std::to_string(found) + "\r\n";
+}
+
+// EXPIRE key seconds (scale 1000), PEXPIRE key ms (scale 1), PERSIST key (scale 0).
+// In AOF ajunge termenul absolut, deci replay-ul nu reporneste TTL-ul.
+std::string Database::handle_expire(const std::string& room_name, Room& room, const std::vector<std::string>& args,
+                                    const long long scale) {
+    if (args.size() != (scale ? 3u : 2u)) {
+        return "-ERR Wrong number of arguments for " + args[0] + "\r\n";
+    }
+
+    long long expire_at = 0;
+    if (scale) {
+        const long long now_ms = get_current_time_ms();
+        long long n = 0;
+        if (!fsutil::parse_i64(args[2], &n) || n > (LLONG_MAX - now_ms) / scale) {
+            return "-ERR invalid expire time\r\n";
+        }
+        // ca Redis: un termen care a trecut deja sterge cheia
+        if (n <= 0) return handle_del(room_name, room, {"DEL", args[1]});
+        expire_at = now_ms + n * scale;
+    }
+
+    Record* r = lookup(room_name, room, args[1]);
+    if (!r || (!scale && r->expire_at == 0)) return ":0\r\n";
+
+    r->expire_at = expire_at;
+    aof.append(room_name, args, expire_at, r->timestamp_ms, r->node_id);
+    return ":1\r\n";
 }
 
 // TTL/PTTL: -2 cheie absenta, -1 cheie persistenta
@@ -464,14 +593,11 @@ std::string Database::handle_crdtmerge(const std::string& room_name, Room& room,
 
     const std::string& key = args[1];
     Record* r = lookup(room_name, room, key);
-    if (!r) {
-        r = record_pool.construct();
-        room.keys.emplace(key, r);
-        global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
-    } else if (std::tie(incoming_ts, incoming_node) <= std::tie(r->timestamp_ms, r->node_id)) {
-        // Monotonic Join Semi-Lattice: actualizam doar daca starea e strict mai noua
+    // Monotonic Join Semi-Lattice: actualizam doar daca starea e strict mai noua
+    if (r && std::tie(incoming_ts, incoming_node) <= std::tie(r->timestamp_ms, r->node_id)) {
         return "+OK (Ignored Stale Write)\r\n";
     }
+    if (!r) r = insert(room, key);
 
     r->value = args[2];
     r->timestamp_ms = incoming_ts;

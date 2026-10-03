@@ -143,7 +143,7 @@ P0 means correctness foundations to land first. P1 means the next deliverables b
 
 **Goal:** Remove the remaining hard ceilings: inputs that can kill the server, clients that cannot connect, a log that grows forever, memory that no budget actually bounds, and a CRDT that never leaves its node.
 
-**Status:** In progress. S6 implemented, awaiting CI verification; S7 to S10 planned. Five tickets, each inspired by one supplied word.
+**Status:** In progress. S6 done; S7 implemented, awaiting CI verification; S8 to S10 planned. Five tickets, each inspired by one supplied word.
 
 **Planning target:** One two-week sprint for S6 to S9; S10 may spill into the next one. Completion means meeting the acceptance checks below.
 
@@ -159,7 +159,7 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 
 ## S6 - Hyaenanche: Poison for Scavengers
 
-**Status: IMPLEMENTED, awaiting CI verification.** The AOF already had a correct offset-based RESP parser, so it moved to `src/core/resp.h` and now serves both the network and AOF recovery: integers via `std::from_chars` (no temporary strings), header scan bounded to 32 bytes, CRLF checked after every bulk, limits of 1M arguments and 512 MB per bulk. The event loop parses from an offset and erases consumed input once per batch, so a deep pipeline is linear instead of quadratic. Malformed input gets `-ERR Protocol error` and closes only that connection; replies to the commands before it are still sent. `publish()` copies the subscriber list under the lock and delivers after releasing it, so disconnecting a subscriber during delivery can no longer self-deadlock. Tests: `tests/resp_test.cpp` (every prefix of a command waits for more bytes, malformed cases, pipelined offsets; run by `run_all.sh`), `tests/s6_test.py` (protocol errors, byte-by-byte delivery, a subscriber pushed past the 32 MB cap). The CI benchmark job now also records a 100-byte SET at `-P 64` for both servers; the before/after gap is not measured yet.
+**Status: DONE.** Verified by CI on PR #2 (AddressSanitizer suite, ThreadSanitizer and benchmark jobs green); the deep-pipeline numbers are in that run's `benchmark` artifact and are not yet copied into the README. The AOF already had a correct offset-based RESP parser, so it moved to `src/core/resp.h` and now serves both the network and AOF recovery: integers via `std::from_chars` (no temporary strings), header scan bounded to 32 bytes, CRLF checked after every bulk, limits of 1M arguments and 512 MB per bulk. The event loop parses from an offset and erases consumed input once per batch, so a deep pipeline is linear instead of quadratic. Malformed input gets `-ERR Protocol error` and closes only that connection; replies to the commands before it are still sent. `publish()` copies the subscriber list under the lock and delivers after releasing it, so disconnecting a subscriber during delivery can no longer self-deadlock. Tests: `tests/resp_test.cpp` (every prefix of a command waits for more bytes, malformed cases, pipelined offsets; run by `run_all.sh`), `tests/s6_test.py` (protocol errors, byte-by-byte delivery, a subscriber pushed past the 32 MB cap). The CI benchmark job now also records a 100-byte SET at `-P 64` for both servers; the before/after gap is not measured yet.
 
 **Inspiration:** A plant whose fruit was used to poison hyenas becomes a defense against the inputs and clients that can bring the server down.
 
@@ -179,6 +179,8 @@ P0 fixes failures that can take the server down. P1 removes ceilings on adoption
 **Primary files:** `main.cpp`, `pubsub.*`.
 
 ## S7 - Catholicized: Every Client Welcome
+
+**Status: IMPLEMENTED, awaiting CI verification.** `resp::parse_request` accepts inline commands (LF or CRLF, split on spaces and tabs, 64 KB line cap) and otherwise defers to the strict `resp::parse`, which AOF recovery keeps using. New commands: `PING`, `ECHO`, `EXISTS`, `MGET`, `MSET`, `EXPIRE`, `PEXPIRE`, `PERSIST`, `UNSUBSCRIBE`, and `QUIT` (handled in the event loop, since it closes the connection); `SUBSCRIBE` takes several channels, and `PING`/`UNSUBSCRIBE` work in subscribe mode. Every key access goes through `lookup()`, so the new reads see cold storage and treat expired keys as absent. `MSET` is one AOF record (atomic under a crash), and expiry commands log the absolute deadline in AOF meta so replay never restarts a TTL; a non-positive TTL reuses `DEL`, as in Redis. SET, CRDTMERGE and MSET now share one `insert()` for new records. Tests: `tests/s7_test.py`, including real `redis-cli` and `redis-benchmark -t ping,set,get,mset` runs (CI installs `redis-tools`), and inline cases in `tests/resp_test.cpp`.
 
 **Inspiration:** Made universal: any Redis client, tool or library should work unmodified.
 

@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <cstring>
+#include <strings.h>
 #include <cstdlib>
 #include <unistd.h>
 #include <fcntl.h>
@@ -207,22 +208,30 @@ static bool process_buffered(const shared_ptr<Client>& c) {
     size_t pos = 0;
     vector<string> args;
     resp::Status st = resp::Status::NeedMore;
+    bool quit = false;
 
     while (processed < MAX_COMMANDS_PER_TURN) {
         size_t end = 0;
-        st = resp::parse(c->in_buf, pos, &end, &args);
+        st = resp::parse_request(c->in_buf, pos, &end, &args);
         if (st != resp::Status::Complete) break;
         pos = end;
         ++processed;
+
+        // QUIT tine de conexiune, nu de baza de date: raspundem si inchidem
+        if (args.size() == 1 && strcasecmp(args[0].c_str(), "QUIT") == 0) {
+            quit = true;
+            break;
+        }
 
         const string response = db.execute(c->fd, args);
         if (!response.empty() && !enqueue_output(c, response)) return false; // deconectat (cap output)
     }
     c->in_buf.erase(0, pos);
 
-    if (st == resp::Status::Malformed) {
-        // ca Redis: eroare de protocol, apoi inchidem (inputul nu mai poate fi resincronizat)
-        if (enqueue_output(c, "-ERR Protocol error\r\n")) flush_output(*c);
+    // ca Redis: dupa QUIT sau o eroare de protocol (inputul nu mai poate fi
+    // resincronizat) trimitem ultimul raspuns si inchidem
+    if (quit || st == resp::Status::Malformed) {
+        if (enqueue_output(c, quit ? "+OK\r\n" : "-ERR Protocol error\r\n")) flush_output(*c);
         schedule_close(c);
         return false;
     }

@@ -33,7 +33,7 @@ def sec_protocol_errors(check):
             ("lungime uriasa", b"*1\r\n$99999999999\r\n"),
             ("numar negativ de argumente", b"*-1\r\n"),
             ("bulk fara CRLF", b"*1\r\n$3\r\nabcXY"),
-            ("comanda inline (pana la S7)", b"PING\r\n"),
+            ("prefix gresit in array", b"*1\r\n:3\r\n"),
         ):
             bad = srv.connect()
             bad.sendall(payload)

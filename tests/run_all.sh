@@ -23,6 +23,7 @@ run_suite() {
     python3 tests/s1_test.py
     python3 tests/s2_test.py
     python3 tests/s6_test.py
+    python3 tests/s7_test.py
     python3 tests/s3_test.py
     python3 tests/hib_test.py
 }

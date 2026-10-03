@@ -67,9 +67,16 @@ private:
     // cheia logica: RAM, apoi cold storage (reincarcata in RAM); cheile expirate
     // conteaza ca absente. nullptr = cheia nu exista.
     Record* lookup(const std::string& room_name, Room& room, const std::string& key);
+    // inregistrare noua, goala; apelantul o completeaza
+    Record* insert(Room& room, const std::string& key);
 
     std::string handle_get(const std::string& room_name, Room& room, const std::vector<std::string>& args);
     std::string handle_set(const std::string& room_name, Room& room, const std::vector<std::string>& args);
+    std::string handle_mset(const std::string& room_name, Room& room, const std::vector<std::string>& args);
+    std::string handle_mget(const std::string& room_name, Room& room, const std::vector<std::string>& args);
+    std::string handle_exists(const std::string& room_name, Room& room, const std::vector<std::string>& args);
+    std::string handle_expire(const std::string& room_name, Room& room, const std::vector<std::string>& args,
+                              long long scale);
     std::string handle_ttl(const std::string& room_name, Room& room, const std::vector<std::string>& args, bool millis);
     std::string handle_del(const std::string& room_name, Room& room, const std::vector<std::string>& args);
     std::string handle_crdtmerge(const std::string& room_name, Room& room, const std::vector<std::string>& args);

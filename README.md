@@ -54,6 +54,9 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 | --- | --- |
 | `GET key`, `DEL key` | Read or delete; both see keys in cold storage |
 | `SET key value [NX\|XX] [EX seconds\|PX milliseconds]` | Conditional and expiring writes, strictly validated; a failed condition replies nil and writes nothing |
+| `MGET key [key ...]`, `MSET key value [key value ...]` | Multi-key read and atomic multi-key write (one AOF record) |
+| `EXISTS key [key ...]` | Number of existing keys; repeated keys count each time |
+| `EXPIRE key seconds`, `PEXPIRE key ms`, `PERSIST key` | Set or remove a deadline; a non-positive TTL deletes the key |
 | `TTL key`, `PTTL key` | Remaining lifetime; `-1` persistent, `-2` missing |
 | `CRDTMERGE key value timestamp node` | Last-writer-wins merge on `(timestamp, node)` |
 | `ROOM name` | Select (and wake) a room |
@@ -61,8 +64,11 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 | `ROOM.INFO name` | State, last access, resident keys |
 | `ROOM.HIBERNATE name`, `ROOM.WAKE name` | Explicit room control |
 | `COMPACT` | Compact cold storage; replies with reclaimed bytes |
-| `SUBSCRIBE channel`, `PUBLISH channel message` | Pub/Sub |
+| `SUBSCRIBE channel [channel ...]`, `UNSUBSCRIBE [channel ...]`, `PUBLISH channel message` | Pub/Sub; `PING` and `UNSUBSCRIBE` also work while subscribed |
+| `PING [message]`, `ECHO message`, `QUIT` | Connection commands |
 | `INFO`, `SAVE` | Server status, persistence health |
+
+Commands can be sent as RESP arrays or inline (one line split on spaces, as from `telnet`), so `redis-cli` and `redis-benchmark` work unmodified.
 
 Environment: `REDIS_PORT`, `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
 

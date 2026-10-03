@@ -52,6 +52,21 @@ int main() {
         assert(parse_all(bad) == Status::Malformed);
     }
 
+    // cererile inline: LF sau CRLF, spatii si taburi multiple, linia goala ignorata
+    const std::string inline_cmds = "SET  a\tb\r\n\r\nGET a\n*1\r\n$4\r\nPING\r\n";
+    std::vector<std::vector<std::string>> seen;
+    pos = 0;
+    while (resp::parse_request(inline_cmds, pos, &end, &args) == Status::Complete) {
+        seen.push_back(args);
+        pos = end;
+    }
+    assert(pos == inline_cmds.size());
+    assert((seen == std::vector<std::vector<std::string>>{{"SET", "a", "b"}, {}, {"GET", "a"}, {"PING"}}));
+    assert(resp::parse_request("GET a", 0, &end, &args) == Status::NeedMore);
+    assert(resp::parse_request(std::string(resp::kMaxInline, 'x'), 0, &end, &args) == Status::Malformed);
+    // AOF-ul ramane strict: aceeasi linie inline e respinsa de parse()
+    assert(parse_all("GET a\r\n") == Status::Malformed);
+
     puts("resp_test: OK");
     return 0;
 }
