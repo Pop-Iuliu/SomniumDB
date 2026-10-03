@@ -16,6 +16,7 @@
 #include "../storage/snapshot_manager.h"
 #include "../../record.h"
 #include "room.h"
+#include "hlc.h"
 
 class Database {
 private:
@@ -35,6 +36,8 @@ private:
         "-ERR ROOMS FULL: active room budget reached, ROOM.HIBERNATE one or wait\r\n";
     static constexpr long long ROOM_IDLE_MS = 10000;
     uint32_t local_node_id = 1; // SOMNIUM_NODE_ID: versiunea CRDT a scrierilor locale
+    hlc::Clock clock_;          // versiunile scrierilor locale (thread-ul de comenzi)
+    long long max_clock_offset_ms = 600000; // SOMNIUM_MAX_CLOCK_OFFSET_MS
 
     PubSubManager pubsub;
     PoolAllocator<Record, 1024> record_pool;

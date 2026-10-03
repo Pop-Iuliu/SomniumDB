@@ -1,5 +1,6 @@
 #include "snapshot_manager.h"
 #include "fs_util.h"
+#include "../core/hlc.h"
 #include <cstdio>
 #include <cerrno>
 #include <cstring>
@@ -127,7 +128,7 @@ bool SnapshotManager::wakeup_room(Room& room, PoolAllocator<Record, 1024>& pool)
         }
 
         Record* rec = pool.construct(std::move(val), expire_at);
-        rec->timestamp_ms = timestamp_ms;
+        rec->timestamp_ms = hlc::normalize(timestamp_ms); // snapshot-urile vechi tin ms
         rec->node_id = node_id;
         // ultima aparitie a cheii in fisier castiga (fisierul e generat de noi,
         // dar validarea tot o impune)

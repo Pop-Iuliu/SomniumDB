@@ -8,6 +8,7 @@ echo "=== SomniumDB test suite: $BIN ==="
 
 # parserul RESP, fara server (construit langa binarul testat)
 "$(dirname "$BIN")/resp_test"
+"$(dirname "$BIN")/hlc_test"
 
 # farmece de serveri orfani din rulari anterioare (local; in CI nu exista)
 pkill -x Redis 2>/dev/null || true
@@ -27,6 +28,8 @@ run_suite() {
     python3 tests/s8_test.py
     python3 tests/s9_test.py
     python3 tests/s10_test.py
+    python3 tests/s11_test.py
+    python3 tests/s12_test.py
     python3 tests/s3_test.py
     python3 tests/hib_test.py
 }

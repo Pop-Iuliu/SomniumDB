@@ -11,8 +11,59 @@
 #include <chrono>
 #include <iostream>
 #include <cstdio>
+#include <cmath>
+#include <limits>
+#include <map>
+#include <mutex>
 
 DbMetrics global_metrics;
+
+namespace {
+    struct PeerState {
+        double mean_ms = 0;
+        double stddev_ms = 0;
+        long long last_beat_ms = 0; // 0 = niciun heartbeat inca
+        uint64_t lag_bytes = 0;
+    };
+    std::mutex peers_mutex;
+    std::map<std::string, PeerState> peers;
+
+    long long steady_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // phi = -log10(P(un heartbeat soseste mai tarziu decat acum)), cu intervalele
+    // aproximate normal; fara niciun heartbeat, suspiciunea e infinita
+    double phi(const PeerState& p) {
+        if (p.last_beat_ms == 0) return std::numeric_limits<double>::infinity();
+        const double sd = std::max(p.stddev_ms, 100.0); // ca Akka: deviatie minima
+        const double later = 0.5 * std::erfc((steady_ms() - p.last_beat_ms - p.mean_ms) / (sd * std::sqrt(2.0)));
+        return later < 1e-300 ? 300.0 : -std::log10(later);
+    }
+} // namespace
+
+void publish_peer(const std::string& peer, const double mean_ms, const double stddev_ms, const long long last_beat_ms,
+                  const uint64_t lag_bytes) {
+    std::lock_guard lock(peers_mutex);
+    peers[peer] = {mean_ms, stddev_ms, last_beat_ms, lag_bytes};
+}
+
+std::string peers_report(const bool prometheus) {
+    std::lock_guard lock(peers_mutex);
+    std::string out;
+    for (const auto& [name, p] : peers) {
+        const double f = phi(p);
+        const std::string value = std::isinf(f) ? (prometheus ? "+Inf" : "inf") : std::to_string(f);
+        if (prometheus) {
+            out += "db_peer_phi{peer=\"" + name + "\"} " + value + "\n";
+            out += "db_peer_lag_bytes{peer=\"" + name + "\"} " + std::to_string(p.lag_bytes) + "\n";
+        } else {
+            out += "Peer " + name + ": phi=" + value + " lag=" + std::to_string(p.lag_bytes) + "\n";
+        }
+    }
+    return out;
+}
 
 static void prometheus_thread(int port) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -80,7 +131,11 @@ static void prometheus_thread(int port) {
             "db_aof_bytes " + std::to_string(global_metrics.aof_bytes.load()) + "\n"
             "# HELP db_aof_base_bytes AOF size after the last rewrite (or at startup)\n"
             "# TYPE db_aof_base_bytes gauge\n"
-            "db_aof_base_bytes " + std::to_string(global_metrics.aof_base_bytes.load()) + "\n";
+            "db_aof_base_bytes " + std::to_string(global_metrics.aof_base_bytes.load()) + "\n"
+            "# HELP db_peer_phi Phi accrual suspicion level per replication peer\n"
+            "# TYPE db_peer_phi gauge\n"
+            "# HELP db_peer_lag_bytes AOF bytes not yet acknowledged by the peer\n"
+            "# TYPE db_peer_lag_bytes gauge\n" + peers_report(true);
 
         std::string response =
             "HTTP/1.1 200 OK\r\n"
