@@ -16,7 +16,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | Step | Title | Phase | Status |
 | --- | --- | --- | --- |
 | SEC-1 | Listen on localhost by default | 1. Secure defaults | DONE |
-| SEC-2 | Password authentication (`AUTH`) | 1. Secure defaults | TODO |
+| SEC-2 | Password authentication (`AUTH`) | 1. Secure defaults | DONE |
 | SEC-3 | Private data files | 1. Secure defaults | TODO |
 | SEC-4 | Remove automatic real-time priority | 1. Secure defaults | TODO |
 | SEC-5 | Safe room names | 2. Limits | TODO |
@@ -117,6 +117,11 @@ An audit snapshot of `main` on 2026-10-04 (after PR #9). Each gap maps to a step
 - `SOMNIUM_BIND=0.0.0.0` without a password refuses to start.
 
 **Files:** `main.cpp`, `src/storage/replicator.*`, `README.md`, `tests/sec_test.py`.
+
+**Changes from the plan:**
+- The replicator authenticates right after connecting (one `AUTH`, one reply) instead of counting the reply inside the batch, so the batch acknowledgement logic stays untouched.
+- `HELLO ... AUTH` with no password configured keeps accepting any credentials, as Redis does for a `nopass` default user; only the plain `AUTH` command errors.
+- Found while testing the 16 KB limit: an incomplete command that filled the input buffer exactly to its cap was never read further nor closed (the same applied to the 128 MB cap). The connection is now closed when an incomplete command fills the buffer.
 
 ### SEC-3: Private data files
 

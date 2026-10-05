@@ -31,9 +31,11 @@ using namespace std;
 #define READ_CHUNK 16384
 #define MAX_COMMANDS_PER_TURN 8192
 #define MAX_INPUT_BUFFER (128ull * 1024 * 1024)
+#define MAX_UNAUTH_INPUT (16ull * 1024) // un strain nu are voie sa ne tina 128 MB
 #define MAX_CLIENT_OUTPUT (32ull * 1024 * 1024)
 
 static Database db;
+static string g_password; // SEC-2: SOMNIUM_PASSWORD; gol = fara autentificare
 static Watchdog watchdog(db);
 
 // S3 "naigie": calutul de munca care nu se opreste pentru niciun client.
@@ -50,9 +52,11 @@ struct Client {
     bool read_armed = false;
     bool write_armed = false;
     bool resp3 = false; // protocolul negociat prin HELLO
+    bool authenticated = g_password.empty();
 
     explicit Client(int f) : fd(f) {}
     size_t pending_out() const { return out_buf.size() - out_off; }
+    size_t input_cap() const { return authenticated ? MAX_INPUT_BUFFER : MAX_UNAUTH_INPUT; }
 };
 
 // un PollTicket zboara cu fiecare poll armat in ring; shared_ptr tine clientul
@@ -211,25 +215,66 @@ static void queue_work() {
     }
 }
 
+// SEC-2: un singur utilizator, "default". Parola se compara in timp constant:
+// bucla merge mereu pe toata lungimea asteptata, fara iesire timpurie.
+static bool credentials_ok(const string& user, const string& pass) {
+    unsigned char diff = pass.size() != g_password.size();
+    for (size_t i = 0; i < g_password.size(); ++i) {
+        diff |= static_cast<unsigned char>(g_password[i] ^ (i < pass.size() ? pass[i] : 0));
+    }
+    return diff == 0 && user == "default";
+}
+
+static string authenticate(Client& c, const string& user, const string& pass) {
+    if (!credentials_ok(user, pass)) {
+        printf("[AUTH] fd %d: parola gresita\n", c.fd);
+        return "-WRONGPASS invalid username-password pair\r\n";
+    }
+    c.authenticated = true;
+    return "+OK\r\n";
+}
+
+// AUTH [user] pass
+static string auth(Client& c, const vector<string>& args) {
+    if (args.size() != 2 && args.size() != 3) return "-ERR wrong number of arguments for 'auth' command\r\n";
+    if (g_password.empty()) {
+        return "-ERR AUTH <password> called without any password configured for the default user. "
+               "Are you sure your configuration is correct?\r\n";
+    }
+    return authenticate(c, args.size() == 3 ? args[1] : "default", args.back());
+}
+
 // HELLO [protover [AUTH user pass] [SETNAME name]]: protocolul tine de conexiune.
-// Serverul nu are autentificare, deci AUTH e acceptat ca pentru utilizatorul
-// default fara parola, iar SETNAME e ignorat. Raspunsul: harta pe RESP3, lista
-// plata pe RESP2. "version" e nivelul de protocol Redis pe care il imitam.
+// Fara parola configurata AUTH e acceptat ca pentru utilizatorul default fara
+// parola; SETNAME e ignorat. Raspunsul: harta pe RESP3, lista plata pe RESP2.
+// "version" e nivelul de protocol Redis pe care il imitam.
 static string hello(Client& c, const vector<string>& args) {
+    int proto = c.resp3 ? 3 : 2;
     if (args.size() >= 2) {
-        int proto = 0;
         const string& v = args[1];
         if (const auto [p, ec] = from_chars(v.data(), v.data() + v.size(), proto); ec != errc() || p != v.data() + v.size()) {
             return "-ERR Protocol version is not an integer or out of range\r\n";
         }
         if (proto != 2 && proto != 3) return "-NOPROTO unsupported protocol version\r\n";
         for (size_t i = 2; i < args.size();) {
-            if (strcasecmp(args[i].c_str(), "AUTH") == 0 && i + 2 < args.size()) i += 3;
-            else if (strcasecmp(args[i].c_str(), "SETNAME") == 0 && i + 1 < args.size()) i += 2;
-            else return "-ERR Syntax error in HELLO option '" + args[i] + "'\r\n";
+            if (strcasecmp(args[i].c_str(), "AUTH") == 0 && i + 2 < args.size()) {
+                if (!g_password.empty()) {
+                    if (string r = authenticate(c, args[i + 1], args[i + 2]); r[0] == '-') return r;
+                }
+                i += 3;
+            } else if (strcasecmp(args[i].c_str(), "SETNAME") == 0 && i + 1 < args.size()) {
+                i += 2;
+            } else {
+                return "-ERR Syntax error in HELLO option '" + args[i] + "'\r\n";
+            }
         }
-        c.resp3 = proto == 3;
     }
+    if (!c.authenticated) {
+        return "-NOAUTH HELLO must be called with the client already authenticated, otherwise the "
+               "HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and "
+               "select the RESP protocol version at the same time\r\n";
+    }
+    c.resp3 = proto == 3;
 
     const auto bulk = [](const string& s) { return "$" + to_string(s.size()) + "\r\n" + s + "\r\n"; };
     return (c.resp3 ? "%7\r\n" : "*14\r\n") + bulk("server") + bulk("somnium") + bulk("version") + bulk("7.0.0") +
@@ -260,9 +305,13 @@ static bool process_buffered(const shared_ptr<Client>& c) {
             break;
         }
 
-        // HELLO alege protocolul conexiunii; celelalte comenzi raspund in protocolul ales
-        const bool is_hello = !args.empty() && strcasecmp(args[0].c_str(), "HELLO") == 0;
-        const string response = is_hello ? hello(*c, args) : db.execute(c->fd, args, c->resp3);
+        // AUTH si HELLO tin de conexiune; HELLO alege protocolul in care raspund
+        // celelalte comenzi. Pana la autentificare, doar ele (si QUIT) trec.
+        const char* name = args.empty() ? "" : args[0].c_str();
+        const string response = strcasecmp(name, "AUTH") == 0    ? auth(*c, args)
+                              : strcasecmp(name, "HELLO") == 0   ? hello(*c, args)
+                              : !c->authenticated                ? "-NOAUTH Authentication required.\r\n"
+                                                                 : db.execute(c->fd, args, c->resp3);
         if (!response.empty() && !enqueue_output(c, response)) return false; // deconectat (cap output)
     }
     c->in_buf.erase(0, pos);
@@ -289,7 +338,7 @@ static bool process_buffered(const shared_ptr<Client>& c) {
 // citeste tot ce e disponibil; false = conexiunea s-a terminat
 static bool drain_read(const shared_ptr<Client>& c) {
     char temp[READ_CHUNK];
-    while (c->in_buf.size() < MAX_INPUT_BUFFER) {
+    while (c->in_buf.size() < c->input_cap()) {
         const ssize_t n = read(c->fd, temp, sizeof(temp));
         if (n > 0) {
             c->in_buf.append(temp, static_cast<size_t>(n));
@@ -357,8 +406,11 @@ int main() {
         cerr << "SOMNIUM_BIND invalid: " << bind_ip << " (astept o adresa IPv4)\n";
         return 1;
     }
-    if (ntohl(bind_addr.s_addr) >> 24 != 127) {
-        cerr << "ATENTIE: serverul asculta pe " << bind_ip << ", accesibil din retea fara autentificare\n";
+    if (const char* pw = getenv("SOMNIUM_PASSWORD")) g_password = pw;
+    if (ntohl(bind_addr.s_addr) >> 24 != 127 && g_password.empty()) {
+        cerr << "Refuz sa pornesc: SOMNIUM_BIND=" << bind_ip
+             << " expune serverul in retea, dar SOMNIUM_PASSWORD nu e setat\n";
+        return 1;
     }
 
     if (getenv("SOMNIUM_NO_METRICS") == nullptr) {
@@ -495,12 +547,10 @@ int main() {
                     schedule_close(c);
                     continue;
                 }
-                if (c->in_buf.size() > MAX_INPUT_BUFFER) {
-                    schedule_close(c);
-                    continue;
-                }
                 if (process_buffered(c)) {
                     queue_work(); // mai sunt comenzi buff-uite fara event nou
+                } else if (c->in_buf.size() >= c->input_cap()) {
+                    schedule_close(c); // o comanda incompleta a umplut bufferul
                 }
             }
         }

@@ -83,6 +83,8 @@ Replicator::Replicator(const std::atomic<uint64_t>& frontier) : frontier_(fronti
         if (fsutil::parse_u64(env, &id) && id >= 1 && id <= UINT32_MAX) node_id_ = static_cast<uint32_t>(id);
     }
 
+    if (const char* pw = getenv("SOMNIUM_PASSWORD")) password_ = pw;
+
     const char* env = getenv("SOMNIUM_PEERS");
     const std::string list = env ? env : "";
     for (size_t start = 0; start < list.size();) {
@@ -186,6 +188,10 @@ bool Replicator::ship(Peer& peer) {
     if (peer.fd < 0) {
         peer.fd = connect_to(peer.host, peer.port);
         peer.room.clear(); // conexiune noua: camera selectata e iar "default"
+        if (peer.fd >= 0 && !authenticate(peer)) {
+            ::close(peer.fd);
+            peer.fd = -1;
+        }
         if (peer.fd < 0) {
             ::close(aof);
             return false;
@@ -277,6 +283,15 @@ bool Replicator::ship(Peer& peer) {
     if (peer.offset != before) save(peer);
     peer.lag = size - peer.offset;
     return alive;
+}
+
+// prima comanda pe o conexiune noua, cand nodurile au parola
+bool Replicator::authenticate(Peer& peer) {
+    if (password_.empty()) return true;
+    size_t acked = 0;
+    if (deliver(peer, encode({"AUTH", password_}), 1, &acked) && acked == 1) return true;
+    fprintf(stderr, "Replicare: %s:%s a refuzat autentificarea\n", peer.host.c_str(), peer.port.c_str());
+    return false;
 }
 
 bool Replicator::deliver(Peer& peer, const std::string& out, const size_t expected, size_t* acked) {
