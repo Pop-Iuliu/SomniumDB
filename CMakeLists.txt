@@ -7,6 +7,15 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# SEC-11: hardening explicit, oriunde e construit binarul (nu doar unde
+# compilatorul il activeaza implicit)
+add_compile_options(-fstack-protector-strong)
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    add_compile_options(-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2)
+endif()
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+add_link_options(-pie -Wl,-z,relro,-z,now)
+
 add_executable(Redis main.cpp
         src/core/database.h
         src/core/database.cpp

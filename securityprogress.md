@@ -25,7 +25,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-8 | Harden the metrics endpoint | 2. Limits | DONE |
 | SEC-9 | UndefinedBehaviorSanitizer in CI | 3. Find bugs first | DONE |
 | SEC-10 | Fuzz the RESP parser | 3. Find bugs first | DONE |
-| SEC-11 | Explicit build hardening | 3. Find bugs first | TODO |
+| SEC-11 | Explicit build hardening | 3. Find bugs first | DONE |
 | SEC-12 | Least-privilege CI token | 3. Find bugs first | TODO |
 | SEC-13 | Remove the unused vendored `json.hpp` | 3. Find bugs first | TODO |
 | SEC-14 | `SECURITY.md` and a deployment checklist | 4. Process and transport | TODO |
@@ -250,6 +250,8 @@ An audit snapshot of `main` on 2026-10-04 (after PR #9). Each gap maps to a step
 **Done when:** for the Release binary, `readelf -h` shows `Type: DYN` and `readelf -d` shows `BIND_NOW`. Add this check as one CI step.
 
 **Files:** `CMakeLists.txt`, `.github/workflows/ci.yml`.
+
+**Result:** with Ubuntu's GCC the binary was already PIE, full RELRO, stack-protected and fortified, so nothing changes there. With clang, `main` built without `BIND_NOW` and without a stack protector; both are now present. Clang's build still shows no fortified calls, so `_FORTIFY_SOURCE` mainly helps GCC builds.
 
 ### SEC-12: Least-privilege CI token
 
