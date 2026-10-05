@@ -61,7 +61,7 @@ An embedded HTTP metrics server runs on port `9090` (`/metrics`). It exports rea
 | `CRDTMERGE key value timestamp node [expire_at]` | Last-writer-wins merge on `(timestamp, node)`; timestamps are Hybrid Logical Clock values (48-bit ms, 16-bit counter), plain milliseconds are accepted and converted; the optional absolute deadline (ms) travels with the state |
 | `CRDTDEL key timestamp node` | Versioned delete (replication); loses against a newer write |
 | `REPLFRONTIER node frontier` | Replication heartbeat: every write of `node` up to `frontier` has been delivered |
-| `ROOM name` | Select (and wake) a room |
+| `ROOM name` | Select (and wake) a room; names are 1 to 200 bytes without `/` or NUL, since they become file names |
 | `ROOMS` | List known rooms |
 | `ROOM.INFO name` | State, last access, resident keys and estimated bytes |
 | `ROOM.HIBERNATE name`, `ROOM.WAKE name` | Explicit room control |

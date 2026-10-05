@@ -19,7 +19,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-2 | Password authentication (`AUTH`) | 1. Secure defaults | DONE |
 | SEC-3 | Private data files | 1. Secure defaults | DONE |
 | SEC-4 | Remove automatic real-time priority | 1. Secure defaults | DONE |
-| SEC-5 | Safe room names | 2. Limits | TODO |
+| SEC-5 | Safe room names | 2. Limits | DONE |
 | SEC-6 | Maximum number of clients | 2. Limits | TODO |
 | SEC-7 | Maximum number of rooms | 2. Limits | TODO |
 | SEC-8 | Harden the metrics endpoint | 2. Limits | TODO |
@@ -160,7 +160,9 @@ An audit snapshot of `main` on 2026-10-04 (after PR #9). Each gap maps to a step
 
 **Done when:** `ROOM ""`, `ROOM a/b`, a name containing `\0` and a 201-byte name are refused; `ROOM LIST`, `ROOM SET` and a 200-byte name still work and can hibernate and wake.
 
-**Files:** `src/core/database.cpp`, `tests/sec_test.py`.
+**Files:** `src/core/database.*`, `tests/sec_test.py`.
+
+**Changes from the plan:** `wake_room()` now returns the error reply (`nullptr` when the room is active) instead of a `bool`, so both callers pass on the exact error. SEC-7 adds its `too many rooms` error the same way.
 
 ### SEC-6: Maximum number of clients
 

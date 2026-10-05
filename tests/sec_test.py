@@ -148,6 +148,30 @@ def sec3_file_modes(check):
         srv.cleanup()
 
 
+def sec5_room_names(check):
+    srv = Server(env_extra=ENV)
+    try:
+        srv.start()
+        c = Client(srv)
+        for name in ("", "a/b", "a\0b", "r" * 201):
+            check(f"SEC-5: ROOM {name[:12]!r} refuzat", c.cmd("ROOM", name) == ("err", "ERR invalid room name"))
+            check(f"SEC-5: ROOM.WAKE {name[:12]!r} refuzat", c.cmd("ROOM.WAKE", name)[0] == "err")
+        rooms = [name for _, name in c.cmd("ROOMS")[1]]
+        check("SEC-5: niciun nume invalid in registru", all(len(n) in range(1, 201) and b"/" not in n for n in rooms), rooms)
+
+        for name in ("LIST", "SET", "r" * 200):
+            check(f"SEC-5: ROOM {name[:12]!r} merge", c.cmd("ROOM", name) == ("ok", "OK") and c.cmd("SET", "k", name)[0] == "ok")
+            c.cmd("ROOM", "default")
+            check(f"SEC-5: ROOM.HIBERNATE {name[:12]!r}", c.cmd("ROOM.HIBERNATE", name) == ("ok", "OK"))  # bugetul de 3
+        long = "r" * 200
+        check("SEC-5: ...si se trezeste", c.cmd("ROOM.WAKE", long) == ("ok", "OK"))
+        c.cmd("ROOM", long)
+        check("SEC-5: ...cu datele intacte", c.cmd("GET", "k") == ("bulk", long.encode()))
+        c.close()
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
     run_with_retry(sec1_bind, fails)
@@ -155,6 +179,7 @@ def main():
     run_with_retry(sec2_no_password, fails)
     run_with_retry(sec2_replication, fails)
     run_with_retry(sec3_file_modes, fails)
+    run_with_retry(sec5_room_names, fails)
     report(fails, "sec")
 
 
