@@ -21,7 +21,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-4 | Remove automatic real-time priority | 1. Secure defaults | DONE |
 | SEC-5 | Safe room names | 2. Limits | DONE |
 | SEC-6 | Maximum number of clients | 2. Limits | DONE |
-| SEC-7 | Maximum number of rooms | 2. Limits | TODO |
+| SEC-7 | Maximum number of rooms | 2. Limits | DONE |
 | SEC-8 | Harden the metrics endpoint | 2. Limits | TODO |
 | SEC-9 | UndefinedBehaviorSanitizer in CI | 3. Find bugs first | TODO |
 | SEC-10 | Fuzz the RESP parser | 3. Find bugs first | TODO |
@@ -187,6 +187,8 @@ An audit snapshot of `main` on 2026-10-04 (after PR #9). Each gap maps to a step
 **Done when:** with `SOMNIUM_MAX_ROOMS=3`, a fourth new name is refused while the first three keep working.
 
 **Files:** `src/core/database.*`, `README.md`, `tests/sec_test.py`.
+
+**Note:** the pinned `default` room is created on first use without going through `wake_room()`, so it never counts against a full registry.
 
 ### SEC-8: Harden the metrics endpoint
 

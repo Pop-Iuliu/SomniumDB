@@ -42,6 +42,10 @@ Database::Database() {
     if (const char* env = getenv("SOMNIUM_MAX_CLOCK_OFFSET_MS"); env && !fsutil::parse_i64(env, &max_clock_offset_ms)) {
         fprintf(stderr, "SOMNIUM_MAX_CLOCK_OFFSET_MS invalid: '%s'\n", env);
     }
+    if (const char* env = getenv("SOMNIUM_MAX_ROOMS"); env && !fsutil::parse_u64(env, &max_rooms_)) {
+        fprintf(stderr, "SOMNIUM_MAX_ROOMS invalid: '%s' (folosesc %llu)\n", env,
+                static_cast<unsigned long long>(max_rooms_));
+    }
 
     // 1) redare istoric (snapshot-urile se incarca sub prima mutatie a fiecarei camere,
     //    apoi mutatiile AOF se aplica peste ele: un snapshot vechi nu poate
@@ -343,7 +347,12 @@ const char* Database::wake_room(const std::string& name) {
     if (name.empty() || name.size() > 200 || name.find_first_of(std::string_view("/\0", 2)) != std::string::npos) {
         return "-ERR invalid room name\r\n";
     }
-    const std::shared_ptr<Room> room = find_room(name, true);
+    std::shared_ptr<Room> room = find_room(name, false);
+    if (!room) {
+        // SEC-7: un nume nou ramane in registru pentru totdeauna (redarea AOF nu trece pe aici)
+        if (std::shared_lock lock(rooms_mutex); rooms.size() >= max_rooms_) return "-ERR too many rooms\r\n";
+        room = find_room(name, true);
+    }
     std::lock_guard lock(room->room_mutex);
     return activate(*room) ? nullptr : ROOMS_FULL;
 }

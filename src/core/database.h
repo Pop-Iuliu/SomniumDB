@@ -55,6 +55,7 @@ private:
     size_t peer_count_ = 0;                            // intrarile din SOMNIUM_PEERS
     std::atomic<uint64_t> frontier_{0};                // frontiera locala, citita de replicator
     long long max_clock_offset_ms = 600000; // SOMNIUM_MAX_CLOCK_OFFSET_MS
+    uint64_t max_rooms_ = 10000;            // SEC-7: SOMNIUM_MAX_ROOMS, marimea registrului
 
     PubSubManager pubsub;
     PoolAllocator<Record, 1024> record_pool;
