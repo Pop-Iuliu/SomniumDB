@@ -3,8 +3,10 @@
 import glob
 import os
 import shutil
+import socket
 import subprocess
 import time
+import urllib.request
 
 from common import Client, Server, report, resp_cmd, run_with_retry
 
@@ -224,6 +226,24 @@ def sec7_max_rooms(check):
         srv.cleanup()
 
 
+def sec8_metrics(check):
+    srv = Server()  # cu exporterul de metrici pornit
+    try:
+        srv.start()
+        scrape = lambda: urllib.request.urlopen("http://127.0.0.1:9090/metrics", timeout=5).read()
+        check("SEC-8: exporterul asculta pe 127.0.0.1", "127.0.0.1:9090" in server_log(srv), server_log(srv))
+        check("SEC-8: scrape normal", wait_until(lambda: b"db_keys_in_ram" in scrape()))
+
+        idle = socket.create_connection(("127.0.0.1", 9090))  # nu trimite nimic
+        t0 = time.time()
+        body = scrape()
+        check("SEC-8: o conexiune inactiva nu blocheaza scrape-ul",
+              b"db_keys_in_ram" in body and time.time() - t0 < 2, f"{time.time() - t0:.2f}s")
+        idle.close()
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
     run_with_retry(sec1_bind, fails)
@@ -234,6 +254,7 @@ def main():
     run_with_retry(sec5_room_names, fails)
     run_with_retry(sec6_maxclients, fails)
     run_with_retry(sec7_max_rooms, fails)
+    run_with_retry(sec8_metrics, fails)
     report(fails, "sec")
 
 

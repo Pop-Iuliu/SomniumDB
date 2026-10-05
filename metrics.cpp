@@ -5,12 +5,15 @@
 #include "metrics.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <string>
 #include <thread>
 #include <chrono>
 #include <iostream>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -68,15 +71,18 @@ std::string peers_report(const bool prometheus) {
 static void prometheus_thread(int port) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    sockaddr_in address;
+    // SEC-8: ca listenerul principal, implicit doar localhost
+    const char* bind_env = getenv("SOMNIUM_METRICS_BIND");
+    const std::string bind_ip = bind_env ? bind_env : "127.0.0.1";
+    sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
 
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        std::cerr << "[Metrics] Eroare: Nu s-a putut face bind pe portul " << port << "!\n";
+    if (inet_pton(AF_INET, bind_ip.c_str(), &address.sin_addr) != 1 ||
+        bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        std::cerr << "[Metrics] Eroare: Nu s-a putut face bind pe " << bind_ip << ":" << port << "!\n";
         close(server_fd);
         return;
     }
@@ -86,7 +92,7 @@ static void prometheus_thread(int port) {
         return;
     }
 
-    std::cout << "[Metrics] Prometheus exporter asculta pe portul " << port << "...\n";
+    std::cout << "[Metrics] Prometheus exporter asculta pe " << bind_ip << ":" << port << "...\n";
 
     while (true) {
         int client_socket = accept(server_fd, nullptr, nullptr);
@@ -94,6 +100,11 @@ static void prometheus_thread(int port) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
+
+        // un scraper inactiv sau lent e abandonat, nu blocheaza exporterul
+        const timeval timeout{1, 0};
+        setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
         char buffer[1024] = {0};
         read(client_socket, buffer, 1024);
