@@ -28,6 +28,12 @@ jobs:
           set -o pipefail
           cmake --build build-release 2>&1 | tee build.log
 
+      # SEC-11: PIE + full RELRO
+      - name: Verifica hardeningul binarului Release
+        run: |
+          readelf -h build-release/Redis | grep -q 'Type:.*DYN'
+          readelf -d build-release/Redis | grep -q 'BIND_NOW'
+
       - name: Afiseaza erorile de build in summary
         if: failure()
         run: |
