@@ -172,6 +172,42 @@ def sec5_room_names(check):
         srv.cleanup()
 
 
+def sec6_maxclients(check):
+    srv = Server(env_extra={**ENV, "SOMNIUM_MAXCLIENTS": "2"})
+
+    def admitted():
+        """Un client care a primit loc; inchiderile anterioare se proceseaza asincron."""
+        deadline = time.time() + 5
+        while True:
+            c = Client(srv)
+            try:
+                if c.cmd("PING") == ("ok", "PONG"):
+                    return c
+            except (ConnectionError, OSError):
+                pass
+            c.close()
+            if time.time() > deadline:
+                return None
+            time.sleep(0.1)
+
+    try:
+        srv.start()
+        a, b = admitted(), admitted()
+        check("SEC-6: primii doi clienti merg", a and b)
+        third = srv.connect()
+        check("SEC-6: al treilea primeste eroarea si e inchis",
+              third.recv(1024) == b"-ERR max number of clients reached\r\n" and third.recv(1024) == b"")
+        third.close()
+
+        a.close()
+        c = admitted()
+        check("SEC-6: dupa o deconectare un client nou e acceptat", c is not None)
+        for x in (b, c):
+            x.close()
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
     run_with_retry(sec1_bind, fails)
@@ -180,6 +216,7 @@ def main():
     run_with_retry(sec2_replication, fails)
     run_with_retry(sec3_file_modes, fails)
     run_with_retry(sec5_room_names, fails)
+    run_with_retry(sec6_maxclients, fails)
     report(fails, "sec")
 
 

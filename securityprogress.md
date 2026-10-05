@@ -20,7 +20,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-3 | Private data files | 1. Secure defaults | DONE |
 | SEC-4 | Remove automatic real-time priority | 1. Secure defaults | DONE |
 | SEC-5 | Safe room names | 2. Limits | DONE |
-| SEC-6 | Maximum number of clients | 2. Limits | TODO |
+| SEC-6 | Maximum number of clients | 2. Limits | DONE |
 | SEC-7 | Maximum number of rooms | 2. Limits | TODO |
 | SEC-8 | Harden the metrics endpoint | 2. Limits | TODO |
 | SEC-9 | UndefinedBehaviorSanitizer in CI | 3. Find bugs first | TODO |
