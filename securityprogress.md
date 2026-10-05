@@ -28,7 +28,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-11 | Explicit build hardening | 3. Find bugs first | DONE |
 | SEC-12 | Least-privilege CI token | 3. Find bugs first | DONE |
 | SEC-13 | Remove the unused vendored `json.hpp` | 3. Find bugs first | DONE |
-| SEC-14 | `SECURITY.md` and a deployment checklist | 4. Process and transport | TODO |
+| SEC-14 | `SECURITY.md` and a deployment checklist | 4. Process and transport | DONE |
 | SEC-15 | Encrypted transport through a tunnel (docs) | 4. Process and transport | TODO |
 | SEC-16 | Native TLS | 4. Process and transport | DEFERRED (trigger below) |
 
