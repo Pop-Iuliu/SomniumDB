@@ -148,6 +148,66 @@ def sec3_file_modes(check):
         srv.cleanup()
 
 
+def sec5_room_names(check):
+    srv = Server(env_extra=ENV)
+    try:
+        srv.start()
+        c = Client(srv)
+        for name in ("", "a/b", "a\0b", "r" * 201):
+            check(f"SEC-5: ROOM {name[:12]!r} refuzat", c.cmd("ROOM", name) == ("err", "ERR invalid room name"))
+            check(f"SEC-5: ROOM.WAKE {name[:12]!r} refuzat", c.cmd("ROOM.WAKE", name)[0] == "err")
+        rooms = [name for _, name in c.cmd("ROOMS")[1]]
+        check("SEC-5: niciun nume invalid in registru", all(len(n) in range(1, 201) and b"/" not in n for n in rooms), rooms)
+
+        for name in ("LIST", "SET", "r" * 200):
+            check(f"SEC-5: ROOM {name[:12]!r} merge", c.cmd("ROOM", name) == ("ok", "OK") and c.cmd("SET", "k", name)[0] == "ok")
+            c.cmd("ROOM", "default")
+            check(f"SEC-5: ROOM.HIBERNATE {name[:12]!r}", c.cmd("ROOM.HIBERNATE", name) == ("ok", "OK"))  # bugetul de 3
+        long = "r" * 200
+        check("SEC-5: ...si se trezeste", c.cmd("ROOM.WAKE", long) == ("ok", "OK"))
+        c.cmd("ROOM", long)
+        check("SEC-5: ...cu datele intacte", c.cmd("GET", "k") == ("bulk", long.encode()))
+        c.close()
+    finally:
+        srv.cleanup()
+
+
+def sec6_maxclients(check):
+    srv = Server(env_extra={**ENV, "SOMNIUM_MAXCLIENTS": "2"})
+
+    def admitted():
+        """Un client care a primit loc; inchiderile anterioare se proceseaza asincron."""
+        deadline = time.time() + 5
+        while True:
+            c = Client(srv)
+            try:
+                if c.cmd("PING") == ("ok", "PONG"):
+                    return c
+            except (ConnectionError, OSError):
+                pass
+            c.close()
+            if time.time() > deadline:
+                return None
+            time.sleep(0.1)
+
+    try:
+        srv.start()
+        a, b = admitted(), admitted()
+        check("SEC-6: primii doi clienti merg", a and b)
+        third = srv.connect()
+        check("SEC-6: al treilea primeste eroarea si e inchis",
+              third.recv(1024) == b"-ERR max number of clients reached\r\n" and third.recv(1024) == b"")
+        third.close()
+
+        a.close()
+        c = admitted()
+        check("SEC-6: dupa o deconectare un client nou e acceptat", c is not None)
+        for x in (b, c):
+            x.close()
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
     run_with_retry(sec1_bind, fails)
@@ -155,6 +215,8 @@ def main():
     run_with_retry(sec2_no_password, fails)
     run_with_retry(sec2_replication, fails)
     run_with_retry(sec3_file_modes, fails)
+    run_with_retry(sec5_room_names, fails)
+    run_with_retry(sec6_maxclients, fails)
     report(fails, "sec")
 
 

@@ -338,10 +338,14 @@ bool Database::hibernate(Room& room) {
     return true;
 }
 
-bool Database::wake_room(const std::string& name) {
+const char* Database::wake_room(const std::string& name) {
+    // SEC-5: numele devine nume de fisier ("room_" + name + ".bin")
+    if (name.empty() || name.size() > 200 || name.find_first_of(std::string_view("/\0", 2)) != std::string::npos) {
+        return "-ERR invalid room name\r\n";
+    }
     const std::shared_ptr<Room> room = find_room(name, true);
     std::lock_guard lock(room->room_mutex);
-    return activate(*room);
+    return activate(*room) ? nullptr : ROOMS_FULL;
 }
 
 std::string Database::execute(const int client_fd, const std::vector<std::string>& args, const bool resp3) {
@@ -399,7 +403,7 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
     // "ROOM." ca nume precum LIST sa ramana camere valide
     if (command == "ROOM") {
         if (args.size() != 2) return "-ERR Wrong number of arguments for ROOM\r\n";
-        if (!wake_room(args[1])) return ROOMS_FULL;
+        if (const char* err = wake_room(args[1])) return err;
         set_client_room(client_fd, args[1]);
         return "+OK\r\n";
     }
@@ -449,7 +453,10 @@ std::string Database::handle_room_admin(const std::string& command, const std::v
     if (args.size() != 2) return "-ERR Wrong number of arguments for " + command + "\r\n";
     const std::string& name = args[1];
 
-    if (command == "ROOM.WAKE") return wake_room(name) ? "+OK\r\n" : ROOMS_FULL;
+    if (command == "ROOM.WAKE") {
+        const char* err = wake_room(name);
+        return err ? err : "+OK\r\n";
+    }
 
     const std::shared_ptr<Room> room = find_room(name, false);
     if (!room) return "-ERR no such room\r\n";

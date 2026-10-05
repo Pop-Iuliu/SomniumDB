@@ -70,8 +70,9 @@ private:
     // hibernate: false = snapshot esuat, camera ramane activa si citibila.
     bool activate(Room& room, bool over_budget = false);
     bool hibernate(Room& room);
-    // creeaza la nevoie si activeaza, luand singur lock-ul camerei
-    bool wake_room(const std::string& name);
+    // creeaza la nevoie si activeaza, luand singur lock-ul camerei;
+    // nullptr = camera e activa, altfel raspunsul de eroare
+    const char* wake_room(const std::string& name);
 
     // dispecerarea lock-uita pe camera; folosita si de replay-ul AOF
     std::string execute_in_room(const std::string& room_name, const std::vector<std::string>& args);

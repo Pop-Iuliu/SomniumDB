@@ -21,6 +21,7 @@
 #include "metrics.h"
 #include "src/core/database.h"
 #include "src/core/resp.h"
+#include "src/storage/fs_util.h"
 #include "src/storage/replicator.h"
 #include "watchdog.h"
 
@@ -36,6 +37,7 @@ using namespace std;
 
 static Database db;
 static string g_password; // SEC-2: SOMNIUM_PASSWORD; gol = fara autentificare
+static uint64_t g_maxclients = 10000; // SEC-6: SOMNIUM_MAXCLIENTS, ca Redis
 static Watchdog watchdog(db);
 
 // S3 "naigie": calutul de munca care nu se opreste pentru niciun client.
@@ -381,6 +383,11 @@ int main() {
         }
     }
 
+    if (const char* env = getenv("SOMNIUM_MAXCLIENTS"); env && (!fsutil::parse_u64(env, &g_maxclients) || g_maxclients == 0)) {
+        cerr << "SOMNIUM_MAXCLIENTS invalid: " << env << "\n";
+        return 1;
+    }
+
     // SEC-1: implicit doar localhost; expunerea in retea e o decizie explicita
     const char* bind_env = getenv("SOMNIUM_BIND");
     const string bind_ip = bind_env ? bind_env : "127.0.0.1";
@@ -491,7 +498,12 @@ int main() {
 
             if (ticket == &listener_ticket) {
                 const int res = cqe->res;
-                if (res >= 0) {
+                if (res >= 0 && clients.size() >= g_maxclients) {
+                    // SEC-6: fara Client, deci fara buffere; doar eroarea si inchiderea
+                    static constexpr char kFull[] = "-ERR max number of clients reached\r\n";
+                    ::send(res, kFull, sizeof(kFull) - 1, MSG_NOSIGNAL);
+                    ::close(res);
+                } else if (res >= 0) {
                     if (g_trace == -2) printf("[TRACE] accept fd %d\n", res);
                     set_nonblocking(res); // SOCK_NONBLOCK deja; defensive
                     auto c = make_shared<Client>(res);
