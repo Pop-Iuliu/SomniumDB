@@ -22,7 +22,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-5 | Safe room names | 2. Limits | DONE |
 | SEC-6 | Maximum number of clients | 2. Limits | DONE |
 | SEC-7 | Maximum number of rooms | 2. Limits | DONE |
-| SEC-8 | Harden the metrics endpoint | 2. Limits | TODO |
+| SEC-8 | Harden the metrics endpoint | 2. Limits | DONE |
 | SEC-9 | UndefinedBehaviorSanitizer in CI | 3. Find bugs first | TODO |
 | SEC-10 | Fuzz the RESP parser | 3. Find bugs first | TODO |
 | SEC-11 | Explicit build hardening | 3. Find bugs first | TODO |
@@ -203,7 +203,9 @@ An audit snapshot of `main` on 2026-10-04 (after PR #9). Each gap maps to a step
 
 **Done when:** a connection that sends nothing does not stop a second scrape from succeeding within 2 seconds, and the S1 metrics test still passes.
 
-**Files:** `metrics.cpp`, `README.md`, `tests/sec_test.py`.
+**Files:** `metrics.cpp`, `README.md`, `docker-compose.yaml`, `tests/sec_test.py`.
+
+**Note:** the old combined option value also meant `SO_REUSEADDR` was never set, so a restart right after a scrape could fail to bind 9090 while connections sat in `TIME_WAIT`. Seen while checking the test against the old binary; fixed by item 3.
 
 ## Phase 3: Find bugs before attackers do
 
