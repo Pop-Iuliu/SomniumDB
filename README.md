@@ -162,7 +162,61 @@ Deployment checklist:
 * Set `SOMNIUM_PASSWORD` to a long random value (for example `openssl rand -hex 32`). Every client and replication peer that knows it is fully trusted.
 * Keep `SOMNIUM_BIND` and `SOMNIUM_METRICS_BIND` on localhost unless something outside the host needs them.
 * Firewall the server port (`6379` by default) and the metrics port (`9090`).
-* Traffic is not encrypted: put a tunnel such as WireGuard or stunnel in front of anything that crosses a network.
+* Traffic is not encrypted: put a tunnel in front of anything that crosses a network (see below).
+
+### Encrypted transport
+
+SomniumDB speaks plain TCP, so the password and the data are readable on the wire. Encrypt everything that leaves the host with a tunnel; the server itself stays as it is.
+
+**Replication: WireGuard.** Put the nodes on a private WireGuard network and replicate over its addresses. On node 1 (`10.0.0.1`); node 2 mirrors it:
+
+```ini
+# /etc/wireguard/wg0.conf  (keys: wg genkey | tee private.key | wg pubkey > public.key)
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = <node 1 private key>
+
+[Peer]
+PublicKey = <node 2 public key>
+AllowedIPs = 10.0.0.2/32
+Endpoint = node2.example.com:51820
+```
+
+```bash
+wg-quick up wg0
+SOMNIUM_BIND=10.0.0.1 SOMNIUM_PASSWORD=<shared secret> SOMNIUM_PEERS=10.0.0.2:6379 ./Redis
+```
+
+Firewall port 6379 everywhere except on `wg0`.
+
+**Remote clients: stunnel.** The server stays on localhost; stunnel terminates TLS next to it, and a second stunnel on the client machine verifies the server's certificate:
+
+```bash
+openssl req -x509 -newkey rsa:3072 -nodes -days 365 -subj /CN=somnium \
+    -keyout somnium.key -out somnium.crt   # copy somnium.crt (not the key) to the clients
+```
+
+```ini
+; server host: TLS on 6380 -> SomniumDB on localhost
+[somnium]
+accept = 0.0.0.0:6380
+connect = 127.0.0.1:6379
+cert = /etc/stunnel/somnium.crt
+key = /etc/stunnel/somnium.key
+```
+
+```ini
+; client host: plain on localhost:6379 -> TLS to the server, certificate pinned
+client = yes
+[somnium]
+accept = 127.0.0.1:6379
+connect = db.example.com:6380
+verifyPeer = yes
+CAfile = /etc/stunnel/somnium.crt
+```
+
+Clients then connect to their own `127.0.0.1:6379` (`redis-cli -a <password>`). The tunnel makes the server reachable from the network, so `SOMNIUM_PASSWORD` must be set even though `SOMNIUM_BIND` is still localhost. A replication peer can use the same client-side stunnel when WireGuard is not an option: point `SOMNIUM_PEERS` at the local stunnel port.
 
 ---
 

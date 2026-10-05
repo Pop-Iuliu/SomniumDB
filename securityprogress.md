@@ -29,7 +29,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-12 | Least-privilege CI token | 3. Find bugs first | DONE |
 | SEC-13 | Remove the unused vendored `json.hpp` | 3. Find bugs first | DONE |
 | SEC-14 | `SECURITY.md` and a deployment checklist | 4. Process and transport | DONE |
-| SEC-15 | Encrypted transport through a tunnel (docs) | 4. Process and transport | TODO |
+| SEC-15 | Encrypted transport through a tunnel (docs) | 4. Process and transport | DONE (WireGuard run pending) |
 | SEC-16 | Native TLS | 4. Process and transport | DEFERRED (trigger below) |
 
 ## Threat model
@@ -307,6 +307,8 @@ An audit snapshot of `main` on 2026-10-04 (after PR #9). Each gap maps to a step
 **Done when:** the guide exists and a manual run of both setups works once.
 
 **Files:** `README.md`.
+
+**Result:** the stunnel setup was run end to end: `redis-cli -a` worked through the tunnel, plain RESP sent to the TLS port got no reply, a client pinning a different certificate was refused at the handshake, and a replication peer authenticated and replicated through the client-side stunnel. The WireGuard setup was not run: the test container's kernel has no WireGuard support. It still needs one manual run on real hosts.
 
 ### SEC-16: Native TLS (deferred)
 
