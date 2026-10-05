@@ -69,6 +69,23 @@ jobs:
           SOMNIUM_BIN: build-tsan/Redis
         run: python3 tests/s4_test.py
 
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # runtime-ul libFuzzer/ASan nu vine cu pachetul clang
+      - name: Instaleaza clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-rt-18-dev
+
+      # SEC-10: parserele RESP citesc octeti direct de la straini
+      - name: Fuzz parserele RESP (60 s)
+        run: |
+          clang++ -std=c++20 -g -O1 -fsanitize=fuzzer,address,undefined tests/fuzz_resp.cpp -o fuzz_resp
+          ./fuzz_resp -max_total_time=60
+
   benchmark:
     runs-on: ubuntu-24.04
     needs: tests
