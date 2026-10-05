@@ -13,7 +13,6 @@
 #include <arpa/inet.h>
 #include <csignal>
 #include <cerrno>
-#include <sched.h>
 #include <liburing.h>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -366,27 +365,6 @@ static void pump_work() {
     }
 }
 
-static void adjust_thread_priority(unsigned int current_load) {
-    static bool is_high_prio = false;
-
-    if (current_load > 500 && !is_high_prio) {
-        sched_param param{};
-        param.sched_priority = sched_get_priority_max(SCHED_FIFO);
-        if (sched_setscheduler(0, SCHED_FIFO, &param) == 0) {
-            is_high_prio = true;
-            cout << "[PRIO CLIMB] Thread promovat la SCHED_FIFO (Real-Time) datorita stresului!\n";
-        }
-    }
-    else if (current_load < 100 && is_high_prio) {
-        sched_param param{};
-        param.sched_priority = 0;
-        if (sched_setscheduler(0, SCHED_OTHER, &param) == 0) {
-            is_high_prio = false;
-            cout << "[PRIO DROP] Trafic normalizat. Revenire la SCHED_OTHER.\n";
-        }
-    }
-}
-
 int main() {
     // SEC-3: tot ce cream de aici incolo e doar al proprietarului. Fisierele
     // deschise la initializarea statica (AOF, cold.bin) au deja 0600 explicit.
@@ -561,7 +539,5 @@ int main() {
         }
 
         io_uring_cq_advance(&ring, count);
-
-        adjust_thread_priority(count);
     }
 }
