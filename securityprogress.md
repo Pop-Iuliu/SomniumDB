@@ -15,7 +15,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 
 | Step | Title | Phase | Status |
 | --- | --- | --- | --- |
-| SEC-1 | Listen on localhost by default | 1. Secure defaults | TODO |
+| SEC-1 | Listen on localhost by default | 1. Secure defaults | DONE |
 | SEC-2 | Password authentication (`AUTH`) | 1. Secure defaults | TODO |
 | SEC-3 | Private data files | 1. Secure defaults | TODO |
 | SEC-4 | Remove automatic real-time priority | 1. Secure defaults | TODO |

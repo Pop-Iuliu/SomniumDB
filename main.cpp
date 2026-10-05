@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <csignal>
 #include <cerrno>
 #include <sched.h>
@@ -348,6 +349,18 @@ int main() {
         }
     }
 
+    // SEC-1: implicit doar localhost; expunerea in retea e o decizie explicita
+    const char* bind_env = getenv("SOMNIUM_BIND");
+    const string bind_ip = bind_env ? bind_env : "127.0.0.1";
+    in_addr bind_addr{};
+    if (inet_pton(AF_INET, bind_ip.c_str(), &bind_addr) != 1) {
+        cerr << "SOMNIUM_BIND invalid: " << bind_ip << " (astept o adresa IPv4)\n";
+        return 1;
+    }
+    if (ntohl(bind_addr.s_addr) >> 24 != 127) {
+        cerr << "ATENTIE: serverul asculta pe " << bind_ip << ", accesibil din retea fara autentificare\n";
+    }
+
     if (getenv("SOMNIUM_NO_METRICS") == nullptr) {
         start_prometheus_exporter(9090);
     }
@@ -371,11 +384,11 @@ int main() {
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_addr = bind_addr;
     address.sin_port = htons(static_cast<uint16_t>(port));
 
     if (bind(g_server_fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) {
-        cerr << "Nu pot face bind pe portul " << port << ": " << strerror(errno) << "\n";
+        cerr << "Nu pot face bind pe " << bind_ip << ":" << port << ": " << strerror(errno) << "\n";
         close(g_server_fd);
         return 1;
     }
@@ -393,7 +406,7 @@ int main() {
     arm_listener(&ring);
     arm_eventfd(&ring);
 
-    cout << "Server pornit (io_uring) pe portul " << port << "...\n";
+    cout << "Server pornit (io_uring) pe " << bind_ip << ":" << port << "...\n";
     watchdog.start();
 
     // replicare CRDT catre SOMNIUM_PEERS (nimic fara peers)

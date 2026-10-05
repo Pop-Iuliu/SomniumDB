@@ -34,6 +34,7 @@ run_suite() {
     python3 tests/s14_test.py
     python3 tests/s3_test.py
     python3 tests/hib_test.py
+    python3 tests/sec_test.py
 }
 
 if ! run_suite; then
