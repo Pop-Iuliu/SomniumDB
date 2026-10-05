@@ -77,6 +77,8 @@ Commands can be sent as RESP arrays or inline (one line split on spaces, with `"
 
 Environment: `REDIS_PORT`, `SOMNIUM_BIND` (IPv4 address to listen on, default `127.0.0.1`; refuses to start on a non-loopback address without a password), `SOMNIUM_PASSWORD` (require `AUTH` from every client; replication peers send it too, so all nodes of a cluster share one password. Like Redis `requirepass`, an authenticated client is fully trusted, including with replication and admin commands), `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_MAXMEMORY` (global budget in bytes for resident keys and values, estimated; default unlimited), `SOMNIUM_AOF_REWRITE_MIN_BYTES` (the AOF is rewritten automatically once it doubles past this size, default 64 MB), `SOMNIUM_NODE_ID` (CRDT node id of local writes, default 1), `SOMNIUM_PEERS` (`host:port,...`: replicate local writes and deletes to these nodes as batched CRDT merges, one thread per peer, assuming a symmetric peer list; delete markers are garbage-collected once every peer's frontier has passed them; per-peer phi and lag appear in `INFO` and `/metrics`), `SOMNIUM_MAX_CLOCK_OFFSET_MS` (reject merges whose timestamp is further in the future, default 10 minutes), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
 
+Data files (`appendonly.aof`, `room_*.bin`, `cold.bin`, replication offsets) are created readable by the server's user only. Files created by older versions keep their mode: run `chmod 600` on them once after upgrading.
+
 ---
 
 ## Project Structure

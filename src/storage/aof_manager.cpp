@@ -159,7 +159,7 @@ bool AOFManager::open_file() {
     std::lock_guard lock(mutex_);
     if (fd_ >= 0) return true;
 
-    fd_ = ::open(kAofPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    fd_ = ::open(kAofPath, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd_ < 0) {
         healthy_ = false;
         fprintf(stderr, "AOF: nu pot deschide %s: %s\n", kAofPath, strerror(errno));
@@ -203,7 +203,7 @@ bool AOFManager::append(const std::string& room_name, const std::vector<std::str
     const std::string data = encode_record(rec);
 
     if (fd_ < 0) {
-        fd_ = ::open(kAofPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        fd_ = ::open(kAofPath, O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (fd_ < 0) {
             healthy_ = false;
             return false;
@@ -362,7 +362,7 @@ bool AOFManager::start_rewrite() {
     if (rewrite_fd_ >= 0) return true;
     base_size_ = size_.load(); // orice incercare reseteaza baza (vezi rewrite_due)
     publish_sizes();
-    rewrite_fd_ = ::open("appendonly.aof.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    rewrite_fd_ = ::open("appendonly.aof.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (rewrite_fd_ < 0) {
         fprintf(stderr, "AOF: rescriere: nu pot crea fisierul temporar: %s\n", strerror(errno));
         return false;
@@ -454,7 +454,7 @@ bool AOFManager::commit_rewrite() {
         ::close(fd_);
         fd_ = -1;
     }
-    fd_ = ::open(kAofPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    fd_ = ::open(kAofPath, O_WRONLY | O_CREAT | O_APPEND, 0600);
     healthy_ = fd_ >= 0;
     needs_rewrite_ = false;
     size_ = written;

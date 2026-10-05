@@ -17,6 +17,7 @@
 #include <liburing.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/stat.h>
 
 #include "metrics.h"
 #include "src/core/database.h"
@@ -387,6 +388,10 @@ static void adjust_thread_priority(unsigned int current_load) {
 }
 
 int main() {
+    // SEC-3: tot ce cream de aici incolo e doar al proprietarului. Fisierele
+    // deschise la initializarea statica (AOF, cold.bin) au deja 0600 explicit.
+    umask(077);
+
     // portul poate fi suprascris (ex: masina de dev are deja un redis pe 6379)
     int port = PORT;
     if (const char* env_port = getenv("REDIS_PORT"); env_port != nullptr) {

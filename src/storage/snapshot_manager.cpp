@@ -165,7 +165,7 @@ bool SnapshotManager::hibernate_room(Room& room, PoolAllocator<Record, 1024>& po
     const std::string filename = "room_" + room.name + ".bin";
     const std::string tmpname = filename + ".tmp";
 
-    const int fd = ::open(tmpname.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    const int fd = ::open(tmpname.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) {
         fprintf(stderr, "Snapshot '%s': nu pot crea fisierul temporar: %s\n", room.name.c_str(), strerror(errno));
         return false;

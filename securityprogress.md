@@ -17,7 +17,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | --- | --- | --- | --- |
 | SEC-1 | Listen on localhost by default | 1. Secure defaults | DONE |
 | SEC-2 | Password authentication (`AUTH`) | 1. Secure defaults | DONE |
-| SEC-3 | Private data files | 1. Secure defaults | TODO |
+| SEC-3 | Private data files | 1. Secure defaults | DONE |
 | SEC-4 | Remove automatic real-time priority | 1. Secure defaults | TODO |
 | SEC-5 | Safe room names | 2. Limits | TODO |
 | SEC-6 | Maximum number of clients | 2. Limits | TODO |
@@ -135,6 +135,8 @@ An audit snapshot of `main` on 2026-10-04 (after PR #9). Each gap maps to a step
 **Done when:** after a `SET`, `ROOM.HIBERNATE` and `COMPACT`, `appendonly.aof`, the room snapshot and `cold.bin` all have mode `0600` (check with `os.stat` in the test).
 
 **Files:** `main.cpp`, the four storage `.cpp` files, `README.md`, `tests/sec_test.py`.
+
+**Changes from the plan:** the explicit `0600` modes are required, not cosmetic: the global `Database` opens the AOF and `cold.bin` during static initialization, before `main()` sets the umask. The replicator's offset files are written after startup and are covered by the umask.
 
 ### SEC-4: Remove automatic real-time priority
 

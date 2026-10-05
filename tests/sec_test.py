@@ -129,12 +129,32 @@ def sec2_replication(check):
             srv.cleanup()
 
 
+def sec3_file_modes(check):
+    srv = Server(env_extra=ENV)
+    try:
+        srv.start()
+        c = Client(srv)
+        c.cmd("ROOM", "r")
+        c.cmd("SET", "k", "v")
+        c.cmd("ROOM", "default")
+        check("SEC-3: ROOM.HIBERNATE", c.cmd("ROOM.HIBERNATE", "r")[0] == "ok")
+        check("SEC-3: COMPACT", c.cmd("COMPACT")[0] != "err")
+        c.close()
+        for name in ("appendonly.aof", "room_r.bin", "cold.bin"):
+            path = os.path.join(srv.workdir, name)
+            mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else None
+            check(f"SEC-3: {name} are modul 0600", mode == 0o600, oct(mode) if mode else "lipseste")
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
     run_with_retry(sec1_bind, fails)
     run_with_retry(sec2_auth, fails)
     run_with_retry(sec2_no_password, fails)
     run_with_retry(sec2_replication, fails)
+    run_with_retry(sec3_file_modes, fails)
     report(fails, "sec")
 
 
