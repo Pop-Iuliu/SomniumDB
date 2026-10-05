@@ -24,7 +24,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-7 | Maximum number of rooms | 2. Limits | DONE |
 | SEC-8 | Harden the metrics endpoint | 2. Limits | DONE |
 | SEC-9 | UndefinedBehaviorSanitizer in CI | 3. Find bugs first | DONE |
-| SEC-10 | Fuzz the RESP parser | 3. Find bugs first | TODO |
+| SEC-10 | Fuzz the RESP parser | 3. Find bugs first | DONE |
 | SEC-11 | Explicit build hardening | 3. Find bugs first | TODO |
 | SEC-12 | Least-privilege CI token | 3. Find bugs first | TODO |
 | SEC-13 | Remove the unused vendored `json.hpp` | 3. Find bugs first | TODO |
@@ -235,6 +235,8 @@ An audit snapshot of `main` on 2026-10-04 (after PR #9). Each gap maps to a step
 **Next targets** (only after this works, and when the related format changes): the snapshot loader and AOF recovery.
 
 **Files:** `tests/fuzz_resp.cpp`, `.github/workflows/ci.yml`.
+
+**Result:** about 2 million inputs in 60 seconds, no findings. A deliberately broken parser (an empty inline line that does not advance) is caught within seconds. CI runs the fuzzer as its own job and also installs `libclang-rt-18-dev`, because the `clang` package does not pull in the libFuzzer and sanitizer runtimes.
 
 ### SEC-11: Explicit build hardening
 
