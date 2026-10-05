@@ -15,22 +15,27 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 
 | Step | Title | Phase | Status |
 | --- | --- | --- | --- |
-| SEC-1 | Listen on localhost by default | 1. Secure defaults | DONE |
-| SEC-2 | Password authentication (`AUTH`) | 1. Secure defaults | DONE |
-| SEC-3 | Private data files | 1. Secure defaults | DONE |
-| SEC-4 | Remove automatic real-time priority | 1. Secure defaults | DONE |
-| SEC-5 | Safe room names | 2. Limits | DONE |
-| SEC-6 | Maximum number of clients | 2. Limits | DONE |
-| SEC-7 | Maximum number of rooms | 2. Limits | DONE |
-| SEC-8 | Harden the metrics endpoint | 2. Limits | DONE |
-| SEC-9 | UndefinedBehaviorSanitizer in CI | 3. Find bugs first | DONE |
-| SEC-10 | Fuzz the RESP parser | 3. Find bugs first | DONE |
-| SEC-11 | Explicit build hardening | 3. Find bugs first | DONE |
-| SEC-12 | Least-privilege CI token | 3. Find bugs first | DONE |
-| SEC-13 | Remove the unused vendored `json.hpp` | 3. Find bugs first | DONE |
-| SEC-14 | `SECURITY.md` and a deployment checklist | 4. Process and transport | DONE |
-| SEC-15 | Encrypted transport through a tunnel (docs) | 4. Process and transport | DONE (WireGuard run pending) |
+| SEC-1 | Listen on localhost by default | 1. Secure defaults | DONE (#11) |
+| SEC-2 | Password authentication (`AUTH`) | 1. Secure defaults | DONE (#11) |
+| SEC-3 | Private data files | 1. Secure defaults | DONE (#11) |
+| SEC-4 | Remove automatic real-time priority | 1. Secure defaults | DONE (#11) |
+| SEC-5 | Safe room names | 2. Limits | DONE (#12) |
+| SEC-6 | Maximum number of clients | 2. Limits | DONE (#12) |
+| SEC-7 | Maximum number of rooms | 2. Limits | DONE (#13) |
+| SEC-8 | Harden the metrics endpoint | 2. Limits | DONE (#14) |
+| SEC-9 | UndefinedBehaviorSanitizer in CI | 3. Find bugs first | DONE (#15) |
+| SEC-10 | Fuzz the RESP parser | 3. Find bugs first | DONE (#16) |
+| SEC-11 | Explicit build hardening | 3. Find bugs first | DONE (#17) |
+| SEC-12 | Least-privilege CI token | 3. Find bugs first | DONE (#18) |
+| SEC-13 | Remove the unused vendored `json.hpp` | 3. Find bugs first | DONE (#19) |
+| SEC-14 | `SECURITY.md` and a deployment checklist | 4. Process and transport | DONE (#20) |
+| SEC-15 | Encrypted transport through a tunnel (docs) | 4. Process and transport | DONE (#21) (WireGuard run pending) |
 | SEC-16 | Native TLS | 4. Process and transport | DEFERRED (trigger below) |
+| SEC-17 | Really close dropped connections | 5. Audit 2026-10-05 | DONE |
+| SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | TODO |
+| SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | TODO |
+| SEC-20 | Rate-limit the failed `AUTH` log | 5. Audit 2026-10-05 | TODO |
+| SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | TODO |
 
 ## Threat model
 
@@ -74,6 +79,16 @@ An audit snapshot of `main` on 2026-10-04 (after PR #9). Each gap maps to a step
 | 10 | Hardening depends on distribution compiler defaults, the CI token has default permissions, and an unused 1 MB vendored header (`json.hpp`) is listed in the build | `CMakeLists.txt`, `ci.yml`, `json.hpp` | SEC-11 to SEC-13 |
 | 11 | No way to report a vulnerability and no deployment guidance | repository root | SEC-14 |
 | 12 | All traffic, including replication, is plain text | network | SEC-15, SEC-16 |
+
+Rows 13 to 17 come from the second audit, on 2026-10-05 after PR #21 (see Phase 5). Each was reproduced against a running server before being listed.
+
+| # | Gap | Where | Step |
+| --- | --- | --- | --- |
+| 13 | A dropped connection is not really closed: `close()` while a write poll is pending leaves the socket open and its buffers (up to 32 MB) allocated until the peer reads or hangs up, and the zombie no longer counts toward `SOMNIUM_MAXCLIENTS`. A stranger who never authenticates triggers it with tiny lines (each answered by a 34-byte `-NOAUTH`): 10 such connections held 334 MB | `main.cpp`, `schedule_close()` / `enqueue_output()` | SEC-17 |
+| 14 | Connections that never authenticate never time out: two idle strangers lock every client out of a `SOMNIUM_MAXCLIENTS=2` server indefinitely (10,000 do it at the default) | `main.cpp`, event loop | SEC-18 |
+| 15 | `MGET` builds its whole reply before any output limit: after `SET k <8 MB>`, a 1.4 KB `MGET k k ...` (200 times) aborted the server with `std::bad_alloc` under a 1 GB memory limit. Authenticated clients only | `Database::handle_mget()` | SEC-19 |
+| 16 | Every failed `AUTH` writes a log line, without limit: 6,000 guesses in under a second wrote 6,000 lines. Unauthenticated | `main.cpp`, `authenticate()` | SEC-20 |
+| 17 | `tests/run_all.sh` exits 0 even when suites fail (`set -e` is ignored inside a function called from `if !`), so CI only catches failures in the last suite. `s9` and `s11` already fail on `main` unnoticed | `tests/run_all.sh` | SEC-21 |
 
 ## Phase 1: Secure defaults
 
@@ -319,6 +334,76 @@ An audit snapshot of `main` on 2026-10-04 (after PR #9). Each gap maps to a step
 - **Replicator side:** a plain blocking `SSL_connect` on its existing per-peer sockets.
 - **Configuration:** certificate and key paths through `SOMNIUM_TLS_CERT` and `SOMNIUM_TLS_KEY`.
 
+## Phase 5: Audit 2026-10-05
+
+A review of the whole server after SEC-1 to SEC-15. In scope:
+- what a stranger can reach: the parsers, `AUTH`, `HELLO`, `QUIT`, connection handling;
+- the command handlers' argument and integer checks;
+- pub/sub, the metrics endpoint, replication and the forked AOF rewrite.
+
+Every finding below was reproduced against a running server. The storage formats were only read: the threat model trusts disk contents. Lower-risk observations went to the deferred list.
+
+### SEC-17: Really close dropped connections
+
+**Why:** gap 13. It defeats the output cap and `SOMNIUM_MAXCLIENTS`, and needs no password.
+
+**Do:**
+1. In `schedule_close()`, call `shutdown(fd, SHUT_RDWR)` before `close()`. This completes any poll still pending in the ring, so the `Client` and its buffers are freed and the peer sees the connection end.
+2. Cap an unauthenticated client's pending output at 16 KB, the same as its input (`Client::output_cap()`).
+
+**Done when:**
+- 10 strangers flooding without reading grow the server by less than 16 MB;
+- no server-side connection stays `ESTABLISHED` after a stranger or an authenticated slow client is dropped (checked through `/proc/net/tcp`, without reading from the socket).
+
+**Result:** before the fix, 10 such strangers added 320 MB and every connection stayed open. All three checks fail on the old binary and pass after the fix, in Release and under ASan + UBSan.
+
+**Files:** `main.cpp`, `tests/sec_test.py`.
+
+### SEC-18: Time out connections that never authenticate
+
+**Why:** gap 14. Anyone who can reach the port can deny service to everyone else without sending a byte.
+
+**Do:**
+1. Only when `SOMNIUM_PASSWORD` is set: record the accept time in `Client`, and close clients that are still unauthenticated 10 seconds later.
+2. The event loop needs a periodic wake for this. Wait with a 1 second timeout, as the first wait already does with `io_uring_wait_cqe_timeout`, and sweep the clients on each wake.
+
+**Done when:** with `SOMNIUM_MAXCLIENTS=2` and two idle strangers, a legitimate client is accepted within 12 seconds.
+
+**Files:** `main.cpp`, `tests/sec_test.py`.
+
+### SEC-19: Bound `MGET` replies
+
+**Why:** gap 15. A small request should not be able to crash the server. `MGET` is the only command whose reply can be much larger than its request; `GET` returns one stored value.
+
+**Do:** stop building the reply once it passes the client output cap (32 MB), and answer `-ERR reply too large`. A larger reply would disconnect the client anyway. Share the cap constant between `main.cpp` and `Database`.
+
+**Done when:** `MGET` of an 8 MB key repeated 200 times returns the error, and the server keeps serving.
+
+**Files:** `src/core/database.*`, `main.cpp`, `tests/sec_test.py`.
+
+### SEC-20: Rate-limit the failed `AUTH` log
+
+**Why:** gap 16. Unlimited log lines from strangers can fill the disk or bury real events. Since SEC-17, pipelined guessing is already limited to about 360 attempts per connection by the 16 KB output cap.
+
+**Do:** log failed `AUTH` at most once per second, as one line with the number of failures since the last line. Lockout stays deferred.
+
+**Done when:** 1,000 failed `AUTH` attempts produce at most 2 log lines.
+
+**Files:** `main.cpp`, `tests/sec_test.py`.
+
+### SEC-21: Make the test runner fail on failing suites
+
+**Why:** gap 17. Every step's test, including `tests/sec_test.py`, is only a gate if CI fails when it fails.
+
+**Do:**
+1. Make `run_suite` in `tests/run_all.sh` return non-zero when any suite fails, keeping the single retry for the io_uring flake.
+2. Fix or explain the current `s9` and `s11` failures in the same PR, otherwise CI turns red.
+3. Also watch `s8` ("rescrierea automata tine AOF-ul mic"): it failed intermittently during SEC-13.
+
+**Done when:** a deliberately failing suite makes `tests/run_all.sh` exit non-zero, and the real suite passes.
+
+**Files:** `tests/run_all.sh`, plus the fixes.
+
 ## Deferred (YAGNI)
 
 Each item comes back only when its trigger happens.
@@ -336,3 +421,6 @@ Each item comes back only when its trigger happens.
 | Static analysis (CodeQL) | After SEC-9 and SEC-10 run clean, as a cheap extra pass |
 | Pinning GitHub Actions to commit SHAs, Dependabot | Adding any third-party action beyond `actions/*` |
 | IPv6 bind addresses | A deployment that needs them |
+| Keyed hashing for keys and channel names (libstdc++'s `std::hash` uses a fixed seed, so collisions can be precomputed) | Authenticated clients that are not fully trusted |
+| Constant-length password comparison (today a wrong-length guess is distinguishable by timing) | Password guessing becoming practical over the network (see the `AUTH` rate-limit row) |
+| Escaping client-supplied names (channels, rooms) in log lines | Logs consumed by a tool that trusts their line structure |
