@@ -32,7 +32,7 @@ using namespace std;
 #define READ_CHUNK 16384
 #define MAX_COMMANDS_PER_TURN 8192
 #define MAX_INPUT_BUFFER (128ull * 1024 * 1024)
-#define MAX_UNAUTH_INPUT (16ull * 1024) // un strain nu are voie sa ne tina 128 MB
+#define MAX_UNAUTH_BUFFER (16ull * 1024) // un strain nu are voie sa ne tina megaocteti (input sau output)
 #define MAX_CLIENT_OUTPUT (32ull * 1024 * 1024)
 
 static Database db;
@@ -58,7 +58,8 @@ struct Client {
 
     explicit Client(int f) : fd(f) {}
     size_t pending_out() const { return out_buf.size() - out_off; }
-    size_t input_cap() const { return authenticated ? MAX_INPUT_BUFFER : MAX_UNAUTH_INPUT; }
+    size_t input_cap() const { return authenticated ? MAX_INPUT_BUFFER : MAX_UNAUTH_BUFFER; }
+    size_t output_cap() const { return authenticated ? MAX_CLIENT_OUTPUT : MAX_UNAUTH_BUFFER; }
 };
 
 // un PollTicket zboara cu fiecare poll armat in ring; shared_ptr tine clientul
@@ -88,6 +89,9 @@ static void schedule_close(const shared_ptr<Client>& c) {
     if (g_trace == -2 || g_trace == c->fd)
         printf("[TRACE] fd %d CLOSE\n", c->fd);
     db.cleanup_client(c->fd);
+    // un poll armat in ring tine socketul (si clientul, cu bufferele lui) in viata
+    // dupa close; shutdown il trezeste acum si inchide conexiunea efectiv
+    ::shutdown(c->fd, SHUT_RDWR);
     ::close(c->fd);
     clients.erase(c->fd);
     // ticketele in zbor tin shared_ptr; CQE-urile viitoare vad closed si nu fac nimic
@@ -181,9 +185,9 @@ static FlushResult flush_output(Client& c) {
 // capul de output: deconecteaza clientii prea lenti ca sa nu moara serverul
 static bool enqueue_output(const shared_ptr<Client>& c, const string& data) {
     if (c->closed) return false;
-    if (c->pending_out() + data.size() > MAX_CLIENT_OUTPUT) {
-        printf("[SlowClient] FD %d a depasit bufferul de output (%llu MB). Deconectat.\n",
-               c->fd, static_cast<unsigned long long>(MAX_CLIENT_OUTPUT >> 20));
+    if (c->pending_out() + data.size() > c->output_cap()) {
+        printf("[SlowClient] FD %d a depasit bufferul de output (%llu KB). Deconectat.\n",
+               c->fd, static_cast<unsigned long long>(c->output_cap() >> 10));
         schedule_close(c);
         return false;
     }

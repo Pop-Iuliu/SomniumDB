@@ -244,6 +244,52 @@ def sec8_metrics(check):
         srv.cleanup()
 
 
+def flood(sock, seconds):
+    """Trimite comenzi fara sa citeasca vreun raspuns (un client care nu urmeaza citirea)."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    sock.setblocking(False)
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            sock.send(b"a\n" * 4096)
+        except BlockingIOError:
+            time.sleep(0.01)
+        except OSError:
+            return  # serverul a inchis conexiunea
+
+
+def server_connections(port):
+    """Conexiunile ESTABLISHED ale serverului, vazute din kernel (fara sa citim din ele)."""
+    with open("/proc/net/tcp") as f:
+        rows = [line.split() for line in f.readlines()[1:]]
+    return sum(r[1].endswith(f":{port:04X}") and r[3] == "01" for r in rows)
+
+
+def sec17_dropped_clients(check):
+    srv = Server(env_extra={**ENV, "SOMNIUM_PASSWORD": PW})
+    rss_mb = lambda: int(open(f"/proc/{srv.proc.pid}/status").read().split("VmRSS:")[1].split()[0]) >> 10
+    try:
+        srv.start()
+        before = rss_mb()
+        strangers = [srv.connect() for _ in range(10)]
+        for s in strangers:
+            flood(s, 1)
+        grown = rss_mb() - before
+        check("SEC-17: 10 straini care nu citesc nu tin memoria serverului", grown < 16, f"+{grown} MB")
+        check("SEC-17: strainii sunt deconectati", wait_until(lambda: server_connections(srv.port) == 0, 5))
+        for s in strangers:
+            s.close()
+
+        slow = Client(srv)
+        slow.cmd("AUTH", PW)
+        flood(slow.s, 20)  # pana trece de capul de 32 MB si serverul inchide; nu citeste nimic
+        check("SEC-17: clientul lent deconectat chiar se inchide",
+              wait_until(lambda: server_connections(srv.port) == 0, 5))
+        slow.close()
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
     run_with_retry(sec1_bind, fails)
@@ -255,6 +301,7 @@ def main():
     run_with_retry(sec6_maxclients, fails)
     run_with_retry(sec7_max_rooms, fails)
     run_with_retry(sec8_metrics, fails)
+    run_with_retry(sec17_dropped_clients, fails)
     report(fails, "sec")
 
 
