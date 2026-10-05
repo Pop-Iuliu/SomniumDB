@@ -151,6 +151,21 @@ make -j$(nproc)
 
 ---
 
+## Security
+
+To report a vulnerability, see [`SECURITY.md`](SECURITY.md). The threat model and the hardening work are tracked in [`securityprogress.md`](securityprogress.md).
+
+Deployment checklist:
+
+* Run the server as a dedicated non-root user.
+* Start it in a working directory owned by that user with mode `0700`: the data files (`appendonly.aof`, `room_*.bin`, `cold.bin`) are written there.
+* Set `SOMNIUM_PASSWORD` to a long random value (for example `openssl rand -hex 32`). Every client and replication peer that knows it is fully trusted.
+* Keep `SOMNIUM_BIND` and `SOMNIUM_METRICS_BIND` on localhost unless something outside the host needs them.
+* Firewall the server port (`6379` by default) and the metrics port (`9090`).
+* Traffic is not encrypted: put a tunnel such as WireGuard or stunnel in front of anything that crosses a network.
+
+---
+
 ## Benchmarks
 
 Measured head-to-head against **Redis 6.0.16** on the same machine, using `redis-benchmark` (100,000 operations per test). The reference Redis ran as a dedicated instance (empty dataset, no persistence), and SomniumDB ran in Release mode with a clean data directory and the default `SOMNIUM_AOF_SYNC=everysec` durability policy.
