@@ -38,7 +38,7 @@ jobs:
 
       - name: Configure + build (Debug + ASan)
         run: |
-          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address -g"
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -g"
           cmake --build build-asan
 
       - name: Teste impotriva buildului ASan
