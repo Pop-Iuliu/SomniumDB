@@ -23,7 +23,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-6 | Maximum number of clients | 2. Limits | DONE |
 | SEC-7 | Maximum number of rooms | 2. Limits | DONE |
 | SEC-8 | Harden the metrics endpoint | 2. Limits | DONE |
-| SEC-9 | UndefinedBehaviorSanitizer in CI | 3. Find bugs first | TODO |
+| SEC-9 | UndefinedBehaviorSanitizer in CI | 3. Find bugs first | DONE |
 | SEC-10 | Fuzz the RESP parser | 3. Find bugs first | TODO |
 | SEC-11 | Explicit build hardening | 3. Find bugs first | TODO |
 | SEC-12 | Least-privilege CI token | 3. Find bugs first | TODO |
@@ -218,6 +218,8 @@ An audit snapshot of `main` on 2026-10-04 (after PR #9). Each gap maps to a step
 **Done when:** the full suite passes under ASan + UBSan.
 
 **Files:** `.github/workflows/ci.yml`, plus any fixes.
+
+**Result:** the first full run under ASan + UBSan reported nothing, so no fixes were needed. `-fno-sanitize-recover` makes any future report end the server with a non-zero code, which the test harness turns into a failure with the server log attached.
 
 ### SEC-10: Fuzz the RESP parser
 
