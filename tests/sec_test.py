@@ -208,6 +208,22 @@ def sec6_maxclients(check):
         srv.cleanup()
 
 
+def sec7_max_rooms(check):
+    srv = Server(env_extra={**ENV, "SOMNIUM_MAX_ROOMS": "3"})
+    try:
+        srv.start()
+        c = Client(srv)
+        check("SEC-7: primele trei camere", all(c.cmd("ROOM", r) == ("ok", "OK") for r in "abc"))
+        check("SEC-7: a patra camera noua e refuzata", c.cmd("ROOM", "d") == ("err", "ERR too many rooms"))
+        check("SEC-7: ...si prin ROOM.WAKE", c.cmd("ROOM.WAKE", "d") == ("err", "ERR too many rooms"))
+        check("SEC-7: ...fara sa intre in registru", b"d" not in [n for _, n in c.cmd("ROOMS")[1]])
+        check("SEC-7: primele trei merg in continuare",
+              all(c.cmd("ROOM", r) == ("ok", "OK") and c.cmd("SET", "k", r)[0] == "ok" for r in "abc"))
+        c.close()
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
     run_with_retry(sec1_bind, fails)
@@ -217,6 +233,7 @@ def main():
     run_with_retry(sec3_file_modes, fails)
     run_with_retry(sec5_room_names, fails)
     run_with_retry(sec6_maxclients, fails)
+    run_with_retry(sec7_max_rooms, fails)
     report(fails, "sec")
 
 
