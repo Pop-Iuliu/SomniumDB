@@ -21,7 +21,6 @@ add_executable(Redis main.cpp
         src/core/database.cpp
         src/core/resp.h
         src/core/hlc.h
-        json.hpp
         watchdog.h
         watchdog.cpp
         pubsub.cpp
