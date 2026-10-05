@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# SEC-12: joburile doar citesc repo-ul (upload-artifact nu foloseste GITHUB_TOKEN)
+permissions:
+  contents: read
+
 jobs:
   tests:
     runs-on: ubuntu-24.04

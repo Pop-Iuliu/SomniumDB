@@ -26,7 +26,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-9 | UndefinedBehaviorSanitizer in CI | 3. Find bugs first | DONE |
 | SEC-10 | Fuzz the RESP parser | 3. Find bugs first | DONE |
 | SEC-11 | Explicit build hardening | 3. Find bugs first | DONE |
-| SEC-12 | Least-privilege CI token | 3. Find bugs first | TODO |
+| SEC-12 | Least-privilege CI token | 3. Find bugs first | DONE |
 | SEC-13 | Remove the unused vendored `json.hpp` | 3. Find bugs first | TODO |
 | SEC-14 | `SECURITY.md` and a deployment checklist | 4. Process and transport | TODO |
 | SEC-15 | Encrypted transport through a tunnel (docs) | 4. Process and transport | TODO |
