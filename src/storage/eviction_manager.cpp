@@ -43,7 +43,7 @@ EvictionManager::EvictionManager() {
     if (const char* env = getenv("SOMNIUM_MAXMEMORY"); env && !fsutil::parse_u64(env, &max_bytes)) {
         fprintf(stderr, "SOMNIUM_MAXMEMORY invalid: '%s' (fara limita)\n", env);
     }
-    fd = ::open(kColdPath, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    fd = ::open(kColdPath, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0600);
     if (fd < 0) {
         fprintf(stderr, "Cold storage indisponibil (%s): cheile raman in RAM\n", strerror(errno));
     }
@@ -143,7 +143,7 @@ bool EvictionManager::for_each(
 }
 
 long long EvictionManager::compact(const long long now_ms) {
-    const int out = ::open(kColdTmp, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    const int out = ::open(kColdTmp, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0600);
     if (out < 0) {
         fprintf(stderr, "Compactare: nu pot crea %s: %s\n", kColdTmp, strerror(errno));
         return -1;

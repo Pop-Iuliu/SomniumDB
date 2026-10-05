@@ -53,12 +53,14 @@ private:
     };
 
     uint32_t node_id_ = 1;
+    std::string password_; // SOMNIUM_PASSWORD, aceeasi pe toate nodurile
     const std::atomic<uint64_t>& frontier_;
     std::vector<Peer> peers_;
     std::atomic<bool> running_{false};
     std::vector<std::thread> workers_;
 
     bool ship(Peer& peer); // true = peer-ul a raspuns (heartbeat)
+    bool authenticate(Peer& peer);
     void beat(Peer& peer);
     static void publish(const Peer& peer);
     bool deliver(Peer& peer, const std::string& out, size_t expected, size_t* acked);
