@@ -31,11 +31,13 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-14 | `SECURITY.md` and a deployment checklist | 4. Process and transport | DONE (#20) |
 | SEC-15 | Encrypted transport through a tunnel (docs) | 4. Process and transport | DONE (#21) (WireGuard run pending) |
 | SEC-16 | Native TLS | 4. Process and transport | DEFERRED (trigger below) |
-| SEC-17 | Really close dropped connections | 5. Audit 2026-10-05 | DONE |
-| SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | TODO |
+| SEC-17 | Really close dropped connections | 5. Audit 2026-10-05 | DONE (#22) |
+| SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | DONE |
 | SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | TODO |
 | SEC-20 | Rate-limit the failed `AUTH` log | 5. Audit 2026-10-05 | TODO |
 | SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | TODO |
+| SEC-22 | Cap the memory held by all client buffers | 6. Defence in depth | TODO |
+| SEC-23 | Fuzz command dispatch | 6. Defence in depth | TODO |
 
 ## Threat model
 
@@ -89,6 +91,13 @@ Rows 13 to 17 come from the second audit, on 2026-10-05 after PR #21 (see Phase 
 | 15 | `MGET` builds its whole reply before any output limit: after `SET k <8 MB>`, a 1.4 KB `MGET k k ...` (200 times) aborted the server with `std::bad_alloc` under a 1 GB memory limit. Authenticated clients only | `Database::handle_mget()` | SEC-19 |
 | 16 | Every failed `AUTH` writes a log line, without limit: 6,000 guesses in under a second wrote 6,000 lines. Unauthenticated | `main.cpp`, `authenticate()` | SEC-20 |
 | 17 | `tests/run_all.sh` exits 0 even when suites fail (`set -e` is ignored inside a function called from `if !`), so CI only catches failures in the last suite. `s9` and `s11` already fail on `main` unnoticed | `tests/run_all.sh` | SEC-21 |
+
+Rows 18 and 19 come from the review of what would remain after every step (2026-10-05). They are read from the code, not reproduced.
+
+| # | Gap | Where | Step |
+| --- | --- | --- | --- |
+| 18 | Client buffers have per-client caps (128 MB input, 32 MB output) but no total: 10,000 authenticated connections may hold up to about 1.6 TB, and none of it counts toward `SOMNIUM_MAXMEMORY` (unlimited by default anyway) | `main.cpp`, `drain_read()` / `enqueue_output()` | SEC-22 |
+| 19 | Only the RESP parsers are fuzzed. `Database::execute()`, which every authenticated command reaches, along with the room logic, the pool allocator and cold storage, is exercised only by the test suite | `src/core/database.cpp` | SEC-23 |
 
 ## Phase 1: Secure defaults
 
@@ -357,7 +366,7 @@ Every finding below was reproduced against a running server. The storage formats
 
 **Result:** before the fix, 10 such strangers added 320 MB and every connection stayed open. All three checks fail on the old binary and pass after the fix, in Release and under ASan + UBSan.
 
-**Files:** `main.cpp`, `tests/sec_test.py`.
+**Files:** `main.cpp`, `tests/sec_test.py`. Merged in PR #22.
 
 ### SEC-18: Time out connections that never authenticate
 
@@ -369,7 +378,20 @@ Every finding below was reproduced against a running server. The storage formats
 
 **Done when:** with `SOMNIUM_MAXCLIENTS=2` and two idle strangers, a legitimate client is accepted within 12 seconds.
 
-**Files:** `main.cpp`, `tests/sec_test.py`.
+**Files:** `main.cpp`, `README.md`, `tests/sec_test.py`.
+
+**Changes from the plan:**
+- The event loop now always waits at most 1 second (`io_uring_submit_and_wait_timeout`), and the sweep runs once per second.
+- There is no separate "password is set" switch: without a password every client starts authenticated, so the sweep never matches anything.
+
+**Result:**
+- **Test:** uses `SOMNIUM_MAXCLIENTS=3` with one authenticated client that then sits idle, plus two idle strangers.
+  - A new client is refused at first and admitted within 13 seconds.
+  - The strangers see their connection closed.
+  - The idle authenticated client is kept.
+- **Old binary:** the test fails, because the strangers hold their slots for good.
+- **Throughput:** `redis-benchmark` with 50 clients is unchanged within run-to-run noise (GET p50 0.431 ms on both).
+- **`s8` flake:** "rescrierea automata tine AOF-ul mic" failed 3 times in 13 runs with this change and once in 14 on `main`, and the last 8 runs of each were clean. It is timing-dependent (it counts the writes that land while the forked rewrite runs) and stays under SEC-21.
 
 ### SEC-19: Bound `MGET` replies
 
@@ -404,6 +426,37 @@ Every finding below was reproduced against a running server. The storage formats
 
 **Files:** `tests/run_all.sh`, plus the fixes.
 
+## Phase 6: Defence in depth
+
+Recommendations from the review of what would remain once every step is done. They are not reproduced vulnerabilities: authenticated clients are trusted. They limit the damage a bug or a misbehaving client can do. Do them after SEC-21, so CI gates them.
+
+### SEC-22: Cap the memory held by all client buffers
+
+**Why:** gap 18. The per-client caps stop one client, not many. This was on the deferred list ("counting client buffers in `SOMNIUM_MAXMEMORY`") and is promoted: SEC-17 showed how fast buffers add up, and a buggy application with many connections is enough to reach the limit.
+
+**Do:**
+1. In `main.cpp`, keep a running total of the bytes held in all clients' input and output buffers. Update it where they grow and shrink: `drain_read()`, `process_buffered()`, `enqueue_output()`, `flush_output()` and `schedule_close()`.
+2. A client whose read or reply would take the total over the budget is disconnected, as with the per-client caps.
+3. Budget: `SOMNIUM_MAX_CLIENT_BUFFERS`, default 1 GB. This is a setting because the right value depends on the host's RAM.
+
+**Done when:** with the budget at 48 MB, two authenticated slow clients that each try to queue 32 MB leave the total under the budget: the second one is disconnected, and the server keeps serving a third client.
+
+**Files:** `main.cpp`, `README.md`, `tests/sec_test.py`.
+
+### SEC-23: Fuzz command dispatch
+
+**Why:** gap 19. Most of the C++ code is past the parser. With SEC-2 a stranger cannot reach it, but a memory bug there is still a way for any authenticated client to crash the server or take it over.
+
+**Do:**
+1. Add `tests/fuzz_commands.cpp`. It turns the input into an argument list with `resp::parse_request` and runs `Database::execute()` on one `Database` that lives for the whole run, in a scratch working directory.
+2. Skip `REWRITEAOF`, which forks.
+3. Build it with the `Database` sources (no io_uring needed) in the `fuzz` CI job, with the same flags as SEC-10, and run it for 60 seconds.
+4. As in SEC-10, any crash becomes a regular test case before it is fixed.
+
+**Done when:** the fuzzer runs 60 seconds per CI run without findings, and a deliberately broken handler (for example an off-by-one in `MSET`'s argument loop) is caught.
+
+**Files:** `tests/fuzz_commands.cpp`, `.github/workflows/ci.yml`.
+
 ## Deferred (YAGNI)
 
 Each item comes back only when its trigger happens.
@@ -415,7 +468,6 @@ Each item comes back only when its trigger happens.
 | Separate peer credentials, authenticated `REPLFRONTIER` | Clients and replication peers living in different trust zones |
 | Rate limiting or lockout of failed `AUTH` attempts | The password port being exposed beyond localhost or a tunnel (prefer long random passwords first) |
 | Encryption at rest | A compliance requirement; until then use disk encryption (LUKS) |
-| Counting client buffers in `SOMNIUM_MAXMEMORY` | Memory exhaustion from client buffers in practice |
 | Fuzzing the snapshot loader and AOF recovery | After SEC-10 runs cleanly, or when either file format changes |
 | Audit logging of commands | A compliance requirement |
 | Static analysis (CodeQL) | After SEC-9 and SEC-10 run clean, as a cheap extra pass |

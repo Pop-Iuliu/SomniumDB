@@ -69,7 +69,7 @@ An embedded HTTP metrics server runs on `127.0.0.1:9090` (`/metrics`; the addres
 | `REWRITEAOF` | Rewrite the AOF as current state in the background: a forked child writes a copy-on-write snapshot while clients keep being served; `INFO` shows progress (also automatic, see below) |
 | `SUBSCRIBE channel [channel ...]`, `UNSUBSCRIBE [channel ...]`, `PUBLISH channel message` | Pub/Sub; `PING` and `UNSUBSCRIBE` also work while subscribed |
 | `PING [message]`, `ECHO message`, `QUIT` | Connection commands |
-| `AUTH [default] password` | Authenticate the connection when `SOMNIUM_PASSWORD` is set; until then only `AUTH`, `HELLO` and `QUIT` are accepted |
+| `AUTH [default] password` | Authenticate the connection when `SOMNIUM_PASSWORD` is set; until then only `AUTH`, `HELLO` and `QUIT` are accepted, and a connection that has not authenticated within 10 seconds is closed |
 | `HELLO [2\|3 [AUTH user pass] [SETNAME name]]` | Protocol negotiation (and authentication in the same step); `HELLO 3` switches the connection to RESP3 (nulls, maps, Pub/Sub pushes, normal commands while subscribed) |
 | `INFO`, `SAVE` | Server status, persistence health |
 

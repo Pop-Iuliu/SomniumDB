@@ -290,6 +290,35 @@ def sec17_dropped_clients(check):
         srv.cleanup()
 
 
+def sec18_auth_timeout(check):
+    srv = Server(env_extra={**ENV, "SOMNIUM_PASSWORD": PW, "SOMNIUM_MAXCLIENTS": "3"})
+
+    def joins():
+        c = Client(srv)
+        try:
+            return c.cmd("AUTH", PW) == ("ok", "OK")
+        except ConnectionError:
+            return False
+        finally:
+            c.close()
+
+    try:
+        srv.start()
+        member = Client(srv)
+        check("SEC-18: clientul autentificat intra", member.cmd("AUTH", PW) == ("ok", "OK"))
+        strangers = [srv.connect(timeout=15) for _ in range(2)]  # nu trimit nimic
+        t0 = time.time()
+        check("SEC-18: cu locurile ocupate, un client nou e refuzat", not joins())
+        check("SEC-18: dupa ~10 s strainii elibereaza locurile", wait_until(joins, 13), f"{time.time() - t0:.1f}s")
+        check("SEC-18: strainii au fost deconectati", all(s.recv(1) == b"" for s in strangers))
+        check("SEC-18: clientul autentificat inactiv ramane conectat", member.cmd("PING") == ("ok", "PONG"))
+        for s in strangers:
+            s.close()
+        member.close()
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
     run_with_retry(sec1_bind, fails)
@@ -302,6 +331,7 @@ def main():
     run_with_retry(sec7_max_rooms, fails)
     run_with_retry(sec8_metrics, fails)
     run_with_retry(sec17_dropped_clients, fails)
+    run_with_retry(sec18_auth_timeout, fails)
     report(fails, "sec")
 
 
