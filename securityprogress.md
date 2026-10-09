@@ -32,8 +32,8 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-15 | Encrypted transport through a tunnel (docs) | 4. Process and transport | DONE (#21) (WireGuard run pending) |
 | SEC-16 | Native TLS | 4. Process and transport | DEFERRED (trigger below) |
 | SEC-17 | Really close dropped connections | 5. Audit 2026-10-05 | DONE (#22) |
-| SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | DONE |
-| SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | TODO |
+| SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | DONE (#23) |
+| SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | DONE |
 | SEC-20 | Rate-limit the failed `AUTH` log | 5. Audit 2026-10-05 | TODO |
 | SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | TODO |
 | SEC-22 | Cap the memory held by all client buffers | 6. Defence in depth | TODO |
@@ -401,7 +401,13 @@ Every finding below was reproduced against a running server. The storage formats
 
 **Done when:** `MGET` of an 8 MB key repeated 200 times returns the error, and the server keeps serving.
 
-**Files:** `src/core/database.*`, `main.cpp`, `tests/sec_test.py`.
+**Files:** `src/core/database.*`, `main.cpp`, `README.md`, `tests/sec_test.py`.
+
+**Result:**
+- `Database::MAX_REPLY` (32 MB) is the cap, and `main.cpp` uses it as the client output cap.
+- `MGET` checks before appending each value, so the reply never grows past the cap.
+- Under a 1 GB memory limit, the request that used to abort the server now gets `-ERR reply too large`, and the server keeps answering.
+- An `MGET` of 16 MB still returns normally.
 
 ### SEC-20: Rate-limit the failed `AUTH` log
 

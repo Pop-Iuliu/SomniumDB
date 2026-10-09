@@ -319,6 +319,21 @@ def sec18_auth_timeout(check):
         srv.cleanup()
 
 
+def sec19_mget_reply(check):
+    srv = Server(env_extra=ENV)
+    try:
+        srv.start()
+        c = Client(srv)
+        big = "x" * (8 << 20)
+        c.cmd("SET", "k", big)
+        check("SEC-19: MGET sub cap merge", c.cmd("MGET", "k", "k") == ("array", [("bulk", big.encode())] * 2))
+        check("SEC-19: MGET amplificat e refuzat", c.cmd("MGET", *["k"] * 200) == ("err", "ERR reply too large"))
+        check("SEC-19: serverul continua", c.cmd("PING") == ("ok", "PONG"))
+        c.close()
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
     run_with_retry(sec1_bind, fails)
@@ -332,6 +347,7 @@ def main():
     run_with_retry(sec8_metrics, fails)
     run_with_retry(sec17_dropped_clients, fails)
     run_with_retry(sec18_auth_timeout, fails)
+    run_with_retry(sec19_mget_reply, fails)
     report(fails, "sec")
 
 

@@ -34,7 +34,7 @@ using namespace std;
 #define MAX_COMMANDS_PER_TURN 8192
 #define MAX_INPUT_BUFFER (128ull * 1024 * 1024)
 #define MAX_UNAUTH_BUFFER (16ull * 1024) // un strain nu are voie sa ne tina megaocteti (input sau output)
-#define MAX_CLIENT_OUTPUT (32ull * 1024 * 1024)
+#define MAX_CLIENT_OUTPUT Database::MAX_REPLY
 static constexpr auto AUTH_TIMEOUT = chrono::seconds(10); // SEC-18: cat poate tine un strain un loc
 
 static Database db;

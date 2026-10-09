@@ -140,6 +140,9 @@ private:
     }
 
 public:
+    // capul de output al unui client autentificat: un raspuns mai mare l-ar deconecta oricum
+    static constexpr size_t MAX_REPLY = 32ull * 1024 * 1024;
+
     Database();
     ~Database();
 
