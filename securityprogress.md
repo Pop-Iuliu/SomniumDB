@@ -32,7 +32,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-15 | Encrypted transport through a tunnel (docs) | 4. Process and transport | DONE (#21) (WireGuard run pending) |
 | SEC-16 | Native TLS | 4. Process and transport | DEFERRED (trigger below) |
 | SEC-17 | Really close dropped connections | 5. Audit 2026-10-05 | DONE (#22) |
-| SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | TODO |
+| SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | DONE |
 | SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | TODO |
 | SEC-20 | Rate-limit the failed `AUTH` log | 5. Audit 2026-10-05 | TODO |
 | SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | TODO |
@@ -378,7 +378,20 @@ Every finding below was reproduced against a running server. The storage formats
 
 **Done when:** with `SOMNIUM_MAXCLIENTS=2` and two idle strangers, a legitimate client is accepted within 12 seconds.
 
-**Files:** `main.cpp`, `tests/sec_test.py`.
+**Files:** `main.cpp`, `README.md`, `tests/sec_test.py`.
+
+**Changes from the plan:**
+- The event loop now always waits at most 1 second (`io_uring_submit_and_wait_timeout`), and the sweep runs once per second.
+- There is no separate "password is set" switch: without a password every client starts authenticated, so the sweep never matches anything.
+
+**Result:**
+- **Test:** uses `SOMNIUM_MAXCLIENTS=3` with one authenticated client that then sits idle, plus two idle strangers.
+  - A new client is refused at first and admitted within 13 seconds.
+  - The strangers see their connection closed.
+  - The idle authenticated client is kept.
+- **Old binary:** the test fails, because the strangers hold their slots for good.
+- **Throughput:** `redis-benchmark` with 50 clients is unchanged within run-to-run noise (GET p50 0.431 ms on both).
+- **`s8` flake:** "rescrierea automata tine AOF-ul mic" failed 3 times in 13 runs with this change and once in 14 on `main`, and the last 8 runs of each were clean. It is timing-dependent (it counts the writes that land while the forked rewrite runs) and stays under SEC-21.
 
 ### SEC-19: Bound `MGET` replies
 

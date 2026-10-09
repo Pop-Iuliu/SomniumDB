@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <csignal>
 #include <cerrno>
+#include <chrono>
 #include <liburing.h>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -34,6 +35,7 @@ using namespace std;
 #define MAX_INPUT_BUFFER (128ull * 1024 * 1024)
 #define MAX_UNAUTH_BUFFER (16ull * 1024) // un strain nu are voie sa ne tina megaocteti (input sau output)
 #define MAX_CLIENT_OUTPUT (32ull * 1024 * 1024)
+static constexpr auto AUTH_TIMEOUT = chrono::seconds(10); // SEC-18: cat poate tine un strain un loc
 
 static Database db;
 static string g_password; // SEC-2: SOMNIUM_PASSWORD; gol = fara autentificare
@@ -55,6 +57,7 @@ struct Client {
     bool write_armed = false;
     bool resp3 = false; // protocolul negociat prin HELLO
     bool authenticated = g_password.empty();
+    const chrono::steady_clock::time_point connected = chrono::steady_clock::now();
 
     explicit Client(int f) : fd(f) {}
     size_t pending_out() const { return out_buf.size() - out_off; }
@@ -359,6 +362,16 @@ static bool drain_read(const shared_ptr<Client>& c) {
     return true; // cap de input: restul asteapta urmatorul ciclu
 }
 
+// SEC-18: o conexiune care nu se autentifica la timp elibereaza locul (fara
+// parola toti clientii sunt autentificati, deci nu se inchide nimic)
+static void close_unauthenticated(const chrono::steady_clock::time_point now) {
+    vector<shared_ptr<Client>> late;
+    for (const auto& [fd, c] : clients) {
+        if (!c->authenticated && now - c->connected > AUTH_TIMEOUT) late.push_back(c);
+    }
+    for (const auto& c : late) schedule_close(c); // schedule_close modifica `clients`
+}
+
 // pompeaza inputul buffered ramas peste buget (declansat prin eventfd)
 static void pump_work() {
     vector<shared_ptr<Client>> snapshot;
@@ -460,6 +473,7 @@ int main() {
     replicator.start();
 
     bool first_wait = true; // doar prima asteptare e sensibila la CQE-uri pierdute
+    auto next_sweep = chrono::steady_clock::now();
 
     while (true) {
         submit_backlog(&ring);
@@ -481,9 +495,12 @@ int main() {
             }
             first_wait = false;
         } else {
-            ret = io_uring_submit_and_wait(&ring, 1);
+            // cel mult o secunda de asteptare: bucla trebuie sa ajunga la sweep-ul de mai jos
+            __kernel_timespec tick{1, 0};
+            io_uring_cqe *ready = nullptr;
+            ret = io_uring_submit_and_wait_timeout(&ring, &ready, 1, &tick, nullptr);
         }
-        if (ret < 0 && ret != -EINTR) {
+        if (ret < 0 && ret != -EINTR && ret != -ETIME) {
             cerr << "io_uring_submit_and_wait esuat: " << strerror(-ret) << "\n";
             continue;
         }
@@ -555,5 +572,10 @@ int main() {
         }
 
         io_uring_cq_advance(&ring, count);
+
+        if (const auto now = chrono::steady_clock::now(); now >= next_sweep) {
+            close_unauthenticated(now);
+            next_sweep = now + chrono::seconds(1);
+        }
     }
 }
