@@ -33,8 +33,8 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-16 | Native TLS | 4. Process and transport | DEFERRED (trigger below) |
 | SEC-17 | Really close dropped connections | 5. Audit 2026-10-05 | DONE (#22) |
 | SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | DONE (#23) |
-| SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | DONE |
-| SEC-20 | Rate-limit the failed `AUTH` log | 5. Audit 2026-10-05 | TODO |
+| SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | DONE (#24) |
+| SEC-20 | Rate-limit the failed `AUTH` log | 5. Audit 2026-10-05 | IMPLEMENTED (awaiting CI) |
 | SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | TODO |
 | SEC-22 | Cap the memory held by all client buffers | 6. Defence in depth | TODO |
 | SEC-23 | Fuzz command dispatch | 6. Defence in depth | TODO |
@@ -418,6 +418,12 @@ Every finding below was reproduced against a running server. The storage formats
 **Done when:** 1,000 failed `AUTH` attempts produce at most 2 log lines.
 
 **Files:** `main.cpp`, `tests/sec_test.py`.
+
+**Result:**
+- `authenticate()` only counts failures. The once-per-second sweep from SEC-18 prints `[AUTH] parole gresite: <n>` when the count is non-zero and resets it. No new timer, and no failure goes unlogged: the last ones appear at most a second later.
+- The line no longer names a client fd (SEC-2 logged one per failure): it covers every client in that second.
+- **Test:** 1,000 wrong passwords in batches of 100, so the replies stay under a stranger's 16 KB output cap. The logged counts must add up to 1,000, in at most 2 lines.
+- **Verification so far:** written on a machine without Linux, so not yet run against the real server. `main.cpp` compiles cleanly with GCC 13 (`-Wall -Wextra -Wformat=2`, stub headers for io_uring and sockets). The test was run against a mock server: it passes 3 times out of 3 with the new logging and fails both checks with the old one-line-per-failure logging. CI is the real check.
 
 ### SEC-21: Make the test runner fail on failing suites
 

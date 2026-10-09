@@ -39,6 +39,7 @@ static constexpr auto AUTH_TIMEOUT = chrono::seconds(10); // SEC-18: cat poate t
 
 static Database db;
 static string g_password; // SEC-2: SOMNIUM_PASSWORD; gol = fara autentificare
+static unsigned g_auth_failures = 0; // SEC-20: parole gresite inca nelogate
 static uint64_t g_maxclients = 10000; // SEC-6: SOMNIUM_MAXCLIENTS, ca Redis
 static Watchdog watchdog(db);
 
@@ -236,7 +237,7 @@ static bool credentials_ok(const string& user, const string& pass) {
 
 static string authenticate(Client& c, const string& user, const string& pass) {
     if (!credentials_ok(user, pass)) {
-        printf("[AUTH] fd %d: parola gresita\n", c.fd);
+        ++g_auth_failures; // logate agregat de sweep-ul din bucla
         return "-WRONGPASS invalid username-password pair\r\n";
     }
     c.authenticated = true;
@@ -575,6 +576,10 @@ int main() {
 
         if (const auto now = chrono::steady_clock::now(); now >= next_sweep) {
             close_unauthenticated(now);
+            if (g_auth_failures > 0) { // SEC-20: oricate ghiciri, cel mult o linie pe secunda
+                printf("[AUTH] parole gresite: %u\n", g_auth_failures);
+                g_auth_failures = 0;
+            }
             next_sweep = now + chrono::seconds(1);
         }
     }
