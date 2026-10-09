@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <climits>
+#include <thread>
 #include <fcntl.h>
 #include <sys/stat.h>
 
@@ -73,6 +74,25 @@ AOFManager::AOFManager() {
     if (const char* min = getenv("SOMNIUM_AOF_REWRITE_MIN_BYTES"); min && !fsutil::parse_u64(min, &rewrite_min_)) {
         fprintf(stderr, "SOMNIUM_AOF_REWRITE_MIN_BYTES invalid: '%s'\n", min);
     }
+    long long interval = 1000;
+    if (const char* env = getenv("SOMNIUM_AOF_SYNC_INTERVAL_MS"); env && !fsutil::parse_i64(env, &interval)) {
+        fprintf(stderr, "SOMNIUM_AOF_SYNC_INTERVAL_MS invalid: '%s' (folosesc 1000)\n", env);
+        interval = 1000;
+    }
+    if (interval < 1) interval = 1;
+    if (interval > 60000) interval = 60000;
+    sync_interval_ms_ = interval;
+    long long delay = 0;
+    if (const char* env = getenv("SOMNIUM_AOF_SYNC_DELAY_MS"); env && !fsutil::parse_i64(env, &delay)) {
+        fprintf(stderr, "SOMNIUM_AOF_SYNC_DELAY_MS invalid: '%s'\n", env);
+        delay = 0;
+    }
+    if (delay < 0 || delay > 60000) delay = 0;
+    sync_delay_ms_ = static_cast<int>(delay);
+    next_attempt_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(sync_interval_ms_);
+    if (sync_policy_ == SyncPolicy::Everysec) {
+        sync_thread_ = std::thread([this] { sync_worker(); });
+    }
 }
 
 void AOFManager::publish_sizes() const {
@@ -81,9 +101,10 @@ void AOFManager::publish_sizes() const {
 }
 
 AOFManager::~AOFManager() {
+    stop_sync_worker();
     std::lock_guard lock(mutex_);
     if (fd_ >= 0) {
-        if (sync_policy_ != SyncPolicy::Off && dirty_.load(std::memory_order_relaxed)) {
+        if (sync_policy_ != SyncPolicy::Off && size_.load(std::memory_order_relaxed) > synced_) {
             fsutil::sync_fd(fd_);
         }
         ::close(fd_);
@@ -128,31 +149,112 @@ std::string AOFManager::encode_record(const AofRecord& rec) {
     return out;
 }
 
+void AOFManager::publish_sync_locked() const {
+    const uint64_t size = size_.load(std::memory_order_relaxed);
+    global_metrics.aof_synced_bytes.store(synced_, std::memory_order_relaxed);
+    global_metrics.aof_pending_bytes.store(size > synced_ ? size - synced_ : 0, std::memory_order_relaxed);
+    global_metrics.aof_generation.store(generation_, std::memory_order_relaxed);
+    global_metrics.aof_last_sync_epoch_ms.store(static_cast<uint64_t>(std::max(0LL, last_sync_epoch_ms_)),
+                                                std::memory_order_relaxed);
+}
+
+void AOFManager::note_append_wait(const std::chrono::steady_clock::time_point start) const {
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    global_metrics.aof_append_lock_wait_us.store(static_cast<uint64_t>(us < 0 ? 0 : us), std::memory_order_relaxed);
+    if (us >= 50000) global_metrics.aof_append_lock_waits_slow.fetch_add(1, std::memory_order_relaxed);
+}
+
+void AOFManager::bump_generation_locked() {
+    ++generation_;
+}
+
+bool AOFManager::sync_fd_delayed(const int fd) const {
+    if (sync_delay_ms_ > 0) std::this_thread::sleep_for(std::chrono::milliseconds(sync_delay_ms_));
+    for (;;) {
+        if (::fdatasync(fd) == 0) return true;
+        if (errno != EINTR) return false;
+    }
+}
+
 bool AOFManager::sync_locked(const int fd) {
-    if (!fsutil::sync_fd(fd)) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!sync_fd_delayed(fd)) {
         healthy_ = false;
         fprintf(stderr, "AOF: fdatasync a esuat: %s (persistenta suspecta!)\n", strerror(errno));
         return false;
     }
-    last_sync_ms_.store(now_ms(), std::memory_order_relaxed);
+    const auto dur_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    global_metrics.aof_sync_duration_us.store(static_cast<uint64_t>(dur_us < 0 ? 0 : dur_us), std::memory_order_relaxed);
+    last_sync_epoch_ms_ = now_ms();
+    if (fd == fd_) synced_ = size_.load(std::memory_order_relaxed);
+    publish_sync_locked();
     return true;
 }
 
-// presupune mutex_ deja prins (chemata din watchdog si din append la always)
-void AOFManager::sync_due_locked() {
-    if (sync_policy_ != SyncPolicy::Everysec) return;
-    if (fd_ < 0 || !dirty_.load(std::memory_order_relaxed)) return;
-    if (now_ms() - last_sync_ms_.load(std::memory_order_relaxed) < 1000) return;
-
-    if (sync_locked(fd_)) dirty_.store(false, std::memory_order_relaxed);
+void AOFManager::stop_sync_worker() {
+    {
+        std::lock_guard lock(mutex_);
+        sync_stop_ = true;
+    }
+    sync_cv_.notify_all();
+    if (sync_thread_.joinable()) sync_thread_.join();
 }
 
-void AOFManager::sync_if_due() {
-    if (sync_policy_ != SyncPolicy::Everysec) return;
-    if (!dirty_.load(std::memory_order_relaxed)) return;
+void AOFManager::sync_worker() {
+    std::unique_lock lock(mutex_);
+    while (true) {
+        if (fd_ < 0 || size_.load(std::memory_order_relaxed) <= synced_) {
+            if (sync_stop_) break;
+            sync_cv_.wait(lock, [&] {
+                return sync_stop_ || (fd_ >= 0 && size_.load(std::memory_order_relaxed) > synced_);
+            });
+            continue;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!sync_stop_ && now < next_attempt_) {
+            sync_cv_.wait_until(lock, next_attempt_, [&] { return sync_stop_; });
+            continue;
+        }
 
-    std::lock_guard lock(mutex_);
-    sync_due_locked();
+        const uint64_t generation = generation_;
+        const uint64_t offset = size_.load(std::memory_order_relaxed);
+        const int dupfd = fd_ >= 0 ? ::fcntl(fd_, F_DUPFD_CLOEXEC, 0) : -1;
+        const auto started = std::chrono::steady_clock::now();
+        lock.unlock();
+
+        global_metrics.aof_sync_inflight.store(1, std::memory_order_release);
+        const bool ok = dupfd >= 0 && sync_fd_delayed(dupfd);
+        const int sync_errno = errno;
+        const auto dur_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        if (dupfd >= 0) ::close(dupfd);
+
+        lock.lock();
+        global_metrics.aof_sync_inflight.store(0, std::memory_order_release);
+        global_metrics.aof_sync_duration_us.store(static_cast<uint64_t>(dur_us < 0 ? 0 : dur_us),
+                                                  std::memory_order_relaxed);
+        if (dur_us > sync_interval_ms_ * 1000) {
+            global_metrics.aof_sync_overruns.fetch_add(1, std::memory_order_relaxed);
+        }
+        // doar generatia capturata: un fd inlocuit intre timp nu marcheaza fisierul nou
+        if (dupfd >= 0 && generation == generation_) {
+            if (!ok) {
+                healthy_ = false;
+                fprintf(stderr, "AOF: fdatasync a esuat: %s (persistenta suspecta!)\n", strerror(sync_errno));
+            } else if (offset > synced_) {
+                synced_ = offset;
+                last_sync_epoch_ms_ = now_ms();
+            }
+        }
+        publish_sync_locked();
+
+        auto next = started + std::chrono::milliseconds(sync_interval_ms_);
+        const auto finished = std::chrono::steady_clock::now();
+        if (next < finished) next = finished;
+        next_attempt_ = next;
+    }
 }
 
 bool AOFManager::open_file() {
@@ -166,32 +268,53 @@ bool AOFManager::open_file() {
         return false;
     }
 
-    // fisier nou: header de format, ca deschiderile viitoare sa nu mai
-    // ghiceasca nimic din continut
     struct stat sb{};
     const bool has_size = ::fstat(fd_, &sb) == 0;
+    bump_generation_locked();
+    // fisier nou: header de format, ca deschiderile viitoare sa nu mai
+    // ghiceasca nimic din continut
     if (has_size && sb.st_size == 0) {
-        if (!fsutil::write_all(fd_, kAofHeader, sizeof(kAofHeader) - 1) || !sync_locked(fd_)) {
+        size_ = 0;
+        if (!fsutil::write_all(fd_, kAofHeader, sizeof(kAofHeader) - 1)) {
             fprintf(stderr, "AOF: nu pot scrie headerul v3\n");
             healthy_ = false;
             ::close(fd_);
             fd_ = -1;
             return false;
         }
+        size_ = sizeof(kAofHeader) - 1;
+        if (!sync_locked(fd_)) {
+            fprintf(stderr, "AOF: nu pot scrie headerul v3\n");
+            ::close(fd_);
+            fd_ = -1;
+            return false;
+        }
         fsutil::sync_dir();
+        publish_sync_locked();
+    } else {
+        // continutul deja pe disc e baza; coada pierduta la crash e contractul everysec
+        size_ = has_size && sb.st_size > 0 ? static_cast<uint64_t>(sb.st_size) : 0;
+        synced_ = size_.load(std::memory_order_relaxed);
+        publish_sync_locked();
     }
 
     // ca Redis: dimensiunea de la pornire e baza pentru rescrierea automata
-    size_ = has_size && sb.st_size > 0 ? static_cast<uint64_t>(sb.st_size) : sizeof(kAofHeader) - 1;
     base_size_ = size_.load();
     publish_sizes();
-    printf("AOF: format v3, politica durabilitate: %s\n", policy_name());
+    if (sync_policy_ == SyncPolicy::Everysec) {
+        printf("AOF: format v3, politica durabilitate: everysec (thread dedicat, interval %lld ms)\n",
+               sync_interval_ms_);
+    } else {
+        printf("AOF: format v3, politica durabilitate: %s\n", policy_name());
+    }
     return true;
 }
 
 bool AOFManager::append(const std::string& room_name, const std::vector<std::string>& args,
                         const long long expire_at, const uint64_t timestamp_ms, const uint32_t node_id) {
+    const auto wait_t0 = std::chrono::steady_clock::now();
     std::lock_guard lock(mutex_);
+    note_append_wait(wait_t0);
     if (replaying_) return false;
 
     AofRecord rec;
@@ -208,6 +331,8 @@ bool AOFManager::append(const std::string& room_name, const std::vector<std::str
             healthy_ = false;
             return false;
         }
+        bump_generation_locked();
+        synced_ = 0;
         healthy_ = true;
     }
 
@@ -216,23 +341,26 @@ bool AOFManager::append(const std::string& room_name, const std::vector<std::str
         fprintf(stderr, "AOF: scriere esuata: %s (mutatia exista doar in RAM!)\n", strerror(errno));
         ::close(fd_);
         fd_ = -1;
+        bump_generation_locked();
+        publish_sync_locked();
         return false;
     }
     size_.fetch_add(data.size(), std::memory_order_relaxed);
     publish_sizes();
+    publish_sync_locked();
 
     switch (sync_policy_) {
         case SyncPolicy::Always:
+            // ack-ul asteapta fdatasync-ul; lock-ul ramane prins intentionat
             if (!sync_locked(fd_)) return false;
             break;
         case SyncPolicy::Everysec:
-            // sincronizarea in "cel mult o secunda" o face watchdog-ul, nu
-            // thread-ul de comenzi: un fdatasync lent (disc ocupat) nu are
-            // voie sa ingheate clientii
-            dirty_.store(true, std::memory_order_relaxed);
+            // thread-ul dedicat sincronizeaza in afara acestui lock. Un fdatasync
+            // lent nu are voie sa intarzie append-ul. Octetii scrisi dupa offsetul
+            // capturat raman pending pana la sincronizarea urmatoare.
+            sync_cv_.notify_one();
             break;
         default:
-            dirty_.store(true, std::memory_order_relaxed);
             break;
     }
     return true;
@@ -389,6 +517,7 @@ bool AOFManager::append_rewrite(const AofRecord& rec) {
 }
 
 void AOFManager::abort_locked() {
+    last_tail_ = 0;
     if (rewrite_fd_ >= 0) {
         ::close(rewrite_fd_);
         rewrite_fd_ = -1;
@@ -410,6 +539,7 @@ bool AOFManager::append_tail(const uint64_t from) {
 
     std::string buf(1 << 16, '\0');
     const uint64_t end = size_.load(std::memory_order_relaxed);
+    last_tail_ = end >= from ? end - from : 0;
     bool ok = true;
     for (uint64_t off = from; ok && off < end;) {
         const size_t n = static_cast<size_t>(std::min<uint64_t>(buf.size(), end - off));
@@ -455,11 +585,22 @@ bool AOFManager::commit_rewrite() {
         fd_ = -1;
     }
     fd_ = ::open(kAofPath, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    // generatie noua: o sincronizare in zbor pe fd-ul vechi nu marcheaza fisierul nou
+    bump_generation_locked();
     healthy_ = fd_ >= 0;
     needs_rewrite_ = false;
     size_ = written;
-    base_size_ = written;
+    // baza e instantaneul, nu fisierul cu coada: daca scrierile din timpul
+    // copilului au umflat rezultatul, urmatoarea comanda mai rescrie o data
+    const uint64_t snapshot = written >= last_tail_ ? written - last_tail_ : written;
+    base_size_ = snapshot == 0 ? 1 : snapshot;
+    last_tail_ = 0;
+    // rewrite_fd_ a fost deja fdatasync-uit inainte de rename; acel inode e durabil
+    synced_ = healthy_ ? written : 0;
+    last_sync_epoch_ms_ = healthy_ ? now_ms() : last_sync_epoch_ms_;
+    publish_sync_locked();
     publish_sizes();
+    sync_cv_.notify_all();
     printf("AOF: rescriere finalizata (%llu octeti)\n", static_cast<unsigned long long>(written));
     return healthy_;
 }

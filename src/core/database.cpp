@@ -943,6 +943,11 @@ std::string Database::handle_info() {
         "Rescriere AOF: " + (rewrite_child_ > 0 ? "in curs" : "inactiva") + "\n" +
         "Comenzi procesate: " + std::to_string(total_commands.load(std::memory_order_relaxed)) + "\n" +
         "AOF: " + std::string(aof.policy_name()) + (aof.healthy() ? " (sanatos)" : " (ERORI SCRIERE)") + "\n" +
+        "AOF sync: age=" + std::to_string(aof_sync_age_ms()) + "ms pending=" +
+        std::to_string(global_metrics.aof_pending_bytes.load(std::memory_order_relaxed)) +
+        " duration_us=" + std::to_string(global_metrics.aof_sync_duration_us.load(std::memory_order_relaxed)) +
+        " overruns=" + std::to_string(global_metrics.aof_sync_overruns.load(std::memory_order_relaxed)) +
+        " inflight=" + std::to_string(global_metrics.aof_sync_inflight.load(std::memory_order_relaxed)) + "\n" +
         peers_report(false);
 
     return bulk_string(info_text);

@@ -370,3 +370,7 @@ P0 fixes a live convergence bug and a replication stall. P1 closes the replicati
 - A Zipf workload with periodic scans shows a higher RAM hit ratio than before.
 
 **Primary files:** `src/storage/eviction_manager.*`, `src/utils/count_min_sketch.h`, `src/core/database.cpp`.
+
+## S18 - Operational: Keep Durability Off the Append Lock
+
+**Status: DONE.** `everysec` no longer fsyncs on the watchdog, and no longer holds the append mutex during `fdatasync`. A dedicated thread captures a duplicated descriptor, the file generation and the appended offset, syncs outside the lock, and publishes that prefix only if the generation is unchanged. Writes that arrive during the sync stay pending until a later successful sync. `always` still waits for its own sync before acknowledging. Sync age, pending bytes, duration, overruns and append-lock waits are in `INFO` and `/metrics`. The interval (`SOMNIUM_AOF_SYNC_INTERVAL_MS`, default 1000) is a target, not a strict power-loss window when storage stalls. Because appends no longer stall behind fsync, a background rewrite can carry a large tail; its base size is the snapshot, so the next command rewrites again until the tail is gone. Tests: `tests/s18_test.py`.

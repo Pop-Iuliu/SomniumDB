@@ -1,10 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 // O mutatie persistata: comanda tintita intr-o camera plus starea REZULTATA.
@@ -32,8 +35,11 @@ struct AofRecord {
 class AOFManager {
 public:
     // Politica de durabilitate (SOMNIUM_AOF_SYNC):
-    //   always   - fdatasync dupa fiecare comanda (durabilitate maxima, lent)
-    //   everysec - fdatasync la cel mult o secunda (default, ca Redis)
+    //   always   - fdatasync dupa fiecare comanda, inainte de ack (durabilitate maxima, lent)
+    //   everysec - fdatasync pe un thread dedicat, la intervalul tinta
+    //              SOMNIUM_AOF_SYNC_INTERVAL_MS (implicit 1000). Nu e o fereastra
+    //              stricta de o secunda: daca fdatasync depaseste intervalul, pierderea
+    //              posibila creste si overrun-ul apare in metrici
     //   no       - niciodata explicit; doar page cache (pierdere la pana de curent)
     enum class SyncPolicy { Always, Everysec, Off };
 
@@ -82,10 +88,6 @@ public:
         return size >= rewrite_min_ && size >= 2 * base_size_.load(std::memory_order_relaxed);
     }
 
-    // Sincronizare granulata pentru politica everysec; apelata din watchdog
-    // (thread-ul de comenzi nu blocheaza niciodata pe fdatasync).
-    void sync_if_due();
-
     bool healthy() const { return healthy_; }
     SyncPolicy policy() const { return sync_policy_; }
     const char* policy_name() const;
@@ -95,19 +97,34 @@ private:
     int rewrite_fd_ = -1;  // appendonly.aof.tmp, doar in timpul migrarii
     SyncPolicy sync_policy_;
     std::mutex mutex_;
-    std::atomic<bool> dirty_{false};
-    std::atomic<long long> last_sync_ms_{0};
+    std::condition_variable sync_cv_;
+    std::thread sync_thread_;
+    bool sync_stop_ = false;
+    // generatia creste la fiecare inlocuire a fd-ului. O sincronizare pornita pe
+    // generatia veche nu are voie sa marcheze generatia noua ca durabila.
+    uint64_t generation_ = 0;
+    uint64_t synced_ = 0; // prefixul durabil al generatiei curente
+    long long last_sync_epoch_ms_ = 0;
+    long long sync_interval_ms_ = 1000;
+    int sync_delay_ms_ = 0; // SOMNIUM_AOF_SYNC_DELAY_MS: intarziere de test in fdatasync
+    std::chrono::steady_clock::time_point next_attempt_{};
     std::atomic<bool> healthy_{true}; // citit fara mutex de thread-ul de comenzi
     bool needs_rewrite_ = false;
     std::atomic<uint64_t> size_{0};      // octetii fisierului curent
     std::atomic<uint64_t> base_size_{0}; // dimensiunea dupa ultima rescriere (sau la pornire)
+    uint64_t last_tail_ = 0;             // coada copiata peste instantaneu, la ultima rescriere
     uint64_t rewrite_min_ = 64ull << 20;
 
     void publish_sizes() const;
+    void publish_sync_locked() const; // presupune mutex_ prins
     bool replaying_ = true;
 
     static long long now_ms();
-    bool sync_locked(int fd);
-    void sync_due_locked();
+    bool sync_fd_delayed(int fd) const;
+    bool sync_locked(int fd); // fdatasync sub mutex; doar always si pornirea
+    void note_append_wait(std::chrono::steady_clock::time_point start) const;
+    void bump_generation_locked();
+    void sync_worker();
+    void stop_sync_worker();
     void abort_locked(); // elibereaza rewrite_fd_ + tmp; presupune mutex_ prins
 };

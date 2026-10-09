@@ -160,9 +160,6 @@ public:
     // versiunea pana la care toate scrierile locale sunt deja in AOF (pentru REPLFRONTIER)
     const std::atomic<uint64_t>& replication_frontier() const { return frontier_; }
 
-    // sincronizare AOF granulata (politica everysec); apelata de watchdog
-    void sync_aof_if_due() { aof.sync_if_due(); }
-
     void hibernate_inactive_rooms();
     void clean_expired_keys();
     void cleanup_client(int client_fd);
