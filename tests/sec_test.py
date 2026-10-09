@@ -2,6 +2,7 @@
 
 import glob
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -334,6 +335,23 @@ def sec19_mget_reply(check):
         srv.cleanup()
 
 
+def sec20_auth_log(check):
+    srv = Server(env_extra={**ENV, "SOMNIUM_PASSWORD": PW})
+    logged = lambda: [int(n) for n in re.findall(r"\[AUTH\] parole gresite: (\d+)", server_log(srv))]
+    try:
+        srv.start()
+        c = Client(srv)
+        for _ in range(10):  # loturi de 100: raspunsurile unui strain incap in capul de 16 KB
+            c.s.sendall(resp_cmd("AUTH", "nope") * 100)
+            for _ in range(100):
+                c.read_reply()
+        check("SEC-20: toate cele 1000 de esecuri sunt numarate", wait_until(lambda: sum(logged()) == 1000, 3), logged())
+        check("SEC-20: ...in cel mult 2 linii de log", server_log(srv).count("[AUTH]") <= 2, logged())
+        c.close()
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
     run_with_retry(sec1_bind, fails)
@@ -348,6 +366,7 @@ def main():
     run_with_retry(sec17_dropped_clients, fails)
     run_with_retry(sec18_auth_timeout, fails)
     run_with_retry(sec19_mget_reply, fails)
+    run_with_retry(sec20_auth_log, fails)
     report(fails, "sec")
 
 
