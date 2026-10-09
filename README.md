@@ -54,7 +54,7 @@ An embedded HTTP metrics server runs on `127.0.0.1:9090` (`/metrics`; the addres
 | --- | --- |
 | `GET key`, `DEL key` | Read or delete; both see keys in cold storage |
 | `SET key value [NX\|XX] [EX seconds\|PX milliseconds]` | Conditional and expiring writes, strictly validated; a failed condition replies nil and writes nothing |
-| `MGET key [key ...]`, `MSET key value [key value ...]` | Multi-key read and atomic multi-key write (one AOF record) |
+| `MGET key [key ...]`, `MSET key value [key value ...]` | Multi-key read and atomic multi-key write (one AOF record); an `MGET` reply over 32 MB is refused with `-ERR reply too large` |
 | `EXISTS key [key ...]` | Number of existing keys; repeated keys count each time |
 | `EXPIRE key seconds [NX\|XX\|GT\|LT]`, `PEXPIRE key ms [...]`, `PERSIST key` | Set or remove a deadline (Redis 7 options; no deadline counts as infinite); a non-positive TTL deletes the key |
 | `TTL key`, `PTTL key` | Remaining lifetime; `-1` persistent, `-2` missing |

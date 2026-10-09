@@ -690,6 +690,8 @@ std::string Database::handle_mget(const std::string& room_name, Room& room, cons
             out += nil();
             continue;
         }
+        // SEC-19: aceeasi cheie mare repetata ar construi gigaocteti dintr-o cerere mica
+        if (out.size() + r->value.size() > MAX_REPLY) return "-ERR reply too large\r\n";
         eviction.record_access(args[i]);
         out += bulk_string(r->value);
     }
