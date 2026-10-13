@@ -35,9 +35,9 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | DONE (#23) |
 | SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | DONE (#24) |
 | SEC-20 | Rate-limit the failed `AUTH` log | 5. Audit 2026-10-05 | DONE (#25) |
-| SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | IMPLEMENTED (awaiting CI) |
+| SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | DONE (#26) |
 | SEC-22 | Cap the memory held by all client buffers | 6. Defence in depth | TODO |
-| SEC-23 | Fuzz command dispatch | 6. Defence in depth | TODO |
+| SEC-23 | Fuzz command dispatch | 6. Defence in depth | IMPLEMENTED (awaiting CI) |
 
 ## Threat model
 
@@ -476,6 +476,18 @@ Recommendations from the review of what would remain once every step is done. Th
 **Done when:** the fuzzer runs 60 seconds per CI run without findings, and a deliberately broken handler (for example an off-by-one in `MSET`'s argument loop) is caught.
 
 **Files:** `tests/fuzz_commands.cpp`, `.github/workflows/ci.yml`.
+
+**Order:** done before SEC-22, at the maintainer's request. SEC-22 stays open.
+
+**Result:**
+- **Harness:** one `Database` for the whole run, created on the first input in a temporary directory. Each input is one connection: every complete command in it (RESP or inline) goes through `execute()` on one fd, then `cleanup_client()`, as on a disconnect. That also resets the room and subscribe state, so one `SUBSCRIBE` cannot block the rest of the run.
+- **Environment, set before the `Database` exists:**
+  - `SOMNIUM_AOF_REWRITE_MIN_BYTES` at its maximum, so the automatic rewrite never forks (`REWRITEAOF` itself is skipped);
+  - `SOMNIUM_AOF_SYNC=no`, to avoid fsyncs;
+  - `SOMNIUM_MAXMEMORY` of 16 MB, which keeps RSS bounded and sends keys to cold storage, so eviction is fuzzed too.
+- **Pub/sub:** the harness sets a no-op message sink. `PUBLISH` to a subscriber calls the sink unchecked, and only `main.cpp` sets one.
+- **CI:** a second step in the `fuzz` job, with the SEC-10 flags plus `-D_GLIBCXX_ASSERTIONS`. ASan alone misses `args[i]` read past `size()` but inside the vector's capacity, which is exactly what an argument-loop off-by-one does. `-close_fd_mask=1` silences the server's stdout logs; crash reports go to stderr.
+- **Verification so far:** no libFuzzer on the machine it was written on. The harness compiles and links with GCC 13 against every listed source (stub headers for POSIX), so the CI file list is complete. A small driver standing in for libFuzzer ran six inputs (`SET`/`GET`, `MSET`/`MGET`, `SUBSCRIBE` plus `PUBLISH`, hibernate and wake, a skipped `REWRITEAOF`, RESP with `EXPIRE`/`TTL`) without errors. With the second `MSET` loop broken to `i <= args.size()`, the same driver aborts on the `_GLIBCXX_ASSERTIONS` bounds check. Whether libFuzzer reaches the broken `MSET` within 60 seconds, and the 60 second clean run itself, are left to CI.
 
 ## Deferred (YAGNI)
 
