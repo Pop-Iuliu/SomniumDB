@@ -12,6 +12,7 @@ permissions:
 jobs:
   tests:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20 # un test blocat pica repede, cu log, in loc de 6 ore
     steps:
       - uses: actions/checkout@v4
 
@@ -52,6 +53,8 @@ jobs:
           cmake --build build-asan
 
       - name: Teste impotriva buildului ASan
+        env:
+          PYTHONUNBUFFERED: 1 # fiecare PASS/FAIL apare in log imediat, nu la iesirea suitei
         run: tests/run_all.sh build-asan/Redis
 
   tsan:
