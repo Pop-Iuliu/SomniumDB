@@ -36,7 +36,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | DONE (#24) |
 | SEC-20 | Rate-limit the failed `AUTH` log | 5. Audit 2026-10-05 | DONE (#25) |
 | SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | DONE (#26) |
-| SEC-22 | Cap the memory held by all client buffers | 6. Defence in depth | IMPLEMENTED (awaiting CI) |
+| SEC-22 | Cap the memory held by all client buffers | 6. Defence in depth | DONE (#28) |
 | SEC-23 | Fuzz command dispatch | 6. Defence in depth | DONE (#27) |
 
 ## Threat model
@@ -444,7 +444,7 @@ Every finding below was reproduced against a running server. The storage formats
   - `s9` "zero dupa hibernare" (1210 bytes left): a server bug. `INFO` ran inside the client's room, so after `ROOM.HIBERNATE` of the current room the test's `INFO` woke it again. `INFO` reads only global counters, so it now runs before any room is selected and never wakes a room (`Database::execute()`).
   - `s11` "versiunea redata dupa restart": a test bug. The check re-sent a version computed again from the clock (`now + 5 s`), which after the restart is newer than the stored one, so the server correctly accepted it. The test now re-sends the same version, as does the related check before the restart, which only passed when both calls landed in the same millisecond.
   - `s12` "peer-ul inaccesibil: phi infinit si lag pozitiv" (lag 0): a reporting bug. `ship()` computed an unreachable peer's lag before connecting, but published it only after the 2 second connect timeout, so `INFO` showed the startup value 0 until then. It now publishes right after computing the lag.
-- **Verification so far:** `database.cpp` and `replicator.cpp` compile cleanly with GCC 13 (stub headers). The suites themselves need Linux, so CI on this PR is the real check. `s8` did not fail in the run that was read.
+- **Verification:** CI on PR #26 was green, so every suite, including `s9`, `s11` and `s12`, now passes and gates CI. `s8` did not fail in that run.
 
 ## Phase 6: Defence in depth
 
@@ -469,7 +469,7 @@ Recommendations from the review of what would remain once every step is done. Th
 - The budget is checked only where buffers grow: before a reply is queued, and after each 16 KB read. Either way the client is disconnected with a `[ClientBuffers]` log line.
 - **Test:** two slow clients each ask for 31 replies of 1 MB (one `GET` each, under the 32 MB per-client cap) and never read. The budget is 32 MB instead of the planned 48 MB: the server queues all of a client's replies before flushing, and sent output counts until the buffer drains, so the first client holds 32,506,259 bytes (under the budget) and the second goes over on its second reply, however much the kernel buffers. The test checks that exactly one client is disconnected, that the first one then reads all 31 replies (so the dropped one was the second), and that a third client still gets `PONG`.
 - **First CI runs hung:** an earlier version shrank the slow clients' receive buffer to 4 KB so the kernel could not absorb their replies, then read 31 MB back through it. That trickles on Linux even after the buffer is raised again, without ever tripping the 10 second socket timeout. The live log (now unbuffered, see below) showed the drop check passing and the read hanging. The CI `tests` job now prints test output as it happens (`PYTHONUNBUFFERED`) and times out after 20 minutes.
-- **Verification so far:** `main.cpp` compiles cleanly with GCC 13 (`-Wall -Wextra -Wformat=2`, stub headers). The server and the test need Linux, so CI on this PR is the first real run.
+- **Verification:** CI on PR #28 was green, with all three SEC-22 checks passing under ASan + UBSan.
 
 ### SEC-23: Fuzz command dispatch
 
@@ -495,7 +495,7 @@ Recommendations from the review of what would remain once every step is done. Th
   - `SOMNIUM_MAXMEMORY` of 16 MB, which keeps RSS bounded and sends keys to cold storage, so eviction is fuzzed too.
 - **Pub/sub:** the harness sets a no-op message sink. `PUBLISH` to a subscriber calls the sink unchecked, and only `main.cpp` sets one.
 - **CI:** a second step in the `fuzz` job, with the SEC-10 flags plus `-D_GLIBCXX_ASSERTIONS`. ASan alone misses `args[i]` read past `size()` but inside the vector's capacity, which is exactly what an argument-loop off-by-one does. `-close_fd_mask=1` silences the server's stdout logs; crash reports go to stderr.
-- **Verification so far:** no libFuzzer on the machine it was written on. The harness compiles and links with GCC 13 against every listed source (stub headers for POSIX), so the CI file list is complete. A small driver standing in for libFuzzer ran six inputs (`SET`/`GET`, `MSET`/`MGET`, `SUBSCRIBE` plus `PUBLISH`, hibernate and wake, a skipped `REWRITEAOF`, RESP with `EXPIRE`/`TTL`) without errors. With the second `MSET` loop broken to `i <= args.size()`, the same driver aborts on the `_GLIBCXX_ASSERTIONS` bounds check. Whether libFuzzer reaches the broken `MSET` within 60 seconds, and the 60 second clean run itself, are left to CI.
+- **Verification so far:** no libFuzzer on the machine it was written on. The harness compiles and links with GCC 13 against every listed source (stub headers for POSIX), so the CI file list is complete. A small driver standing in for libFuzzer ran six inputs (`SET`/`GET`, `MSET`/`MGET`, `SUBSCRIBE` plus `PUBLISH`, hibernate and wake, a skipped `REWRITEAOF`, RESP with `EXPIRE`/`TTL`) without errors. With the second `MSET` loop broken to `i <= args.size()`, the same driver aborts on the `_GLIBCXX_ASSERTIONS` bounds check. CI on PR #27 was green: the 60 second run found nothing. Whether libFuzzer itself reaches the broken `MSET` within 60 seconds was not tried in CI; the driver check above is the evidence for that part.
 
 ## Deferred (YAGNI)
 
