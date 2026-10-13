@@ -41,6 +41,8 @@ static Database db;
 static string g_password; // SEC-2: SOMNIUM_PASSWORD; gol = fara autentificare
 static unsigned g_auth_failures = 0; // SEC-20: parole gresite inca nelogate
 static uint64_t g_maxclients = 10000; // SEC-6: SOMNIUM_MAXCLIENTS, ca Redis
+static uint64_t g_max_client_buffers = 1ull << 30; // SEC-22: SOMNIUM_MAX_CLIENT_BUFFERS
+static uint64_t g_client_buffers = 0; // SEC-22: octetii din bufferele tuturor clientilor
 static Watchdog watchdog(db);
 
 // S3 "naigie": calutul de munca care nu se opreste pentru niciun client.
@@ -58,6 +60,7 @@ struct Client {
     bool write_armed = false;
     bool resp3 = false; // protocolul negociat prin HELLO
     bool authenticated = g_password.empty();
+    size_t held = 0; // cat din g_client_buffers e al acestui client
     const chrono::steady_clock::time_point connected = chrono::steady_clock::now();
 
     explicit Client(int f) : fd(f) {}
@@ -65,6 +68,20 @@ struct Client {
     size_t input_cap() const { return authenticated ? MAX_INPUT_BUFFER : MAX_UNAUTH_BUFFER; }
     size_t output_cap() const { return authenticated ? MAX_CLIENT_OUTPUT : MAX_UNAUTH_BUFFER; }
 };
+
+// SEC-22: aduce totalul la zi dupa orice schimbare a bufferelor clientului.
+// out_buf numara si partea deja trimisa: ramane alocata pana la golire.
+static void track(Client& c) {
+    const size_t now = c.closed ? 0 : c.in_buf.size() + c.out_buf.size();
+    g_client_buffers = g_client_buffers - c.held + now;
+    c.held = now;
+}
+
+static bool over_buffer_budget(const Client& c, const size_t extra) {
+    if (g_client_buffers + extra <= g_max_client_buffers) return false;
+    printf("[ClientBuffers] FD %d: bufferele clientilor depasesc SOMNIUM_MAX_CLIENT_BUFFERS. Deconectat.\n", c.fd);
+    return true;
+}
 
 // un PollTicket zboara cu fiecare poll armat in ring; shared_ptr tine clientul
 // viu pana la CQE, chiar daca intre timp a fost deconectat
@@ -90,6 +107,7 @@ static void set_nonblocking(const int fd) {
 static void schedule_close(const shared_ptr<Client>& c) {
     if (c->closed) return;
     c->closed = true;
+    track(*c);
     if (g_trace == -2 || g_trace == c->fd)
         printf("[TRACE] fd %d CLOSE\n", c->fd);
     db.cleanup_client(c->fd);
@@ -183,6 +201,7 @@ static FlushResult flush_output(Client& c) {
     }
     c.out_buf.clear();
     c.out_off = 0;
+    track(c);
     return FlushResult::Complete;
 }
 
@@ -195,7 +214,12 @@ static bool enqueue_output(const shared_ptr<Client>& c, const string& data) {
         schedule_close(c);
         return false;
     }
+    if (over_buffer_budget(*c, data.size())) {
+        schedule_close(c);
+        return false;
+    }
     c->out_buf += data;
+    track(*c);
     return true;
 }
 
@@ -325,6 +349,7 @@ static bool process_buffered(const shared_ptr<Client>& c) {
         if (!response.empty() && !enqueue_output(c, response)) return false; // deconectat (cap output)
     }
     c->in_buf.erase(0, pos);
+    track(*c);
 
     // ca Redis: dupa QUIT sau o eroare de protocol (inputul nu mai poate fi
     // resincronizat) trimitem ultimul raspuns si inchidem
@@ -352,6 +377,8 @@ static bool drain_read(const shared_ptr<Client>& c) {
         const ssize_t n = read(c->fd, temp, sizeof(temp));
         if (n > 0) {
             c->in_buf.append(temp, static_cast<size_t>(n));
+            track(*c);
+            if (over_buffer_budget(*c, 0)) return false; // apelantul il inchide
             if (static_cast<size_t>(n) < sizeof(temp)) return true; // s-a golit kernel bufferul
             continue;
         }
@@ -403,6 +430,11 @@ int main() {
 
     if (const char* env = getenv("SOMNIUM_MAXCLIENTS"); env && (!fsutil::parse_u64(env, &g_maxclients) || g_maxclients == 0)) {
         cerr << "SOMNIUM_MAXCLIENTS invalid: " << env << "\n";
+        return 1;
+    }
+
+    if (const char* env = getenv("SOMNIUM_MAX_CLIENT_BUFFERS"); env && !fsutil::parse_u64(env, &g_max_client_buffers)) {
+        cerr << "SOMNIUM_MAX_CLIENT_BUFFERS invalid: " << env << "\n";
         return 1;
     }
 

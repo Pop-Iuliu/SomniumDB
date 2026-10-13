@@ -352,6 +352,28 @@ def sec20_auth_log(check):
         srv.cleanup()
 
 
+def sec22_client_buffers(check):
+    srv = Server(env_extra={**ENV, "SOMNIUM_MAX_CLIENT_BUFFERS": str(48 << 20)})
+    try:
+        srv.start()
+        c = Client(srv)
+        c.cmd("SET", "k", "x" * (1 << 20))
+        slow = [Client(srv), Client(srv)]
+        for s in slow:  # fiecare cere 31 MB (sub capul de 32 MB per client) si nu citeste
+            s.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            s.s.sendall(resp_cmd("GET", "k") * 31)
+            time.sleep(0.5)
+        dropped = lambda: server_log(srv).count("[ClientBuffers]")
+        check("SEC-22: al doilea client lent e deconectat", wait_until(lambda: dropped() == 1, 5), server_log(srv)[-500:])
+        check("SEC-22: primul isi primeste toate raspunsurile",
+              all(slow[0].read_reply() == ("bulk", b"x" * (1 << 20)) for _ in range(31)))
+        check("SEC-22: serverul serveste in continuare", c.cmd("PING") == ("ok", "PONG"))
+        for x in (*slow, c):
+            x.close()
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
     run_with_retry(sec1_bind, fails)
@@ -367,6 +389,7 @@ def main():
     run_with_retry(sec18_auth_timeout, fails)
     run_with_retry(sec19_mget_reply, fails)
     run_with_retry(sec20_auth_log, fails)
+    run_with_retry(sec22_client_buffers, fails)
     report(fails, "sec")
 
 

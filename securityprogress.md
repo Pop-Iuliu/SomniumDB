@@ -36,8 +36,8 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | DONE (#24) |
 | SEC-20 | Rate-limit the failed `AUTH` log | 5. Audit 2026-10-05 | DONE (#25) |
 | SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | DONE (#26) |
-| SEC-22 | Cap the memory held by all client buffers | 6. Defence in depth | TODO |
-| SEC-23 | Fuzz command dispatch | 6. Defence in depth | IMPLEMENTED (awaiting CI) |
+| SEC-22 | Cap the memory held by all client buffers | 6. Defence in depth | IMPLEMENTED (awaiting CI) |
+| SEC-23 | Fuzz command dispatch | 6. Defence in depth | DONE (#27) |
 
 ## Threat model
 
@@ -463,6 +463,13 @@ Recommendations from the review of what would remain once every step is done. Th
 
 **Files:** `main.cpp`, `README.md`, `tests/sec_test.py`.
 
+**Result:**
+- Each `Client` remembers how many of its bytes are in the total (`held`). One helper, `track()`, brings the total up to date after any change to that client's buffers. It is called at the five places listed above, after every `in_buf`/`out_buf` change and on close; a closed client counts as zero, so a late call is harmless.
+- The output buffer counts in full, including the part already sent: that prefix stays allocated until the buffer drains.
+- The budget is checked only where buffers grow: before a reply is queued, and after each 16 KB read. Either way the client is disconnected with a `[ClientBuffers]` log line.
+- **Test:** the per-client output cap is 32 MB, so each slow client asks for 31 replies of 1 MB (one `GET` each) instead of 32 MB, and never reads. With the budget at 48 MB, the test checks that exactly one client is disconnected, that the first one then reads all 31 replies (so the dropped one was the second), and that a third client still gets `PONG`.
+- **Verification so far:** `main.cpp` compiles cleanly with GCC 13 (`-Wall -Wextra -Wformat=2`, stub headers). The server and the test need Linux, so CI on this PR is the first real run.
+
 ### SEC-23: Fuzz command dispatch
 
 **Why:** gap 19. Most of the C++ code is past the parser. With SEC-2 a stranger cannot reach it, but a memory bug there is still a way for any authenticated client to crash the server or take it over.
@@ -477,7 +484,7 @@ Recommendations from the review of what would remain once every step is done. Th
 
 **Files:** `tests/fuzz_commands.cpp`, `.github/workflows/ci.yml`.
 
-**Order:** done before SEC-22, at the maintainer's request. SEC-22 stays open.
+**Order:** done before SEC-22, at the maintainer's request. CI on PR #27 was green.
 
 **Result:**
 - **Harness:** one `Database` for the whole run, created on the first input in a temporary directory. Each input is one connection: every complete command in it (RESP or inline) goes through `execute()` on one fd, then `cleanup_client()`, as on a disconnect. That also resets the room and subscribe state, so one `SUBSCRIBE` cannot block the rest of the run.
