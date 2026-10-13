@@ -184,6 +184,7 @@ bool Replicator::ship(Peer& peer) {
         peer.offset = 0;
     }
     peer.lag = size - peer.offset; // si pentru un peer inaccesibil
+    publish(peer);                 // vizibil si cat connect-ul asteapta (pana la kIoTimeoutMs)
 
     if (peer.fd < 0) {
         peer.fd = connect_to(peer.host, peer.port);

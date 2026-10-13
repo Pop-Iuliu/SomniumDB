@@ -408,6 +408,9 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
         return args.size() == 2 ? bulk_string(args[1]) : "-ERR Wrong number of arguments for ECHO\r\n";
     }
 
+    // doar contoare globale: INFO nu trezeste camera clientului
+    if (command == "INFO") return handle_info();
+
     // ROOM selecteaza (si trezeste); comenzile de administrare au prefixul
     // "ROOM." ca nume precum LIST sa ramana camere valide
     if (command == "ROOM") {
@@ -523,7 +526,6 @@ std::string Database::execute_in_room(const std::string& room_name, const std::v
         if (command == "PERSIST") return handle_expire(room_name, *room, args, 0);
         if (command == "TTL") return handle_ttl(room_name, *room, args, false);
         if (command == "PTTL") return handle_ttl(room_name, *room, args, true);
-        if (command == "INFO") return handle_info();
         if (command == "SAVE") {
             // nu confirmam niciodata o persistenta suspectata
             return aof.healthy() ? "+OK AOF is active and up to date\r\n"
@@ -932,8 +934,7 @@ std::string Database::handle_info() {
     const auto now = std::chrono::steady_clock::now();
     const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
 
-    // doar contoare atomice: INFO nu ia lock-ul altor camere (ar inversa
-    // ordinea rooms_mutex -> room_mutex, camera curenta fiind deja prinsa)
+    // doar contoare atomice: INFO nu ia lock-ul niciunei camere
     const std::string info_text =
         "Uptime: " + std::to_string(uptime) + "s\n" +
         "Camere active: " + std::to_string(active_rooms.load()) + "\n" +
