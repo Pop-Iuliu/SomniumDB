@@ -365,6 +365,7 @@ def sec22_client_buffers(check):
             time.sleep(0.5)
         dropped = lambda: server_log(srv).count("[ClientBuffers]")
         check("SEC-22: al doilea client lent e deconectat", wait_until(lambda: dropped() == 1, 5), server_log(srv)[-500:])
+        slow[0].s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)  # cu 4 KB, 31 MB ar dura minute
         check("SEC-22: primul isi primeste toate raspunsurile",
               all(slow[0].read_reply() == ("bulk", b"x" * (1 << 20)) for _ in range(31)))
         check("SEC-22: serverul serveste in continuare", c.cmd("PING") == ("ok", "PONG"))
