@@ -34,8 +34,8 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-17 | Really close dropped connections | 5. Audit 2026-10-05 | DONE (#22) |
 | SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | DONE (#23) |
 | SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | DONE (#24) |
-| SEC-20 | Rate-limit the failed `AUTH` log | 5. Audit 2026-10-05 | IMPLEMENTED (awaiting CI) |
-| SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | TODO |
+| SEC-20 | Rate-limit the failed `AUTH` log | 5. Audit 2026-10-05 | DONE (#25) |
+| SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | IMPLEMENTED (awaiting CI) |
 | SEC-22 | Cap the memory held by all client buffers | 6. Defence in depth | TODO |
 | SEC-23 | Fuzz command dispatch | 6. Defence in depth | TODO |
 
@@ -423,7 +423,7 @@ Every finding below was reproduced against a running server. The storage formats
 - `authenticate()` only counts failures. The once-per-second sweep from SEC-18 prints `[AUTH] parole gresite: <n>` when the count is non-zero and resets it. No new timer, and no failure goes unlogged: the last ones appear at most a second later.
 - The line no longer names a client fd (SEC-2 logged one per failure): it covers every client in that second.
 - **Test:** 1,000 wrong passwords in batches of 100, so the replies stay under a stranger's 16 KB output cap. The logged counts must add up to 1,000, in at most 2 lines.
-- **Verification so far:** written on a machine without Linux, so not yet run against the real server. `main.cpp` compiles cleanly with GCC 13 (`-Wall -Wextra -Wformat=2`, stub headers for io_uring and sockets). The test was run against a mock server: it passes 3 times out of 3 with the new logging and fails both checks with the old one-line-per-failure logging. CI is the real check.
+- **Verification:** before CI, `main.cpp` was compiled with GCC 13 (`-Wall -Wextra -Wformat=2`, stub headers) and the test was checked against a mock server (passes with the new logging, fails both checks with the old). CI on PR #25 was green, and the SEC-20 checks pass in the ASan run.
 
 ### SEC-21: Make the test runner fail on failing suites
 
@@ -437,6 +437,14 @@ Every finding below was reproduced against a running server. The storage formats
 **Done when:** a deliberately failing suite makes `tests/run_all.sh` exit non-zero, and the real suite passes.
 
 **Files:** `tests/run_all.sh`, plus the fixes.
+
+**Result:**
+- **Runner:** a plain loop over the suites replaces the `run_suite` function. A failing suite is retried once on its own (a fresh server, for the io_uring flake), and a second failure stops the script with a non-zero exit through `set -e`. Checked in Git Bash with stub suites: all passing exits 0, an always-failing suite exits 1 after one retry, a suite that fails only once passes; the old script exits 0 with a failing suite.
+- **Failures on `main`** (CI log of PR #25's merge run): three suites, not two.
+  - `s9` "zero dupa hibernare" (1210 bytes left): a server bug. `INFO` ran inside the client's room, so after `ROOM.HIBERNATE` of the current room the test's `INFO` woke it again. `INFO` reads only global counters, so it now runs before any room is selected and never wakes a room (`Database::execute()`).
+  - `s11` "versiunea redata dupa restart": a test bug. The check re-sent a version computed again from the clock (`now + 5 s`), which after the restart is newer than the stored one, so the server correctly accepted it. The test now re-sends the same version, as does the related check before the restart, which only passed when both calls landed in the same millisecond.
+  - `s12` "peer-ul inaccesibil: phi infinit si lag pozitiv" (lag 0): a reporting bug. `ship()` computed an unreachable peer's lag before connecting, but published it only after the 2 second connect timeout, so `INFO` showed the startup value 0 until then. It now publishes right after computing the lag.
+- **Verification so far:** `database.cpp` and `replicator.cpp` compile cleanly with GCC 13 (stub headers). The suites themselves need Linux, so CI on this PR is the real check. `s8` did not fail in the run that was read.
 
 ## Phase 6: Defence in depth
 

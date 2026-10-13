@@ -57,17 +57,19 @@ def sec_versions(check):
         c = Client(srv)
         check("versiune absurda respinsa", c.cmd("CRDTMERGE", "k", "v", "18446744073709551615", "1")[0] == "err")
         check("versiune cu o ora in viitor respinsa", c.cmd("CRDTMERGE", "k", "v", str(now_ms() + 3600000), "1")[0] == "err")
-        r = c.cmd("CRDTMERGE", "k", "remote", str(now_ms() + 5000), "9")
+        # aceeasi versiune retrimisa: una calculata din nou ar fi deja mai noua (ceasul a mers)
+        remote = str(now_ms() + 5000)
+        r = c.cmd("CRDTMERGE", "k", "remote", remote, "9")
         check("versiune cu 5s in viitor acceptata", "Converged" in r[1], r)
         c.cmd("SET", "k", "local")
-        r = c.cmd("CRDTMERGE", "k", "again", str(now_ms() + 5000), "9")
+        r = c.cmd("CRDTMERGE", "k", "again", remote, "9")
         check("SET-ul local depaseste versiunea suprascrisa", "Ignored" in r[1], r)
         c.cmd("CRDTMERGE", "z", "far", str(now_ms() + 60000), "9")  # ceasul observa +60s
         c.close()
 
         srv.restart()
         c = Client(srv)
-        r = c.cmd("CRDTMERGE", "k", "late", str(now_ms() + 5000), "9")
+        r = c.cmd("CRDTMERGE", "k", "late", remote, "9")
         check("versiunea redata dupa restart", "Ignored" in r[1], r)
         c.cmd("SET", "w", "fresh")  # cheie noua: versiunea vine din ceasul observat la replay
         r = c.cmd("CRDTMERGE", "w", "older", str(now_ms() + 30000), "9")
