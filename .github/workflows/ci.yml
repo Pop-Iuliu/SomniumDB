@@ -96,6 +96,16 @@ jobs:
           clang++ -std=c++20 -g -O1 -fsanitize=fuzzer,address,undefined tests/fuzz_resp.cpp -o fuzz_resp
           ./fuzz_resp -max_total_time=60
 
+      # SEC-23: tot ce urmeaza dupa parser, pentru orice client autentificat.
+      # _GLIBCXX_ASSERTIONS: un args[i] dupa capat (dar in capacitate) nu e vazut de ASan
+      - name: Fuzz comenzile (60 s)
+        run: |
+          clang++ -std=c++20 -g -O1 -fsanitize=fuzzer,address,undefined -D_GLIBCXX_ASSERTIONS \
+            tests/fuzz_commands.cpp src/core/database.cpp pubsub.cpp metrics.cpp \
+            src/storage/aof_manager.cpp src/storage/snapshot_manager.cpp src/storage/eviction_manager.cpp \
+            -o fuzz_commands
+          ./fuzz_commands -max_total_time=60 -close_fd_mask=1 # stdout: logurile serverului
+
   benchmark:
     runs-on: ubuntu-24.04
     needs: tests
