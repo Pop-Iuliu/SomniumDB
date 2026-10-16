@@ -11,7 +11,7 @@ import tempfile
 import time
 import urllib.request
 
-from common import Client, Server, report, resp_cmd, run_with_retry
+from common import Client, Server, report, resp_cmd, run_with_retry, wait_until
 
 ENV = {"SOMNIUM_NO_METRICS": "1"}
 PW = "s3cret-pw"
@@ -42,15 +42,6 @@ def sec1_bind(check):
         check("SEC-1: SOMNIUM_BIND invalid iese cu codul 1", r is not None and r.returncode == 1, r)
     finally:
         srv.cleanup()
-
-
-def wait_until(cond, timeout=10):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if cond():
-            return True
-        time.sleep(0.2)
-    return cond()
 
 
 def sec2_auth(check):

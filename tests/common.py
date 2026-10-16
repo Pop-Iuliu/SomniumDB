@@ -228,6 +228,16 @@ class Client:
         self.s.close()
 
 
+def wait_until(cond, timeout=15, interval=0.2):
+    """Asteapta pana cand cond() e adevarata; intoarce rezultatul ultimei evaluari."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if cond():
+            return True
+        time.sleep(interval)
+    return cond()
+
+
 def run_with_retry(fn, fails, max_attempts=3):
     """Ruleaza o sectiune de test, reluata de la zero la decesul serverului.
 

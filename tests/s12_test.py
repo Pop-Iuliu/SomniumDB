@@ -7,9 +7,8 @@ lag-ul fiecarui peer.
 """
 
 import re
-import time
 
-from common import Client, Server, report, run_with_retry
+from common import Client, Server, report, run_with_retry, wait_until
 
 ENV = {"SOMNIUM_NO_METRICS": "1"}
 PORT_A, PORT_B = 6391, 6392
@@ -19,15 +18,6 @@ BLACKHOLE = "192.0.2.1:6399"
 def peers(client):
     info = client.cmd("INFO")[1].decode()
     return {m[0]: (float(m[1]), int(m[2])) for m in re.findall(r"Peer (\S+): phi=(\S+) lag=(\d+)", info)}
-
-
-def wait_until(cond, timeout=10):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if cond():
-            return True
-        time.sleep(0.2)
-    return cond()
 
 
 def sec_isolation(check):
