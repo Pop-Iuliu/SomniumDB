@@ -25,8 +25,8 @@ A step-by-step plan for restructuring SomniumDB after the security plan (`securi
 
 | Step | Title | Phase | Status |
 | --- | --- | --- | --- |
-| REF-1 | Construct the server after startup checks | 1. Foundations | IMPLEMENTED (awaiting CI) |
-| REF-2 | One source of configuration | 1. Foundations | TODO |
+| REF-1 | Construct the server after startup checks | 1. Foundations | DONE (#35) |
+| REF-2 | One source of configuration | 1. Foundations | IMPLEMENTED (awaiting CI) |
 | REF-3 | Split `database.cpp` by concern | 2. Structure | TODO |
 | REF-4 | A command table | 2. Structure | TODO |
 | REF-5 | Split `main.cpp`: connection layer and authentication | 2. Structure | TODO |
@@ -99,6 +99,21 @@ Findings from reading `main` at `39aac90` (2026-10-16). Each maps to a step. Row
 **Files:** `main.cpp`, a new `src/config.{h,cpp}`, the constructors of the components listed above, `tests/s13_test.py`.
 
 **Depends on:** REF-1, which puts construction in `main()`, where the configuration is loaded.
+
+**Changes from the plan:**
+- Components take `const Config&` and copy the fields they need, so no component keeps a reference to it. The defaults now live only in `Config`; the class members that held them no longer have initializers.
+- `main.cpp` keeps one `static Config cfg` in place of the globals `g_password`, `g_maxclients`, `g_max_client_buffers` and `g_trace`.
+- The AOF sync policy enum moved to `config.h` (`AofSync`); `AOFManager::SyncPolicy` is now an alias, so the AOF code is unchanged.
+- `get_current_time_ms()` became a private `Database` member that adds the configured clock offset; its 17 call sites are unchanged.
+- The snapshot test delay is now a parameter of `SnapshotManager::hibernate_room()`, instead of a `static` read from the environment on first use.
+- The TLS paths are `std::optional<std::string>`, because a variable set to an empty string must still count as set: `SOMNIUM_TLS_CERT=""` refuses to start rather than silently serving plain text.
+- The SEC-23 fuzzer now builds a `Config` instead of calling `setenv`.
+
+**Result:**
+- `grep getenv` finds only `src/config.cpp`. 25 calls in 7 files became one function. The components lost 108 lines of parsing; the new module adds 165, most of them the documented `Config` fields.
+- **Unchanged:** every variable's rule and message, including which invalid values stop the server (port, client limits, bind address, a network bind without a password) and which are reported and fall back to their default.
+- **Behaviour change:** `Database` counts the peers that the replicator actually uses, so a malformed `SOMNIUM_PEERS` entry no longer stops tombstone collection. Test: a third `s13` section, `sec_malformed_peer`.
+- **Verification so far:** every changed file compiles cleanly with GCC 13 (stub headers). `load_config()` was compiled on Windows against the real Winsock `inet_pton` and passed 28 checks: defaults, each fatal case, each fallback, the clamps, the peer list and the TLS and metrics switches, with messages identical to the old ones. `Database` with all its storage components was linked and run through the fuzz harness on sample inputs. The server and the suites need Linux, so CI on this PR is the first real run.
 
 ## Phase 2: Structure
 

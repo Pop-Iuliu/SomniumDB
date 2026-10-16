@@ -27,6 +27,7 @@ public:
 
     // true = snapshot validat (write+fsync+close+rename) si inregistrarile
     // eliberate. false = persistenta a esuat: inregistrarile raman in RAM.
-    // Starea camerei o gestioneaza apelantul (Database).
-    static bool hibernate_room(Room& room, PoolAllocator<Record, 1024>& pool);
+    // Starea camerei o gestioneaza apelantul (Database). delay_ms: intarziere
+    // de test inainte de scriere (SOMNIUM_SNAPSHOT_DELAY_MS).
+    static bool hibernate_room(Room& room, PoolAllocator<Record, 1024>& pool, int delay_ms);
 };

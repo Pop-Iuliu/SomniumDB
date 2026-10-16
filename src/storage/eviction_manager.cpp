@@ -35,15 +35,8 @@ namespace {
     }
 } // namespace
 
-EvictionManager::EvictionManager() {
-    if (const char* env = getenv("SOMNIUM_MAX_KEYS"); env && !fsutil::parse_u64(env, &max_keys_per_room)) {
-        fprintf(stderr, "SOMNIUM_MAX_KEYS invalid: '%s' (folosesc %llu)\n", env,
-                static_cast<unsigned long long>(max_keys_per_room));
-    }
-    if (const char* env = getenv("SOMNIUM_MAXMEMORY"); env && !fsutil::parse_u64(env, &max_bytes)) {
-        fprintf(stderr, "SOMNIUM_MAXMEMORY invalid: '%s' (fara limita)\n", env);
-    }
-    fd = ::open(kColdPath, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0600);
+EvictionManager::EvictionManager(const Config& cfg) : max_keys_per_room(cfg.max_keys), max_bytes(cfg.maxmemory) {
+    fd =::open(kColdPath, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0600);
     if (fd < 0) {
         fprintf(stderr, "Cold storage indisponibil (%s): cheile raman in RAM\n", strerror(errno));
     }

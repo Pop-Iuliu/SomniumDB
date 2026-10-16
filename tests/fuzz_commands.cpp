@@ -11,16 +11,17 @@
 extern "C" int LLVMFuzzerInitialize(int*, char***) {
     char dir[] = "/tmp/somnium-fuzz-XXXXXX";
     if (!mkdtemp(dir) || chdir(dir) != 0) abort();
-    setenv("SOMNIUM_AOF_SYNC", "no", 1);
-    setenv("SOMNIUM_AOF_REWRITE_MIN_BYTES", "18446744073709551615", 1); // fara rescriere automata (fork)
-    setenv("SOMNIUM_MAXMEMORY", "16777216", 1); // RSS marginit; restul ajunge in cold storage
     return 0;
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, const size_t size) {
-    // creata dupa LLVMFuzzerInitialize: in directorul temporar, cu env-ul de mai sus
+    // creata dupa LLVMFuzzerInitialize, deci in directorul temporar
     static Database* const db = [] {
-        auto* d = new Database;
+        Config cfg;
+        cfg.aof_sync = AofSync::Off;
+        cfg.aof_rewrite_min_bytes = UINT64_MAX; // fara rescriere automata (fork)
+        cfg.maxmemory = 16 << 20;               // RSS marginit; restul ajunge in cold storage
+        auto* d = new Database(cfg);
         d->set_message_sink([](int, const std::string&) {}); // PUBLISH catre un abonat
         return d;
     }();

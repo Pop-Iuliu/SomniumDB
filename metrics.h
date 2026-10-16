@@ -52,4 +52,5 @@ inline long long aof_sync_age_ms() {
 void publish_peer(const std::string& peer, double mean_ms, double stddev_ms, long long last_beat_ms, uint64_t lag_bytes);
 std::string peers_report(bool prometheus);
 
-void start_prometheus_exporter(int port = 9090);
+// SEC-8: bind_ip vine din SOMNIUM_METRICS_BIND (implicit 127.0.0.1)
+void start_prometheus_exporter(int port, const std::string& bind_ip);

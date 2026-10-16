@@ -78,29 +78,12 @@ namespace {
     }
 } // namespace
 
-Replicator::Replicator(const std::atomic<uint64_t>& frontier, SSL_CTX* tls) : tls_(tls), frontier_(frontier) {
-    if (const char* env = getenv("SOMNIUM_NODE_ID")) {
-        uint64_t id = 0;
-        if (fsutil::parse_u64(env, &id) && id >= 1 && id <= UINT32_MAX) node_id_ = static_cast<uint32_t>(id);
-    }
-
-    if (const char* pw = getenv("SOMNIUM_PASSWORD")) password_ = pw;
-
-    const char* env = getenv("SOMNIUM_PEERS");
-    const std::string list = env ? env : "";
-    for (size_t start = 0; start < list.size();) {
-        const size_t comma = std::min(list.find(',', start), list.size());
-        const std::string item = list.substr(start, comma - start);
-        start = comma + 1;
-
-        const size_t colon = item.rfind(':');
-        if (colon == std::string::npos || colon == 0 || colon + 1 == item.size()) {
-            fprintf(stderr, "SOMNIUM_PEERS: intrare invalida '%s' (astept host:port)\n", item.c_str());
-            continue;
-        }
+Replicator::Replicator(const std::atomic<uint64_t>& frontier, const Config& cfg, SSL_CTX* tls)
+    : node_id_(cfg.node_id), password_(cfg.password), tls_(tls), frontier_(frontier) {
+    for (const auto& [host, port] : cfg.peers) {
         Peer peer;
-        peer.host = item.substr(0, colon);
-        peer.port = item.substr(colon + 1);
+        peer.host = host;
+        peer.port = port;
         peer.state_file = "replication_" + peer.host + "_" + peer.port + ".offset";
         std::ifstream(peer.state_file) >> peer.inode >> peer.offset; // absent: de la zero
         peers_.push_back(std::move(peer));

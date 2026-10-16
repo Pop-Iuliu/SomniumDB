@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include "../../record.h"
+#include "../config.h"
 #include "../../pool_allocator.h"
 #include "../core/room.h"
 #include "../utils/count_min_sketch.h"
@@ -21,7 +22,7 @@
 // si nici reconstruirea indexului. Folosit doar de thread-ul de comenzi.
 class EvictionManager {
 public:
-    EvictionManager();
+    explicit EvictionManager(const Config& cfg);
     ~EvictionManager();
 
     void record_access(const std::string& key) { cms.record_access(key); }
@@ -60,8 +61,8 @@ private:
     int fd = -1;
     uint64_t file_bytes = 0;
     uint64_t obsolete_bytes = 0;
-    uint64_t max_keys_per_room = 1000000;
-    uint64_t max_bytes = 0;
+    uint64_t max_keys_per_room; // SOMNIUM_MAX_KEYS
+    uint64_t max_bytes;         // SOMNIUM_MAXMEMORY; 0 = fara limita
 
     void publish_metrics() const;
 };

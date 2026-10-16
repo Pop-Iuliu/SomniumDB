@@ -7,6 +7,7 @@
 #include <thread>
 #include <vector>
 #include <openssl/ssl.h>
+#include "../config.h"
 
 // S10 "koreish": replicare CRDT in caravane. Thread-uri proprii (I/O-ul de retea
 // nu are voie sa intarzie fsync-ul AOF din watchdog) citeste AOF-ul local de la
@@ -32,10 +33,10 @@
 // esec si un heartbeat (REPLFRONTIER) la fiecare caravana, din care se calculeaza phi.
 class Replicator {
 public:
-    // citeste SOMNIUM_NODE_ID si SOMNIUM_PEERS ("host:port,host:port"); frontier e
+    // din cfg: SOMNIUM_NODE_ID, SOMNIUM_PASSWORD si SOMNIUM_PEERS; frontier e
     // versiunea pana la care toate scrierile locale sunt deja in AOF (Database);
     // tls e contextul serverului (SEC-16), nullptr = replicare in text clar
-    Replicator(const std::atomic<uint64_t>& frontier, SSL_CTX* tls);
+    Replicator(const std::atomic<uint64_t>& frontier, const Config& cfg, SSL_CTX* tls);
     ~Replicator();
 
     void start(); // nu face nimic fara peers
@@ -55,7 +56,7 @@ private:
         uint64_t lag = 0; // octeti din AOF inca neconfirmati
     };
 
-    uint32_t node_id_ = 1;
+    uint32_t node_id_;
     std::string password_; // SOMNIUM_PASSWORD, aceeasi pe toate nodurile
     SSL_CTX* tls_; // certificatul clusterului, acelasi pe toate nodurile
     const std::atomic<uint64_t>& frontier_;
