@@ -31,13 +31,15 @@ add_executable(Redis main.cpp
         src/core/rooms.cpp
         src/core/resp.h
         src/core/hlc.h
-        watchdog.h
-        watchdog.cpp
-        pubsub.cpp
-        pubsub.h
-        pool_allocator.h
-        metrics.h
-        metrics.cpp
+        src/core/pubsub.h
+        src/core/pubsub.cpp
+        src/core/pool_allocator.h
+        src/core/record.h
+        src/core/room.h
+        src/server/metrics.h
+        src/server/metrics.cpp
+        src/server/watchdog.h
+        src/server/watchdog.cpp
         src/storage/aof_manager.h
         src/storage/aof_manager.cpp
         src/storage/fs_util.h

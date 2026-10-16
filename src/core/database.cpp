@@ -2,7 +2,7 @@
 // (lookup/insert/set_value/erase: singurele care schimba RAM-ul unei camere,
 // cu room_mutex prins). Contractul de lock-uri: room.h.
 #include "database.h"
-#include "../../metrics.h"
+#include "../server/metrics.h"
 #include <algorithm>
 #include <cctype>
 #include <chrono>

@@ -10,12 +10,12 @@
 #include <atomic>
 #include <functional>
 #include <sys/types.h>
-#include "../../pubsub.h"
-#include "../../pool_allocator.h"
+#include "pubsub.h"
+#include "pool_allocator.h"
 #include "../storage/aof_manager.h"
 #include "../storage/eviction_manager.h"
 #include "../storage/snapshot_manager.h"
-#include "../../record.h"
+#include "record.h"
 #include "../config.h"
 #include "room.h"
 #include "hlc.h"

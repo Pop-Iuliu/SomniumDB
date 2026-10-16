@@ -21,13 +21,13 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#include "metrics.h"
+#include "src/server/metrics.h"
 #include "src/core/database.h"
 #include "src/config.h"
 #include "src/net/auth.h"
 #include "src/net/connection.h"
 #include "src/storage/replicator.h"
-#include "watchdog.h"
+#include "src/server/watchdog.h"
 
 using namespace std;
 using net::Client;

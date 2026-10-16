@@ -1,6 +1,6 @@
 #include "eviction_manager.h"
 #include "fs_util.h"
-#include "../../metrics.h"
+#include "../server/metrics.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

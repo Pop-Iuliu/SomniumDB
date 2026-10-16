@@ -85,12 +85,18 @@ Data files (`appendonly.aof`, `room_*.bin`, `cold.bin`, replication offsets) are
 
 ```text
 SomniumDB/
+├── main.cpp            # Startup and the io_uring event loop
 ├── src/
-│   ├── core/         # Engine orchestrator, RESP protocol parser, Room partitioning
-│   ├── storage/      # Async I/O managers (aof_manager, snapshot_manager, eviction_manager)
-│   └── utils/        # Probabilistic structures, pool allocator, Prometheus HTTP exporter
-├── docker-compose.yml # Prometheus & Grafana stack configuration
-└── CMakeLists.txt    # Build system configuration (-O3 optimized)
+│   ├── config.*        # Every environment variable, read once at startup
+│   ├── core/           # Database: command table, rooms, key commands, CRDT, persistence,
+│   │                   # RESP parser, Pub/Sub, pool allocator, records
+│   ├── net/            # Client connections: buffers and limits, TLS, AUTH and HELLO
+│   ├── server/         # Prometheus exporter and the maintenance watchdog
+│   ├── storage/        # AOF, room snapshots, cold storage, replication
+│   └── utils/          # Count-min sketch for LFU eviction
+├── tests/              # Python suites (run_all.sh), C++ unit tests and fuzzers
+├── docker-compose.yaml # Prometheus & Grafana stack
+└── CMakeLists.txt      # Build configuration (Release by default)
 
 ```
 

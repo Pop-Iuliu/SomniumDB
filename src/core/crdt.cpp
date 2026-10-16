@@ -2,7 +2,7 @@
 // Tombstone-urile, frontierele si watermark-ul nu au lock propriu: le atinge doar
 // thread-ul de comenzi.
 #include "database.h"
-#include "../../metrics.h"
+#include "../server/metrics.h"
 #include "../storage/fs_util.h"
 #include <algorithm>
 #include <climits>

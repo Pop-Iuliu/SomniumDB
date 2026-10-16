@@ -1,7 +1,7 @@
 #include "replicator.h"
 #include "fs_util.h"
 #include "../core/resp.h"
-#include "../../metrics.h"
+#include "../server/metrics.h"
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
