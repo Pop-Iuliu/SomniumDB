@@ -1,6 +1,6 @@
 # Stability Progress
 
-A step-by-step plan for the stability and continuity problems found by stress-testing SomniumDB after the refactor plan (`refactorprogress.md`) was completed. The six problems that could be fixed in place are already fixed (see [Done](#done)). What remains here changes behaviour or the persistence model, so each item is one pull request with its own test, and one item needs a decision first.
+A step-by-step plan for the stability and continuity problems found by stress-testing SomniumDB after the refactor plan (`refactorprogress.md`) was completed. The six problems that could be fixed in place are already fixed in #43 (see [Done](#done)). What remains here changes behaviour or the persistence model, so each item is one pull request with its own test, and one item needs a decision first.
 
 ## Objectives
 
@@ -110,7 +110,7 @@ Once D1 is decided, it becomes STAB-4, with a test like the disk-full tests in `
 
 ## Done
 
-Fixed in the pull request that added this plan. Each fix has a test that fails on `main` and passes after it.
+Fixed in #43, the pull request that added this plan. Each fix has a test that fails on `main` and passes after it.
 
 | Problem | Impact on `main` | Fix | Test |
 | --- | --- | --- | --- |
