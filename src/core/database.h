@@ -78,8 +78,25 @@ private:
     // nullptr = camera e activa, altfel raspunsul de eroare
     const char* wake_room(const std::string& name);
 
-    // dispecerarea lock-uita pe camera; folosita si de replay-ul AOF
-    std::string execute_in_room(const std::string& room_name, const std::vector<std::string>& args);
+    // REF-4: tabela comenzilor (database.cpp). Ce primeste o comanda:
+    struct Call {
+        int client_fd;
+        const std::string& command; // numele, cu majuscule
+        const std::vector<std::string>& args;
+        const std::string& room_name; // camera clientului
+        Room* room;                   // doar pentru Scope::Room: activa, cu room_mutex prins
+    };
+    struct Command {
+        // Connection: fara camera. Room: in camera clientului, trezita si lock-uita de execute_in_room()
+        enum class Scope { Connection, Room } scope;
+        // Pub/Sub: permisa pe RESP2 in modul subscribe si nenumarata in "Comenzi procesate"
+        bool pubsub;
+        std::string (*run)(Database&, const Call&);
+    };
+    static const std::unordered_map<std::string, Command> kCommands;
+
+    // ruleaza o comanda Scope::Room: camera trezita, room_mutex prins, evictare dupa
+    std::string execute_in_room(const Command& cmd, const Call& call);
 
     // replay verbatim al unei mutatii persistate: aplica starea rezultata
     // (valoare, expirare, versiune CRDT) asa cum a fost serializata, fara sa
@@ -131,6 +148,10 @@ private:
     std::string handle_crdtmerge(const std::string& room_name, Room& room, const std::vector<std::string>& args);
     std::string handle_info();
     std::string handle_room_admin(const std::string& command, const std::vector<std::string>& args);
+    std::string handle_room(int client_fd, const std::vector<std::string>& args);
+    std::string handle_subscribe(int client_fd, const std::vector<std::string>& args);
+    std::string handle_ping(int client_fd, const std::vector<std::string>& args);
+    std::string handle_replfrontier(const std::vector<std::string>& args);
 
     static std::string bulk_string(const std::string& payload);
     long long get_current_time_ms() const; // ceasul de perete, plus SOMNIUM_CLOCK_OFFSET_MS

@@ -104,6 +104,23 @@ void Database::collect_tombstones() {
     }
 }
 
+// REPLFRONTIER node F: "toate scrierile mele <= F ti-au fost livrate" (S13)
+std::string Database::handle_replfrontier(const std::vector<std::string>& args) {
+    uint64_t node = 0, f = 0;
+    if (args.size() != 3 || !fsutil::parse_u64(args[1], &node) || node > UINT32_MAX ||
+        !fsutil::parse_u64(args[2], &f)) {
+        return "-ERR usage: REPLFRONTIER node frontier\r\n";
+    }
+    uint64_t& known = frontiers_[static_cast<uint32_t>(node)];
+    known = std::max(known, f);
+    // intre comenzi nu e nimic in zbor: orice versiune locala emisa pana aici
+    // e deja in AOF, deci o versiune noua e o frontiera exacta (si avanseaza
+    // cu timpul fizic chiar daca nodul nu scrie nimic)
+    frontier_ = clock_.next(get_current_time_ms(), 0);
+    collect_tombstones();
+    return "+OK\r\n";
+}
+
 std::string Database::handle_crdtmerge(const std::string& room_name, Room& room, const std::vector<std::string>& args) {
     // CRDTMERGE key value timestamp node [expire_at]: termenul absolut optional
     // calatoreste cu starea (replicarea S10 trimite si expirarea unui SET ... PX)

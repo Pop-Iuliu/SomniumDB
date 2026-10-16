@@ -3,11 +3,9 @@
 // cu room_mutex prins). Contractul de lock-uri: room.h.
 #include "database.h"
 #include "../../metrics.h"
-#include "../storage/fs_util.h"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <climits>
 
 // SOMNIUM_CLOCK_OFFSET_MS muta ceasul: ceas controlabil pentru testele
 // de expirare peste restart (timp "trecut" cat serverul era oprit)
@@ -84,90 +82,86 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
     std::string command = args[0];
     std::ranges::transform(command, command.begin(), ::toupper);
 
-    if (command == "SUBSCRIBE") {
-        if (args.size() < 2) return "-ERR Wrong number of arguments for SUBSCRIBE\r\n";
-        std::string replies;
-        for (size_t i = 1; i < args.size(); ++i) replies += pubsub.subscribe(client_fd, args[i], resp3);
-        return replies;
-    }
+    // ROOM.<orice> e o singura familie (handle_room_admin isi alege subcomanda); o
+    // comanda necunoscuta ruleaza in camera clientului si raspunde "unknown command"
+    static const Command unknown{Command::Scope::Room, false,
+                                 [](Database&, const Call&) -> std::string { return "-ERR unknown command\r\n"; }};
+    const auto it = kCommands.find(command.starts_with("ROOM.") ? std::string("ROOM.") : command);
+    const Command& cmd = it != kCommands.end() ? it->second : unknown;
 
-    if (command == "UNSUBSCRIBE") {
-        return pubsub.unsubscribe(client_fd, {args.begin() + 1, args.end()}, resp3);
-    }
-
-    if (command == "PING") {
-        if (args.size() > 2) return "-ERR Wrong number of arguments for PING\r\n";
-        // in modul subscribe pe RESP2, ca Redis: raspuns sub forma de mesaj ["pong", payload]
+    if (!cmd.pubsub) {
+        // pe RESP3 mesajele push se disting de raspunsuri, deci orice comanda e permisa
         if (!resp3 && pubsub.is_subscribed(client_fd)) {
-            return "*2\r\n$4\r\npong\r\n" + bulk_string(args.size() == 2 ? args[1] : "");
+            return "-ERR Clientul este in mod SUBSCRIBE. Nu poti trimite comenzi de Database!\r\n";
         }
-        return args.size() == 2 ? bulk_string(args[1]) : "+PONG\r\n";
+        total_commands.fetch_add(1, std::memory_order_relaxed);
     }
 
-    if (command == "PUBLISH") {
-        if (args.size() >= 3) return pubsub.publish(args[1], args[2]);
-        return "-ERR Wrong number of arguments for PUBLISH\r\n";
+    const Call call{client_fd, command, args, current_room, nullptr};
+    return cmd.scope == Command::Scope::Room ? execute_in_room(cmd, call) : cmd.run(*this, call);
+}
+
+// REF-4: fiecare comanda, cu proprietatile ei langa nume. Numarul de argumente si
+// textele de eroare raman in handler-e (decizia D4). Replay-ul AOF are dispecerarea
+// lui (replay_record): aplica stare salvata, nu ruleaza comenzi.
+const std::unordered_map<std::string, Database::Command> Database::kCommands = [] {
+    using S = Command::Scope;
+    return std::unordered_map<std::string, Command>{
+        // Pub/Sub
+        {"SUBSCRIBE", {S::Connection, true, [](Database& db, const Call& c) { return db.handle_subscribe(c.client_fd, c.args); }}},
+        {"UNSUBSCRIBE", {S::Connection, true, [](Database& db, const Call& c) {
+             return db.pubsub.unsubscribe(c.client_fd, {c.args.begin() + 1, c.args.end()}, db.resp3_); }}},
+        {"PING", {S::Connection, true, [](Database& db, const Call& c) { return db.handle_ping(c.client_fd, c.args); }}},
+        {"PUBLISH", {S::Connection, true, [](Database& db, const Call& c) -> std::string {
+             return c.args.size() >= 3 ? db.pubsub.publish(c.args[1], c.args[2]) : "-ERR Wrong number of arguments for PUBLISH\r\n"; }}},
+
+        // conexiunea si serverul, fara camera
+        {"COMMAND", {S::Connection, false, [](Database&, const Call&) -> std::string { return "*0\r\n"; }}},
+        {"ECHO", {S::Connection, false, [](Database&, const Call& c) -> std::string {
+             return c.args.size() == 2 ? bulk_string(c.args[1]) : "-ERR Wrong number of arguments for ECHO\r\n"; }}},
+        {"INFO", {S::Connection, false, [](Database& db, const Call&) { return db.handle_info(); }}}, // nu trezeste camera
+        {"ROOM", {S::Connection, false, [](Database& db, const Call& c) { return db.handle_room(c.client_fd, c.args); }}},
+        {"ROOMS", {S::Connection, false, [](Database& db, const Call& c) { return db.handle_room_admin(c.command, c.args); }}},
+        {"ROOM.", {S::Connection, false, [](Database& db, const Call& c) { return db.handle_room_admin(c.command, c.args); }}},
+        {"REPLFRONTIER", {S::Connection, false, [](Database& db, const Call& c) { return db.handle_replfrontier(c.args); }}},
+        {"REWRITEAOF", {S::Connection, false, [](Database& db, const Call&) { return db.start_background_rewrite(); }}},
+        {"COMPACT", {S::Connection, false, [](Database& db, const Call&) -> std::string {
+             const long long reclaimed = db.eviction.compact(db.get_current_time_ms());
+             return reclaimed < 0 ? "-ERR compaction failed, previous cold file kept\r\n" : ":" + std::to_string(reclaimed) + "\r\n"; }}},
+
+        // chei, in camera clientului
+        {"GET", {S::Room, false, [](Database& db, const Call& c) { return db.handle_get(c.room_name, *c.room, c.args); }}},
+        {"SET", {S::Room, false, [](Database& db, const Call& c) { return db.handle_set(c.room_name, *c.room, c.args); }}},
+        {"DEL", {S::Room, false, [](Database& db, const Call& c) { return db.handle_del(c.room_name, *c.room, c.args); }}},
+        {"CRDTMERGE", {S::Room, false, [](Database& db, const Call& c) { return db.handle_crdtmerge(c.room_name, *c.room, c.args); }}},
+        {"CRDTDEL", {S::Room, false, [](Database& db, const Call& c) { return db.handle_crdtdel(c.room_name, *c.room, c.args); }}},
+        {"MGET", {S::Room, false, [](Database& db, const Call& c) { return db.handle_mget(c.room_name, *c.room, c.args); }}},
+        {"MSET", {S::Room, false, [](Database& db, const Call& c) { return db.handle_mset(c.room_name, *c.room, c.args); }}},
+        {"EXISTS", {S::Room, false, [](Database& db, const Call& c) { return db.handle_exists(c.room_name, *c.room, c.args); }}},
+        {"EXPIRE", {S::Room, false, [](Database& db, const Call& c) { return db.handle_expire(c.room_name, *c.room, c.args, 1000); }}},
+        {"PEXPIRE", {S::Room, false, [](Database& db, const Call& c) { return db.handle_expire(c.room_name, *c.room, c.args, 1); }}},
+        {"PERSIST", {S::Room, false, [](Database& db, const Call& c) { return db.handle_expire(c.room_name, *c.room, c.args, 0); }}},
+        {"TTL", {S::Room, false, [](Database& db, const Call& c) { return db.handle_ttl(c.room_name, *c.room, c.args, false); }}},
+        {"PTTL", {S::Room, false, [](Database& db, const Call& c) { return db.handle_ttl(c.room_name, *c.room, c.args, true); }}},
+        {"SAVE", {S::Room, false, [](Database& db, const Call&) -> std::string { // nu confirmam o persistenta suspectata
+             return db.aof.healthy() ? "+OK AOF is active and up to date\r\n" : "-ERR AOF write error, persistenta suspecta\r\n"; }}},
+    };
+}();
+
+std::string Database::handle_subscribe(const int client_fd, const std::vector<std::string>& args) {
+    if (args.size() < 2) return "-ERR Wrong number of arguments for SUBSCRIBE\r\n";
+    std::string replies;
+    for (size_t i = 1; i < args.size(); ++i) replies += pubsub.subscribe(client_fd, args[i], resp3_);
+    return replies;
+}
+
+std::string Database::handle_ping(const int client_fd, const std::vector<std::string>& args) {
+    if (args.size() > 2) return "-ERR Wrong number of arguments for PING\r\n";
+    // in modul subscribe pe RESP2, ca Redis: raspuns sub forma de mesaj ["pong", payload]
+    if (!resp3_ && pubsub.is_subscribed(client_fd)) {
+        return "*2\r\n$4\r\npong\r\n" + bulk_string(args.size() == 2 ? args[1] : "");
     }
-
-    // pe RESP3 mesajele push se disting de raspunsuri, deci orice comanda e permisa
-    if (!resp3 && pubsub.is_subscribed(client_fd)) {
-        return "-ERR Clientul este in mod SUBSCRIBE. Nu poti trimite comenzi de Database!\r\n";
-    }
-
-    total_commands.fetch_add(1, std::memory_order_relaxed);
-
-    if (command == "COMMAND") {
-        return "*0\r\n";
-    }
-
-    if (command == "ECHO") {
-        return args.size() == 2 ? bulk_string(args[1]) : "-ERR Wrong number of arguments for ECHO\r\n";
-    }
-
-    // doar contoare globale: INFO nu trezeste camera clientului
-    if (command == "INFO") return handle_info();
-
-    // ROOM selecteaza (si trezeste); comenzile de administrare au prefixul
-    // "ROOM." ca nume precum LIST sa ramana camere valide
-    if (command == "ROOM") {
-        if (args.size() != 2) return "-ERR Wrong number of arguments for ROOM\r\n";
-        if (const char* err = wake_room(args[1])) return err;
-        set_client_room(client_fd, args[1]);
-        return "+OK\r\n";
-    }
-
-    if (command == "ROOMS" || command.starts_with("ROOM.")) {
-        return handle_room_admin(command, args);
-    }
-
-    // REPLFRONTIER node F: "toate scrierile mele <= F ti-au fost livrate" (S13)
-    if (command == "REPLFRONTIER") {
-        uint64_t node = 0, f = 0;
-        if (args.size() != 3 || !fsutil::parse_u64(args[1], &node) || node > UINT32_MAX ||
-            !fsutil::parse_u64(args[2], &f)) {
-            return "-ERR usage: REPLFRONTIER node frontier\r\n";
-        }
-        uint64_t& known = frontiers_[static_cast<uint32_t>(node)];
-        known = std::max(known, f);
-        // intre comenzi nu e nimic in zbor: orice versiune locala emisa pana aici
-        // e deja in AOF, deci o versiune noua e o frontiera exacta (si avanseaza
-        // cu timpul fizic chiar daca nodul nu scrie nimic)
-        frontier_ = clock_.next(get_current_time_ms(), 0);
-        collect_tombstones();
-        return "+OK\r\n";
-    }
-
-    if (command == "REWRITEAOF") {
-        return start_background_rewrite();
-    }
-
-    if (command == "COMPACT") {
-        const long long reclaimed = eviction.compact(get_current_time_ms());
-        return reclaimed < 0 ? "-ERR compaction failed, previous cold file kept\r\n"
-                             : ":" + std::to_string(reclaimed) + "\r\n";
-    }
-
-    return execute_in_room(current_room, args);
+    return args.size() == 2 ? bulk_string(args[1]) : "+PONG\r\n";
 }
 
 Record* Database::lookup(const std::string& room_name, Room& room, const std::string& key) {
