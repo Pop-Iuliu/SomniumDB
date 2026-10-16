@@ -10,7 +10,7 @@ de sync; sub always, raspunsul asteapta sincronizarea.
 import time
 import urllib.request
 
-from common import Client, Server, report, resp_cmd, run_with_retry
+from common import Client, Server, report, resp_cmd, run_with_retry, wait_until
 
 PORT = 6401
 
@@ -25,15 +25,6 @@ def metrics():
         if value.lstrip("-").isdigit():
             out[key] = int(value)
     return out
-
-
-def wait_until(cond, timeout):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if cond():
-            return True
-        time.sleep(0.02)
-    return cond()
 
 
 def sec_everysec_does_not_block_append(check):
@@ -65,7 +56,7 @@ def sec_everysec_does_not_block_append(check):
         check("lock-ul de append nu a fost tinut peste 50ms", caught is not None and caught[2] == 0, caught)
         check("scrierea din timpul sync ramane pending", caught is not None and caught[1] > 0, caught)
         check("pending se acopera la sincronizarea urmatoare",
-              wait_until(lambda: metrics().get("db_aof_pending_bytes") == 0, 3), metrics())
+              wait_until(lambda: metrics().get("db_aof_pending_bytes") == 0, 3, interval=0.02), metrics())
         c.close()
         srv.restart()
         c = Client(srv)
@@ -129,7 +120,7 @@ def sec_old_generation_cannot_clean_new_file(check):
         gen = metrics().get("db_aof_generation")
 
         check("REWRITEAOF", c.cmd("REWRITEAOF")[0] == "ok")
-        done = wait_until(lambda: b"in curs" not in c.cmd("INFO")[1], 5)
+        done = wait_until(lambda: b"in curs" not in c.cmd("INFO")[1], 5, interval=0.02)
         check("rescrierea se termina in fereastra de sync", done)
         check("generatia creste la publicarea fisierului nou", metrics().get("db_aof_generation", 0) > gen, metrics())
 
@@ -139,7 +130,7 @@ def sec_old_generation_cannot_clean_new_file(check):
         check("offsetul vechi nu depaseste fisierul nou", m.get("db_aof_synced_bytes", 0) <= m.get("db_aof_bytes", 0), m)
 
         check("dupa completare, generatia noua ramane consistenta",
-              wait_until(lambda: metrics().get("db_aof_sync_inflight") == 0, 4))
+              wait_until(lambda: metrics().get("db_aof_sync_inflight") == 0, 4, interval=0.02))
         m = metrics()
         check("synced nu sare peste dimensiunea noii generatii",
               m.get("db_aof_synced_bytes", 0) <= m.get("db_aof_bytes", 0), m)
@@ -196,7 +187,7 @@ def sec_overrun_metric(check):
         c = Client(srv)
         c.cmd("SET", "o", "1")
         check("un sync mai lung decat intervalul numara overrun",
-              wait_until(lambda: metrics().get("db_aof_sync_overruns", 0) >= 1, 3), metrics())
+              wait_until(lambda: metrics().get("db_aof_sync_overruns", 0) >= 1, 3, interval=0.02), metrics())
         c.close()
     finally:
         srv.cleanup()

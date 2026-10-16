@@ -9,19 +9,10 @@ vazuta, inclusiv dupa restart.
 
 import time
 
-from common import Client, Server, report, run_with_retry
+from common import Client, Server, report, run_with_retry, wait_until
 
 ENV = {"SOMNIUM_NO_METRICS": "1"}
 PORT_A, PORT_B = 6391, 6392
-
-
-def wait_until(cond, timeout=15):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if cond():
-            return True
-        time.sleep(0.2)
-    return cond()
 
 
 def now_ms():

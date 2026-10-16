@@ -30,8 +30,8 @@ A step-by-step plan for restructuring SomniumDB after the security plan (`securi
 | REF-3 | Split `database.cpp` by concern | 2. Structure | DONE (#37) |
 | REF-4 | A command table | 2. Structure | DONE (#38) |
 | REF-5 | Split `main.cpp`: connection layer and authentication | 2. Structure | DONE (#39) |
-| REF-6 | Source layout | 3. Layout and tests | IMPLEMENTED (awaiting CI) |
-| REF-7 | Shared test helpers | 3. Layout and tests | TODO |
+| REF-6 | Source layout | 3. Layout and tests | DONE (#40) |
+| REF-7 | Shared test helpers | 3. Layout and tests | IMPLEMENTED (awaiting CI) |
 
 ## Current state
 
@@ -230,6 +230,12 @@ Add the new files to `CMakeLists.txt` and to the source list of the `fuzz` job i
 **Done when:** `grep -rn "def wait_until" tests` finds one definition, and CI is green.
 
 **Files:** `tests/common.py`, the six test files.
+
+**Result:**
+- `tests/common.py` has the one `wait_until(cond, timeout=15, interval=0.2)`. The six copies were not identical: `s10`, `s11` and `s13` defaulted to 15 seconds, `s12` and `sec_test.py` to 10, and `s18` required a timeout and polled every 20 ms.
+- **Kept as before:** `s18`'s four calls pass `interval=0.02`, since its checks time the AOF sync. The other calls that relied on a 10 second default now wait up to 15; no call expects the wait to time out, so a passing run is unchanged.
+- Each file imports `wait_until` by adding it to its existing `from common import` line; `s12` drops `import time`, which only its copy used. 20 lines added, 65 removed.
+- **Verification so far:** every changed test module imports cleanly and resolves `wait_until` to `common`, and the helper behaves as the copies did (immediate success, polling at the given interval, `False` after the timeout). The suites need the server, so CI on this PR is the first full run.
 
 ## Housekeeping
 

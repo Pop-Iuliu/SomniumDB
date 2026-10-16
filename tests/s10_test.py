@@ -9,7 +9,7 @@ dupa o rescriere a AOF-ului (S8); DEL se replica (S13).
 import os
 import time
 
-from common import Client, Server, report, run_with_retry
+from common import Client, Server, report, run_with_retry, wait_until
 
 ENV = {"SOMNIUM_NO_METRICS": "1"}
 PORT_A, PORT_B = 6391, 6392
@@ -18,15 +18,6 @@ PORT_A, PORT_B = 6391, 6392
 def node(node_id, port, peer_port):
     return Server(port=port, keep_dir_on_retry=True, env_extra={
         **ENV, "SOMNIUM_NODE_ID": str(node_id), "SOMNIUM_PEERS": f"127.0.0.1:{peer_port}"})
-
-
-def wait_until(cond, timeout=15):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if cond():
-            return True
-        time.sleep(0.2)
-    return cond()
 
 
 def aof(srv):
