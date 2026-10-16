@@ -16,7 +16,7 @@ import stat
 import tempfile
 import time
 
-from common import REPO, Client, Server, report, run_with_retry
+from common import REPO, Client, Server, report, resp_cmd, run_with_retry
 
 ENV = {"SOMNIUM_NO_METRICS": "1", "SOMNIUM_AOF_SYNC": "no"}
 UNLIMITED = resource.RLIM_INFINITY
@@ -84,6 +84,31 @@ def sec_torn_cold(check):
                 if c.cmd("GET", k) != ("bulk", value(i)):
                     wrong.append(k)
         check("dupa o evictare partiala, fiecare cheie isi citeste valoarea", not wrong, wrong)
+        c.close()
+    finally:
+        srv.cleanup()
+
+
+def sec_saturated_eviction(check):
+    # dupa ~40k accesari count-min sketch-ul e saturat: nicio cheie nu mai pare rece, iar
+    # cautarea unei victime reci (acum marginita) trebuie sa evicteze corect in continuare
+    srv = Server(env_extra={**ENV, "SOMNIUM_MAX_KEYS": "500"})
+    try:
+        srv.start()
+        c = Client(srv)
+        mset = ["MSET"]
+        for i in range(3000):
+            mset += [f"k{i}", f"v{i}"]
+        c.cmd(*mset)
+        c.s.sendall(b"".join(resp_cmd("GET", f"k{i % 3000}") for i in range(45000)))
+        for _ in range(45000):
+            c.read_reply()
+        for i in range(3000, 4000):
+            c.cmd("SET", f"k{i}", f"v{i}")
+        keys = [ln for ln in c.cmd("INFO")[1].decode().splitlines() if ln.startswith("Chei totale")]
+        check("sketch saturat: camera tine exact SOMNIUM_MAX_KEYS in RAM", keys == ["Chei totale: 500"], keys)
+        wrong = [i for i in range(4000) if c.cmd("GET", f"k{i}") != ("bulk", f"v{i}".encode())]
+        check("sketch saturat: fiecare cheie (RAM sau cold) isi citeste valoarea", not wrong, wrong[:10])
         c.close()
     finally:
         srv.cleanup()
@@ -186,7 +211,7 @@ def sec_accept_backoff(check):
 
 def main():
     fails = []
-    for sec in (sec_torn_aof, sec_torn_cold, sec_fd_limit, sec_accept_backoff):
+    for sec in (sec_torn_aof, sec_torn_cold, sec_saturated_eviction, sec_fd_limit, sec_accept_backoff):
         run_with_retry(sec, fails)
     report(fails, "stab")
 

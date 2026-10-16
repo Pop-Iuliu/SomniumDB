@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
-#include <ranges>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -55,6 +54,7 @@ void EvictionManager::publish_metrics() const {
 
 void EvictionManager::evict_despised_keys(Room& room, PoolAllocator<Record, 1024>& pool) {
     constexpr int SAMPLE_SIZE = 5;
+    constexpr int EXTRA_SAMPLES = 64;
     static std::mt19937 rng(std::random_device{}());
 
     // ponytail: evictam doar din camera scrisa; daca alte camere tin bugetul,
@@ -64,7 +64,7 @@ void EvictionManager::evict_despised_keys(Room& room, PoolAllocator<Record, 1024
         const std::string* victim = nullptr;
         uint16_t lowest = 0xFFFF;
         std::uniform_int_distribution<size_t> dist(0, room.keys.bucket_count() - 1);
-        for (int i = 0; i < SAMPLE_SIZE; ++i) {
+        const auto sample = [&] {
             size_t bucket = dist(rng);
             while (room.keys.bucket_size(bucket) == 0) bucket = (bucket + 1) % room.keys.bucket_count();
             const std::string& candidate = room.keys.begin(bucket)->first;
@@ -72,15 +72,14 @@ void EvictionManager::evict_despised_keys(Room& room, PoolAllocator<Record, 1024
                 lowest = freq;
                 victim = &candidate;
             }
-        }
-        // esantionul a prins doar chei fierbinti: cautam explicit una rece
+        };
+        for (int i = 0; i < SAMPLE_SIZE; ++i) sample();
+        // esantionul a prins doar chei fierbinti: cautam una rece, dar marginit. Contoarele
+        // nu scad niciodata, deci dupa ~40k accesari (10 x latimea sketch-ului) nicio cheie
+        // nu mai pare rece, iar parcurgerea completa a camerei la fiecare evictare scadea
+        // SET-urile peste SOMNIUM_MAX_KEYS de ~60 de ori (50k chei; liniar cu marimea camerei)
         if (lowest > 10) {
-            for (const auto& k : room.keys | std::views::keys) {
-                if (cms.estimate_frequency(k) <= 2) {
-                    victim = &k;
-                    break;
-                }
-            }
+            for (int i = 0; i < EXTRA_SAMPLES && lowest > 2; ++i) sample();
         }
 
         const auto it = room.keys.find(*victim);
