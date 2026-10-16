@@ -31,7 +31,9 @@ A step-by-step plan for restructuring SomniumDB after the security plan (`securi
 | REF-4 | A command table | 2. Structure | DONE (#38) |
 | REF-5 | Split `main.cpp`: connection layer and authentication | 2. Structure | DONE (#39) |
 | REF-6 | Source layout | 3. Layout and tests | DONE (#40) |
-| REF-7 | Shared test helpers | 3. Layout and tests | IMPLEMENTED (awaiting CI) |
+| REF-7 | Shared test helpers | 3. Layout and tests | MERGED (#41), CI pending |
+
+All seven steps are merged (#35 to #41). REF-1 to REF-6 passed CI before merging. REF-7 was merged while its CI was still running: set it to `DONE (#41)` once that run, or the next run on `main`, is green. What remains are the decisions D1 to D4 below, each of which changes behaviour or conventions and so needs the team's call before it becomes a step.
 
 ## Current state
 
