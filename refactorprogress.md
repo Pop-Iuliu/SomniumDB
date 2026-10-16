@@ -26,8 +26,8 @@ A step-by-step plan for restructuring SomniumDB after the security plan (`securi
 | Step | Title | Phase | Status |
 | --- | --- | --- | --- |
 | REF-1 | Construct the server after startup checks | 1. Foundations | DONE (#35) |
-| REF-2 | One source of configuration | 1. Foundations | IMPLEMENTED (awaiting CI) |
-| REF-3 | Split `database.cpp` by concern | 2. Structure | TODO |
+| REF-2 | One source of configuration | 1. Foundations | DONE (#36) |
+| REF-3 | Split `database.cpp` by concern | 2. Structure | IMPLEMENTED (awaiting CI) |
 | REF-4 | A command table | 2. Structure | TODO |
 | REF-5 | Split `main.cpp`: connection layer and authentication | 2. Structure | TODO |
 | REF-6 | Source layout | 3. Layout and tests | TODO |
@@ -136,6 +136,13 @@ Add the new files to `CMakeLists.txt` and to the source list of the `fuzz` job i
 **Done when:** `git diff --color-moved` shows only moved blocks and the new file headers, no file is above roughly 350 lines, and CI is green with no test changes.
 
 **Files:** `src/core/*.cpp`, `CMakeLists.txt`, `.github/workflows/ci.yml`.
+
+**Result:**
+- **The move:** a script cut each `Database::` function, with the comment above it, into its file in the original order, and asserted that every original line landed in exactly one file. Afterwards the five files hold the same 864 non-blank lines as the old `database.cpp`, and the same 44 functions. `bulk_string()` stays in `database.cpp`, next to `execute()`, because every file uses it.
+- **The only new lines:** a header per file stating what it holds and the lock rules it relies on (taken from `room.h` and `database.h`), and the includes each file needs. `database.cpp` drops `<cstdlib>`, `<sys/wait.h>` and `<unistd.h>`, which only the persistence code used.
+- **Sizes:** `commands.cpp` 305 lines, `database.cpp` 220, `persistence.cpp` 200, `rooms.cpp` 157, `crdt.cpp` 139 (1,007 in one file before).
+- **Commits:** one. The added lines are only headers and includes, so `git diff --color-moved` still separates them from the moved code, which is what the ground rule is for.
+- **Verification so far:** each file compiles on its own with GCC 13 (stub headers), and all five link together with the storage components and run the fuzz harness's sample inputs. The server and the suites need Linux, so CI on this PR is the first real run.
 
 ### REF-4: A command table
 

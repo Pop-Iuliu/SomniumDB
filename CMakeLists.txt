@@ -21,6 +21,10 @@ add_executable(Redis main.cpp
         src/config.cpp
         src/core/database.h
         src/core/database.cpp
+        src/core/commands.cpp
+        src/core/crdt.cpp
+        src/core/persistence.cpp
+        src/core/rooms.cpp
         src/core/resp.h
         src/core/hlc.h
         watchdog.h
