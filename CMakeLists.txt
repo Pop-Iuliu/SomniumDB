@@ -40,7 +40,8 @@ add_executable(Redis main.cpp
         src/utils/count_min_sketch.h
 )
 
-target_link_libraries(Redis uring)
+find_package(OpenSSL REQUIRED)
+target_link_libraries(Redis uring OpenSSL::SSL)
 
 # verificarea parserului RESP: header-only, fara server
 add_executable(resp_test tests/resp_test.cpp)
