@@ -89,6 +89,16 @@ def sec_cold_and_restart(check):
         p2 = c.cmd("PTTL", "a")[1]
         check("PEXPIRE: termen absolut peste restart", 0 < p2 <= p - 20000, (p, p2))
         check("MSET redat dupa restart", c.cmd("GET", "b") == ("bulk", b"2"))
+
+        # DEL cu mai multe chei (si din cold storage): fiecare, o singura data
+        c.cmd("MSET", "d1", "1", "d2", "2", "d3", "3")
+        check("DEL mai multe chei", c.cmd("DEL", "d1", "missing", "d2", "d1") == ("int", 2))
+        check("DEL: toate cheile date au disparut", c.cmd("EXISTS", "d1", "d2", "d3") == ("int", 1))
+        c.close()
+        srv.restart()
+        c = Client(srv)
+        check("DEL mai multe chei: peste restart",
+              c.cmd("MGET", "d1", "d2", "d3") == ("array", [("nil", None), ("nil", None), ("bulk", b"3")]))
         c.close()
     finally:
         srv.cleanup()

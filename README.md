@@ -52,7 +52,7 @@ An embedded HTTP metrics server runs on `127.0.0.1:9090` (`/metrics`; the addres
 
 | Command | Description |
 | --- | --- |
-| `GET key`, `DEL key` | Read or delete; both see keys in cold storage |
+| `GET key`, `DEL key [key ...]` | Read or delete (DEL replies with the number of keys removed); both see keys in cold storage |
 | `SET key value [NX\|XX] [EX seconds\|PX milliseconds]` | Conditional and expiring writes, strictly validated; a failed condition replies nil and writes nothing |
 | `MGET key [key ...]`, `MSET key value [key value ...]` | Multi-key read and atomic multi-key write (one AOF record); an `MGET` reply over 32 MB is refused with `-ERR reply too large` |
 | `EXISTS key [key ...]` | Number of existing keys; repeated keys count each time |
