@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <unordered_map>
@@ -17,6 +18,7 @@
 #include <liburing.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -58,6 +60,9 @@ static unordered_map<int, shared_ptr<Client>> clients;
 static vector<PollTicket*> arm_backlog;
 static int g_eventfd = -1;
 static int g_server_fd = -1;
+static bool accept_paused = false;   // acceptul se re-armeaza la urmatorul sweep, nu pe loc
+static unsigned accept_failures = 0; // logate agregat de sweep, cel mult o linie pe secunda
+static int last_accept_error = 0;
 
 static void set_nonblocking(const int fd) {
     const int flags = fcntl(fd, F_GETFL, 0);
@@ -122,6 +127,7 @@ static void arm_listener(io_uring* ring) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring);
     if (!sqe) {
         if (cfg.trace_fd == -2) printf("[TRACE] arm_listener ESUAT (sqe null)\n");
+        accept_paused = true; // reincercam la sweep, altfel serverul nu mai accepta niciodata
         return;
     }
     io_uring_prep_accept(sqe, g_server_fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
@@ -195,6 +201,32 @@ static bool load_tls() {
     return false;
 }
 
+// fiecare client tine un fd, iar serverul are si el cateva (ring, AOF, cold storage,
+// snapshot-uri, metrici, replicare). Ca Redis: ridicam limita moale cat permite cea tare,
+// iar daca tot nu ajunge, micsoram SOMNIUM_MAXCLIENTS. Altfel accept() da EMFILE inainte
+// de cap, iar clientul in plus nu mai primeste "max number of clients reached".
+static bool fit_fd_limit() {
+    const rlim_t reserved = 32 + 2 * static_cast<rlim_t>(cfg.peers.size());
+    const rlim_t want = std::min<uint64_t>(cfg.maxclients, 1u << 30) + reserved;
+    rlimit lim{};
+    if (getrlimit(RLIMIT_NOFILE, &lim) != 0) return true;
+    if (lim.rlim_cur < want) {
+        rlimit raised = lim;
+        raised.rlim_cur = lim.rlim_max == RLIM_INFINITY ? want : std::min(want, lim.rlim_max);
+        if (setrlimit(RLIMIT_NOFILE, &raised) == 0) lim = raised;
+    }
+    if (lim.rlim_cur >= want) return true;
+    if (lim.rlim_cur <= reserved) {
+        cerr << "Limita de fd-uri (ulimit -n " << lim.rlim_cur << ") nu ajunge serverului: e nevoie de peste "
+             << reserved << "\n";
+        return false;
+    }
+    cerr << "SOMNIUM_MAXCLIENTS=" << cfg.maxclients << " nu incape in limita de fd-uri (ulimit -n "
+         << lim.rlim_cur << "): folosesc " << lim.rlim_cur - reserved << "\n";
+    cfg.maxclients = lim.rlim_cur - reserved;
+    return true;
+}
+
 // SEC-18: o conexiune care nu se autentifica la timp elibereaza locul (fara
 // parola toti clientii sunt autentificati, deci nu se inchide nimic)
 static void close_unauthenticated(const chrono::steady_clock::time_point now) {
@@ -224,6 +256,7 @@ int main() {
     std::optional<Config> loaded = load_config();
     if (!loaded) return 1;
     cfg = std::move(*loaded);
+    if (!fit_fd_limit()) return 1;
     if (!load_tls()) return 1;
     net::init(cfg, g_tls);
 
@@ -344,9 +377,17 @@ int main() {
                     clients[res] = c;
                     arm_client(c, false);
                 } else if (res != -EINTR) {
-                    // accept esuat: logam si re-armam oricum, altfel serverul
-                    // nu mai accepta conexiuni niciodata
-                    printf("[TRACE] accept esuat: %d (%s)\n", res, strerror(-res));
+                    // accept esuat: logat agregat de sweep si re-armat oricum, altfel
+                    // serverul nu mai accepta conexiuni niciodata. Fara fd-uri sau memorie,
+                    // un accept re-armat pe loc esueaza din nou pe loc: bucla tinea un
+                    // nucleu la 100% si scria milioane de linii de log pe secunda. Atunci
+                    // conexiunile asteapta in backlog, iar sweep-ul re-armeaza acceptul.
+                    ++accept_failures;
+                    last_accept_error = -res;
+                    if (res == -EMFILE || res == -ENFILE || res == -ENOBUFS || res == -ENOMEM) {
+                        accept_paused = true;
+                        continue;
+                    }
                 }
                 arm_listener(&ring); // re-arm accept
                 continue;
@@ -390,6 +431,14 @@ int main() {
             close_unauthenticated(now);
             if (const unsigned failures = net::take_auth_failures()) { // SEC-20: cel mult o linie pe secunda
                 printf("[AUTH] parole gresite: %u\n", failures);
+            }
+            if (accept_failures) {
+                printf("[ACCEPT] esecuri: %u (ultima: %s)\n", accept_failures, strerror(last_accept_error));
+                accept_failures = 0;
+            }
+            if (accept_paused) {
+                accept_paused = false;
+                arm_listener(&ring);
             }
             next_sweep = now + chrono::seconds(1);
         }
