@@ -30,7 +30,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-13 | Remove the unused vendored `json.hpp` | 3. Find bugs first | DONE (#19) |
 | SEC-14 | `SECURITY.md` and a deployment checklist | 4. Process and transport | DONE (#20) |
 | SEC-15 | Encrypted transport through a tunnel (docs) | 4. Process and transport | DONE (#21) (WireGuard run pending) |
-| SEC-16 | Native TLS | 4. Process and transport | IMPLEMENTED (awaiting CI) |
+| SEC-16 | Native TLS | 4. Process and transport | DONE (#31) |
 | SEC-17 | Really close dropped connections | 5. Audit 2026-10-05 | DONE (#22) |
 | SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | DONE (#23) |
 | SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | DONE (#24) |
@@ -58,7 +58,7 @@ Kept short on purpose. Update it when a step changes an assumption.
 **Untrusted**
 
 - Every network client before it authenticates.
-- The network between clients and server, and between replication peers, until SEC-15 or SEC-16.
+- The network between clients and server, and between replication peers. Encrypt it with native TLS (SEC-16) or a tunnel (SEC-15); without either, traffic is plain text.
 - Other unprivileged users on the same machine.
 
 **Out of scope for now** (see the deferred list): malicious authenticated clients, malicious peers, side channels, encryption at rest.
@@ -358,7 +358,7 @@ Rows 18 and 19 come from the review of what would remain after every step (2026-
 - **Server:** each `Client` owns an `SSL` on two memory BIOs. `drain_read()` feeds the bytes it read to OpenSSL and appends the decrypted text to `in_buf`; `enqueue_output()` encrypts replies into `out_buf`; handshake messages and alerts go to `out_buf` too. So `out_buf` holds exactly what goes on the wire, and the output caps (SEC-17, SEC-19), the buffer budget (SEC-22), flushing and closing work unchanged. OpenSSL never needs to write while the loop is reading, and the event loop knows nothing about TLS.
 - **Replication:** `secure()` runs `SSL_connect` right after connecting, before `AUTH`, then compares the peer's certificate with the node's own (`X509_cmp`). No CA store and no hostname check: the trust anchor is the cluster certificate itself, like the pinned certificate in the SEC-15 stunnel setup. One `disconnect()` now closes a peer on every path.
 - **Not changed:** TLS encrypts but does not authenticate clients, so `SOMNIUM_PASSWORD` is still required off localhost (SEC-2). No client certificates, as with Redis `tls-auth-clients no`. The SEC-6 "max clients" error is still written in plain text before the handshake; a TLS client sees a failed handshake instead.
-- **Verification so far:** `main.cpp` and `replicator.cpp` compile cleanly with GCC 13 (`-Wall -Wextra`) against stub headers carrying the exact OpenSSL 3 prototypes used, since this machine has no OpenSSL headers. The test's certificate generation (`openssl` 3.5 CLI) and TLS client were checked against a Python TLS server: the cluster certificate verifies, a foreign certificate is rejected, and a plain client sees its connection closed. The server itself needs Linux, so CI on this PR is the first real run. The `redis-cli --tls` check assumes Ubuntu's `redis-tools` is built with TLS.
+- **Verification:** before CI, the code was compiled against stub headers with the exact OpenSSL 3 prototypes, and the test's certificates and TLS client were checked against a Python TLS server. CI on PR #31 was green in one go. Since SEC-21 any failing check turns the tests job red, and that job installs `redis-tools`, so every SEC-16 check passed, including `redis-cli --tls` (Ubuntu's `redis-cli` is built with TLS).
 
 ## Phase 5: Audit 2026-10-05
 
