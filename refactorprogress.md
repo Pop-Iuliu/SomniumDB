@@ -25,7 +25,7 @@ A step-by-step plan for restructuring SomniumDB after the security plan (`securi
 
 | Step | Title | Phase | Status |
 | --- | --- | --- | --- |
-| REF-1 | Construct the server after startup checks | 1. Foundations | TODO |
+| REF-1 | Construct the server after startup checks | 1. Foundations | IMPLEMENTED (awaiting CI) |
 | REF-2 | One source of configuration | 1. Foundations | TODO |
 | REF-3 | Split `database.cpp` by concern | 2. Structure | TODO |
 | REF-4 | A command table | 2. Structure | TODO |
@@ -67,6 +67,17 @@ Findings from reading `main` at `39aac90` (2026-10-16). Each maps to a step. Row
 **Files:** `main.cpp`, a new `tests/ref_test.py` (registered in `tests/run_all.sh`).
 
 **Not in this step:** two instances on different ports in the same directory still share files. Preventing that takes a lock file, which is a feature, so it is on the deferred list.
+
+**Changes from the plan:**
+- The database is `static optional<Database> db`, built with `db.emplace()`. The functions that use it switch from `db.` to `db->`; `Watchdog` becomes a local static next to its `start()`.
+- Only `schedule_close()` and `process_buffered()` use the database outside `main()`; `deliver_pubsub()`, listed in the plan, does not.
+- It is built after every check that can fail (configuration, `bind()`, and `io_uring` setup, which moved before it) and before `listen()`. So the port still refuses connections until the AOF has been replayed, as when it was not bound at all during replay, and readiness checks keep their meaning.
+
+**Result:**
+- The SEC-3 `umask` now also covers the data files; the explicit `0600` modes stay.
+- Startup messages from the database (AOF recovery, migration) now come after `setvbuf`, so they reach a redirected log line by line instead of when the buffer fills.
+- **Test:** `tests/ref_test.py`, registered in `tests/run_all.sh`. A server with `SOMNIUM_MAX_KEYS=0` puts a key in `cold.bin`; then a second start in the same directory, once on the same port and once with an invalid `SOMNIUM_BIND`, must exit with code 1 and leave `cold.bin` unchanged, and the first server must still return the key.
+- **Verification so far:** `main.cpp` compiles cleanly with GCC 13 (stub headers). The test was run against a Python stand-in for the server: it passes when the data is opened after the checks, and fails all three data checks when it is opened before them, as the old binary does. The server itself needs Linux, so CI on this PR is the first real run.
 
 ### REF-2: One source of configuration
 

@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include <vector>
 #include <memory>
+#include <optional>
 #include <cstring>
 #include <strings.h>
 #include <cstdlib>
@@ -39,14 +40,13 @@ using namespace std;
 #define MAX_CLIENT_OUTPUT Database::MAX_REPLY
 static constexpr auto AUTH_TIMEOUT = chrono::seconds(10); // SEC-18: cat poate tine un strain un loc
 
-static Database db;
+static optional<Database> db; // REF-1: construita in main(), dupa verificarile de pornire
 static string g_password; // SEC-2: SOMNIUM_PASSWORD; gol = fara autentificare
 static unsigned g_auth_failures = 0; // SEC-20: parole gresite inca nelogate
 static uint64_t g_maxclients = 10000; // SEC-6: SOMNIUM_MAXCLIENTS, ca Redis
 static uint64_t g_max_client_buffers = 1ull << 30; // SEC-22: SOMNIUM_MAX_CLIENT_BUFFERS
 static uint64_t g_client_buffers = 0; // SEC-22: octetii din bufferele tuturor clientilor
 static SSL_CTX* g_tls = nullptr; // SEC-16: SOMNIUM_TLS_CERT + SOMNIUM_TLS_KEY; nullptr = text clar
-static Watchdog watchdog(db);
 
 // SEC-16: TLS sta intre socket si buffere, pe BIO-uri de memorie. I/O-ul pe socket
 // ramane neschimbat; in_buf primeste text clar, out_buf textul cifrat gata de
@@ -156,7 +156,7 @@ static void schedule_close(const shared_ptr<Client>& c) {
     track(*c);
     if (g_trace == -2 || g_trace == c->fd)
         printf("[TRACE] fd %d CLOSE\n", c->fd);
-    db.cleanup_client(c->fd);
+    db->cleanup_client(c->fd);
     // un poll armat in ring tine socketul (si clientul, cu bufferele lui) in viata
     // dupa close; shutdown il trezeste acum si inchide conexiunea efectiv
     ::shutdown(c->fd, SHUT_RDWR);
@@ -395,7 +395,7 @@ static bool process_buffered(const shared_ptr<Client>& c) {
         const string response = strcasecmp(name, "AUTH") == 0    ? auth(*c, args)
                               : strcasecmp(name, "HELLO") == 0   ? hello(*c, args)
                               : !c->authenticated                ? "-NOAUTH Authentication required.\r\n"
-                                                                 : db.execute(c->fd, args, c->resp3);
+                                                                 : db->execute(c->fd, args, c->resp3);
         if (!response.empty() && !enqueue_output(c, response)) return false; // deconectat (cap output)
     }
     c->in_buf.erase(0, pos);
@@ -480,8 +480,7 @@ static void pump_work() {
 }
 
 int main() {
-    // SEC-3: tot ce cream de aici incolo e doar al proprietarului. Fisierele
-    // deschise la initializarea statica (AOF, cold.bin) au deja 0600 explicit.
+    // SEC-3: tot ce cream e doar al proprietarului (si 0600 explicit la fiecare open)
     umask(077);
 
     // portul poate fi suprascris (ex: masina de dev are deja un redis pe 6379)
@@ -552,7 +551,6 @@ int main() {
         close(g_server_fd);
         return 1;
     }
-    listen(g_server_fd, 4096);
 
     struct io_uring ring;
     if (io_uring_queue_init(URING_ENTRIES, &ring, 0) < 0) {
@@ -560,17 +558,24 @@ int main() {
         return 1;
     }
 
+    // REF-1: datele se deschid abia dupa toate verificarile, deci o pornire gresita
+    // (alt server pe port, configuratie invalida) nu atinge directorul de date.
+    // Portul accepta conexiuni abia dupa replay-ul AOF, ca inainte.
+    db.emplace();
+    listen(g_server_fd, 4096);
+
     // mesajele Pub/Sub intra in cozile de output ale abonatilor
-    db.set_message_sink(deliver_pubsub);
+    db->set_message_sink(deliver_pubsub);
 
     arm_listener(&ring);
     arm_eventfd(&ring);
 
     cout << "Server pornit (io_uring" << (g_tls ? ", TLS" : "") << ") pe " << bind_ip << ":" << port << "...\n";
+    static Watchdog watchdog(*db);
     watchdog.start();
 
     // replicare CRDT catre SOMNIUM_PEERS (nimic fara peers)
-    static Replicator replicator(db.replication_frontier(), g_tls);
+    static Replicator replicator(db->replication_frontier(), g_tls);
     replicator.start();
 
     bool first_wait = true; // doar prima asteptare e sensibila la CQE-uri pierdute
