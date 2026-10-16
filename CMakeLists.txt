@@ -19,6 +19,10 @@ add_link_options(-pie -Wl,-z,relro,-z,now)
 add_executable(Redis main.cpp
         src/config.h
         src/config.cpp
+        src/net/connection.h
+        src/net/connection.cpp
+        src/net/auth.h
+        src/net/auth.cpp
         src/core/database.h
         src/core/database.cpp
         src/core/commands.cpp

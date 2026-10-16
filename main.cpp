@@ -5,7 +5,6 @@
 #include <memory>
 #include <optional>
 #include <cstring>
-#include <strings.h>
 #include <cstdlib>
 #include <unistd.h>
 #include <fcntl.h>
@@ -24,107 +23,26 @@
 
 #include "metrics.h"
 #include "src/core/database.h"
-#include "src/core/resp.h"
 #include "src/config.h"
+#include "src/net/auth.h"
+#include "src/net/connection.h"
 #include "src/storage/replicator.h"
 #include "watchdog.h"
 
 using namespace std;
+using net::Client;
 
 #define URING_ENTRIES 4096
-#define READ_CHUNK 16384
-#define MAX_COMMANDS_PER_TURN 8192
-#define MAX_INPUT_BUFFER (128ull * 1024 * 1024)
-#define MAX_UNAUTH_BUFFER (16ull * 1024) // un strain nu are voie sa ne tina megaocteti (input sau output)
-#define MAX_CLIENT_OUTPUT Database::MAX_REPLY
 static constexpr auto AUTH_TIMEOUT = chrono::seconds(10); // SEC-18: cat poate tine un strain un loc
 
 static optional<Database> db; // REF-1: construita in main(), dupa verificarile de pornire
 static Config cfg; // REF-2: citita o singura data, la pornire (load_config)
-static unsigned g_auth_failures = 0; // SEC-20: parole gresite inca nelogate
-static uint64_t g_client_buffers = 0; // SEC-22: octetii din bufferele tuturor clientilor
 static SSL_CTX* g_tls = nullptr; // SEC-16: SOMNIUM_TLS_CERT + SOMNIUM_TLS_KEY; nullptr = text clar
-
-// SEC-16: TLS sta intre socket si buffere, pe BIO-uri de memorie. I/O-ul pe socket
-// ramane neschimbat; in_buf primeste text clar, out_buf textul cifrat gata de
-// trimis, deci capurile, bugetul si flush-ul lucreaza la fel ca fara TLS.
-static SSL* tls_session() {
-    SSL* ssl = SSL_new(g_tls);
-    BIO* rbio = BIO_new(BIO_s_mem());
-    BIO* wbio = BIO_new(BIO_s_mem());
-    if (!ssl || !rbio || !wbio) abort(); // ca orice alocare esuata
-    SSL_set_bio(ssl, rbio, wbio);
-    SSL_set_accept_state(ssl);
-    return ssl;
-}
 
 // S3 "naigie": calutul de munca care nu se opreste pentru niciun client.
 // Fiecare client are o coada de output ordonata; scrierile partiale se reiau
 // pe evenimente io_uring POLLOUT, niciodata prin asteptare blocanta in timpul
 // unei comenzi. Clientii care nu urmeaza citirea sunt deconectati la un cap.
-
-struct Client {
-    int fd;
-    string in_buf;
-    string out_buf;
-    size_t out_off = 0; // bytes deja plecati din out_buf
-    bool closed = false;
-    bool read_armed = false;
-    bool write_armed = false;
-    bool resp3 = false; // protocolul negociat prin HELLO
-    bool authenticated = cfg.password.empty();
-    size_t held = 0; // cat din g_client_buffers e al acestui client
-    unique_ptr<SSL, decltype(&SSL_free)> ssl{g_tls ? tls_session() : nullptr, SSL_free}; // SEC-16
-    const chrono::steady_clock::time_point connected = chrono::steady_clock::now();
-
-    explicit Client(int f) : fd(f) {}
-    size_t pending_out() const { return out_buf.size() - out_off; }
-    size_t input_cap() const { return authenticated ? MAX_INPUT_BUFFER : MAX_UNAUTH_BUFFER; }
-    size_t output_cap() const { return authenticated ? MAX_CLIENT_OUTPUT : MAX_UNAUTH_BUFFER; }
-};
-
-// SEC-22: aduce totalul la zi dupa orice schimbare a bufferelor clientului.
-// out_buf numara si partea deja trimisa: ramane alocata pana la golire.
-static void track(Client& c) {
-    const size_t now = c.closed ? 0 : c.in_buf.size() + c.out_buf.size();
-    g_client_buffers = g_client_buffers - c.held + now;
-    c.held = now;
-}
-
-static bool over_buffer_budget(const Client& c, const size_t extra) {
-    if (g_client_buffers + extra <= cfg.max_client_buffers) return false;
-    printf("[ClientBuffers] FD %d: bufferele clientilor depasesc SOMNIUM_MAX_CLIENT_BUFFERS. Deconectat.\n", c.fd);
-    return true;
-}
-
-// ce a produs OpenSSL (handshake, inregistrari, alerte) trece in out_buf
-static void take_ciphertext(Client& c) {
-    BIO* wbio = SSL_get_wbio(c.ssl.get());
-    char* data = nullptr;
-    const long n = BIO_get_mem_data(wbio, &data);
-    c.out_buf.append(data, static_cast<size_t>(n));
-    (void)BIO_reset(wbio);
-}
-
-// octeti cifrati de pe socket -> text clar in in_buf; false = handshake esuat, alerta sau inchidere
-static bool tls_in(Client& c, const char* raw, const size_t len) {
-    BIO_write(SSL_get_rbio(c.ssl.get()), raw, static_cast<int>(len));
-    char plain[READ_CHUNK];
-    int n;
-    while ((n = SSL_read(c.ssl.get(), plain, sizeof(plain))) > 0) c.in_buf.append(plain, static_cast<size_t>(n));
-    take_ciphertext(c);
-    if (SSL_get_error(c.ssl.get(), n) == SSL_ERROR_WANT_READ) return true;
-    ERR_clear_error(); // coada de erori e a thread-ului: urmatorul client o vrea goala
-    return false;
-}
-
-// text clar -> inregistrari TLS in out_buf
-static bool tls_out(Client& c, const string& data) {
-    const bool ok = SSL_write(c.ssl.get(), data.data(), static_cast<int>(data.size())) > 0;
-    if (!ok) ERR_clear_error();
-    take_ciphertext(c);
-    return ok;
-}
 
 // un PollTicket zboara cu fiecare poll armat in ring; shared_ptr tine clientul
 // viu pana la CQE, chiar daca intre timp a fost deconectat
@@ -149,7 +67,7 @@ static void set_nonblocking(const int fd) {
 static void schedule_close(const shared_ptr<Client>& c) {
     if (c->closed) return;
     c->closed = true;
-    track(*c);
+    net::track(*c);
     if (cfg.trace_fd == -2 || cfg.trace_fd == c->fd)
         printf("[TRACE] fd %d CLOSE\n", c->fd);
     db->cleanup_client(c->fd);
@@ -222,53 +140,6 @@ static void arm_eventfd(io_uring* ring) {
     if (cfg.trace_fd == -2) printf("[TRACE] arm_eventfd submit=%d\n", submitted);
 }
 
-// tri-state: Complete = tot a plecat; Pending = fd plin, reluam pe POLLOUT; Dead = eroare
-enum class FlushResult { Complete, Pending, Dead };
-
-static FlushResult flush_output(Client& c) {
-    while (c.out_off < c.out_buf.size()) {
-        const ssize_t n = ::send(c.fd, c.out_buf.data() + c.out_off,
-                                 c.out_buf.size() - c.out_off, MSG_NOSIGNAL);
-        if (n > 0) {
-            c.out_off += static_cast<size_t>(n);
-            continue;
-        }
-        if (n < 0 && errno == EINTR) continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (cfg.trace_fd == -2 || cfg.trace_fd == c.fd)
-                printf("[TRACE] fd %d flush Pending la %zu/%zu\n", c.fd, c.out_off, c.out_buf.size());
-            return FlushResult::Pending;
-        }
-        return FlushResult::Dead;
-    }
-    c.out_buf.clear();
-    c.out_off = 0;
-    track(c);
-    return FlushResult::Complete;
-}
-
-// capul de output: deconecteaza clientii prea lenti ca sa nu moara serverul
-static bool enqueue_output(const shared_ptr<Client>& c, const string& data) {
-    if (c->closed) return false;
-    if (c->pending_out() + data.size() > c->output_cap()) {
-        printf("[SlowClient] FD %d a depasit bufferul de output (%llu KB). Deconectat.\n",
-               c->fd, static_cast<unsigned long long>(c->output_cap() >> 10));
-        schedule_close(c);
-        return false;
-    }
-    if (over_buffer_budget(*c, data.size())) {
-        schedule_close(c);
-        return false;
-    }
-    if (!c->ssl) c->out_buf += data;
-    else if (!tls_out(*c, data)) {
-        schedule_close(c);
-        return false;
-    }
-    track(*c);
-    return true;
-}
-
 static void deliver_pubsub(const int fd, const string& msg) {
     const auto it = clients.find(fd);
     if (it == clients.end() || it->second->closed) return;
@@ -277,15 +148,15 @@ static void deliver_pubsub(const int fd, const string& msg) {
         // confunde cu raspunsul unei comenzi trimise de abonat intre timp
         string push = msg;
         push[0] = '>';
-        if (!enqueue_output(it->second, push)) return;
-    } else if (!enqueue_output(it->second, msg)) {
-        return;
+        if (!net::enqueue_output(*it->second, push)) return schedule_close(it->second);
+    } else if (!net::enqueue_output(*it->second, msg)) {
+        return schedule_close(it->second);
     }
 
     // incercam trimisul direct; daca fd-ul e plin, POLLOUT il ia mai tarziu
-    const auto r = flush_output(*it->second);
-    if (r == FlushResult::Pending) arm_client(it->second, true);
-    else if (r == FlushResult::Dead) schedule_close(it->second);
+    const auto r = net::flush_output(*it->second);
+    if (r == net::FlushResult::Pending) arm_client(it->second, true);
+    else if (r == net::FlushResult::Dead) schedule_close(it->second);
 }
 
 static void queue_work() {
@@ -295,146 +166,17 @@ static void queue_work() {
     }
 }
 
-// SEC-2: un singur utilizator, "default". Parola se compara in timp constant:
-// bucla merge mereu pe toata lungimea asteptata, fara iesire timpurie.
-static bool credentials_ok(const string& user, const string& pass) {
-    unsigned char diff = pass.size() != cfg.password.size();
-    for (size_t i = 0; i < cfg.password.size(); ++i) {
-        diff |= static_cast<unsigned char>(cfg.password[i] ^ (i < pass.size() ? pass[i] : 0));
-    }
-    return diff == 0 && user == "default";
-}
-
-static string authenticate(Client& c, const string& user, const string& pass) {
-    if (!credentials_ok(user, pass)) {
-        ++g_auth_failures; // logate agregat de sweep-ul din bucla
-        return "-WRONGPASS invalid username-password pair\r\n";
-    }
-    c.authenticated = true;
-    return "+OK\r\n";
-}
-
-// AUTH [user] pass
-static string auth(Client& c, const vector<string>& args) {
-    if (args.size() != 2 && args.size() != 3) return "-ERR wrong number of arguments for 'auth' command\r\n";
-    if (cfg.password.empty()) {
-        return "-ERR AUTH <password> called without any password configured for the default user. "
-               "Are you sure your configuration is correct?\r\n";
-    }
-    return authenticate(c, args.size() == 3 ? args[1] : "default", args.back());
-}
-
-// HELLO [protover [AUTH user pass] [SETNAME name]]: protocolul tine de conexiune.
-// Fara parola configurata AUTH e acceptat ca pentru utilizatorul default fara
-// parola; SETNAME e ignorat. Raspunsul: harta pe RESP3, lista plata pe RESP2.
-// "version" e nivelul de protocol Redis pe care il imitam.
-static string hello(Client& c, const vector<string>& args) {
-    int proto = c.resp3 ? 3 : 2;
-    if (args.size() >= 2) {
-        const string& v = args[1];
-        if (const auto [p, ec] = from_chars(v.data(), v.data() + v.size(), proto); ec != errc() || p != v.data() + v.size()) {
-            return "-ERR Protocol version is not an integer or out of range\r\n";
-        }
-        if (proto != 2 && proto != 3) return "-NOPROTO unsupported protocol version\r\n";
-        for (size_t i = 2; i < args.size();) {
-            if (strcasecmp(args[i].c_str(), "AUTH") == 0 && i + 2 < args.size()) {
-                if (!cfg.password.empty()) {
-                    if (string r = authenticate(c, args[i + 1], args[i + 2]); r[0] == '-') return r;
-                }
-                i += 3;
-            } else if (strcasecmp(args[i].c_str(), "SETNAME") == 0 && i + 1 < args.size()) {
-                i += 2;
-            } else {
-                return "-ERR Syntax error in HELLO option '" + args[i] + "'\r\n";
-            }
-        }
-    }
-    if (!c.authenticated) {
-        return "-NOAUTH HELLO must be called with the client already authenticated, otherwise the "
-               "HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and "
-               "select the RESP protocol version at the same time\r\n";
-    }
-    c.resp3 = proto == 3;
-
-    const auto bulk = [](const string& s) { return "$" + to_string(s.size()) + "\r\n" + s + "\r\n"; };
-    return (c.resp3 ? "%7\r\n" : "*14\r\n") + bulk("server") + bulk("somnium") + bulk("version") + bulk("7.0.0") +
-           bulk("proto") + ":" + (c.resp3 ? "3" : "2") + "\r\n" + bulk("id") + ":" + to_string(c.fd) + "\r\n" +
-           bulk("mode") + bulk("standalone") + bulk("role") + bulk("master") + bulk("modules") + "*0\r\n";
-}
-
-// proceseaza comenzi buffered (pana la buget); true = mai exista input complet neprocesat
-static bool process_buffered(const shared_ptr<Client>& c) {
-    // parsam de la un offset si stergem inputul consumat o singura data pe
-    // batch: un pipeline adanc costa liniar, nu cate o copiere per comanda
-    int processed = 0;
-    size_t pos = 0;
-    vector<string> args;
-    resp::Status st = resp::Status::NeedMore;
-    bool quit = false;
-
-    while (processed < MAX_COMMANDS_PER_TURN) {
-        size_t end = 0;
-        st = resp::parse_request(c->in_buf, pos, &end, &args);
-        if (st != resp::Status::Complete) break;
-        pos = end;
-        ++processed;
-
-        // QUIT tine de conexiune, nu de baza de date: raspundem si inchidem
-        if (args.size() == 1 && strcasecmp(args[0].c_str(), "QUIT") == 0) {
-            quit = true;
-            break;
-        }
-
-        // AUTH si HELLO tin de conexiune; HELLO alege protocolul in care raspund
-        // celelalte comenzi. Pana la autentificare, doar ele (si QUIT) trec.
-        const char* name = args.empty() ? "" : args[0].c_str();
-        const string response = strcasecmp(name, "AUTH") == 0    ? auth(*c, args)
-                              : strcasecmp(name, "HELLO") == 0   ? hello(*c, args)
-                              : !c->authenticated                ? "-NOAUTH Authentication required.\r\n"
-                                                                 : db->execute(c->fd, args, c->resp3);
-        if (!response.empty() && !enqueue_output(c, response)) return false; // deconectat (cap output)
-    }
-    c->in_buf.erase(0, pos);
-    track(*c);
-
-    // ca Redis: dupa QUIT sau o eroare de protocol (inputul nu mai poate fi
-    // resincronizat) trimitem ultimul raspuns si inchidem
-    if (quit || st == resp::Status::Malformed) {
-        if (enqueue_output(c, quit ? "+OK\r\n" : "-ERR Protocol error\r\n")) flush_output(*c);
+// ruleaza inputul clientului si face ce a cerut conexiunea (REF-5: inchiderea si
+// armarea raman aici); true = bugetul a lasat input complet neprocesat
+static bool serve(const shared_ptr<Client>& c) {
+    const net::Step step = net::process_buffered(*c, *db);
+    if (step == net::Step::Drop) {
         schedule_close(c);
         return false;
     }
-
-    const auto r = flush_output(*c);
-    if (r == FlushResult::Pending) arm_client(c, true);
-    else if (r == FlushResult::Dead) {
-        schedule_close(c);
-        return false;
-    }
-
-    arm_client(c, false); // re-arm read
-    return processed == MAX_COMMANDS_PER_TURN && !c->in_buf.empty();
-}
-
-// citeste tot ce e disponibil; false = conexiunea s-a terminat
-static bool drain_read(const shared_ptr<Client>& c) {
-    char temp[READ_CHUNK];
-    while (c->in_buf.size() < c->input_cap()) {
-        const ssize_t n = read(c->fd, temp, sizeof(temp));
-        if (n > 0) {
-            if (!c->ssl) c->in_buf.append(temp, static_cast<size_t>(n));
-            else if (!tls_in(*c, temp, static_cast<size_t>(n))) return false;
-            track(*c);
-            if (over_buffer_budget(*c, 0)) return false; // apelantul il inchide
-            if (static_cast<size_t>(n) < sizeof(temp)) return true; // s-a golit kernel bufferul
-            continue;
-        }
-        if (n == 0) return false; // EOF
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-        return false;
-    }
-    return true; // cap de input: restul asteapta urmatorul ciclu
+    if (c->pending_out() > 0) arm_client(c, true); // socketul e plin: restul pleaca pe POLLOUT
+    arm_client(c, false);                           // re-arm read
+    return step == net::Step::More;
 }
 
 // SEC-16: SOMNIUM_TLS_CERT si SOMNIUM_TLS_KEY pornesc TLS pentru clienti si pentru replicare
@@ -471,7 +213,7 @@ static void pump_work() {
 
     for (const auto& c : snapshot) {
         if (c->closed || c->in_buf.empty()) continue;
-        if (process_buffered(c)) queue_work(); // inca mai e lucru: re-signal
+        if (serve(c)) queue_work(); // inca mai e lucru: re-signal
     }
 }
 
@@ -483,6 +225,7 @@ int main() {
     if (!loaded) return 1;
     cfg = std::move(*loaded);
     if (!load_tls()) return 1;
+    net::init(cfg, g_tls);
 
     if (cfg.metrics) start_prometheus_exporter(9090, cfg.metrics_bind);
     signal(SIGPIPE, SIG_IGN);
@@ -621,16 +364,16 @@ int main() {
 
             if (for_write) {
                 c->write_armed = false;
-                const auto r = flush_output(*c);
-                if (r == FlushResult::Pending) arm_client(c, true);
-                else if (r == FlushResult::Dead) schedule_close(c);
+                const auto r = net::flush_output(*c);
+                if (r == net::FlushResult::Pending) arm_client(c, true);
+                else if (r == net::FlushResult::Dead) schedule_close(c);
             } else {
                 c->read_armed = false;
-                if (!drain_read(c)) {
+                if (!net::drain_read(*c)) {
                     schedule_close(c);
                     continue;
                 }
-                if (process_buffered(c)) {
+                if (serve(c)) {
                     queue_work(); // mai sunt comenzi buff-uite fara event nou
                 } else if (c->in_buf.size() >= c->input_cap()) {
                     schedule_close(c); // o comanda incompleta a umplut bufferul
@@ -642,9 +385,8 @@ int main() {
 
         if (const auto now = chrono::steady_clock::now(); now >= next_sweep) {
             close_unauthenticated(now);
-            if (g_auth_failures > 0) { // SEC-20: oricate ghiciri, cel mult o linie pe secunda
-                printf("[AUTH] parole gresite: %u\n", g_auth_failures);
-                g_auth_failures = 0;
+            if (const unsigned failures = net::take_auth_failures()) { // SEC-20: cel mult o linie pe secunda
+                printf("[AUTH] parole gresite: %u\n", failures);
             }
             next_sweep = now + chrono::seconds(1);
         }

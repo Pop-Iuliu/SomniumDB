@@ -28,8 +28,8 @@ A step-by-step plan for restructuring SomniumDB after the security plan (`securi
 | REF-1 | Construct the server after startup checks | 1. Foundations | DONE (#35) |
 | REF-2 | One source of configuration | 1. Foundations | DONE (#36) |
 | REF-3 | Split `database.cpp` by concern | 2. Structure | DONE (#37) |
-| REF-4 | A command table | 2. Structure | IMPLEMENTED (awaiting CI) |
-| REF-5 | Split `main.cpp`: connection layer and authentication | 2. Structure | TODO |
+| REF-4 | A command table | 2. Structure | DONE (#38) |
+| REF-5 | Split `main.cpp`: connection layer and authentication | 2. Structure | IMPLEMENTED (awaiting CI) |
 | REF-6 | Source layout | 3. Layout and tests | TODO |
 | REF-7 | Shared test helpers | 3. Layout and tests | TODO |
 
@@ -186,6 +186,18 @@ Add the new files to `CMakeLists.txt` and to the source list of the `fuzz` job i
 **Files:** `main.cpp`, `src/net/*`, `CMakeLists.txt`.
 
 **Depends on:** REF-2, which removes configuration parsing from `main.cpp` first.
+
+**Changes from the plan:**
+- **The seam, concretely:** `enqueue_output()` returns `false` instead of closing the client, and `process_buffered()` returns a `Step` (`Drop`, `Done`, `More`). A small `serve()` in `main.cpp` acts on it: it closes on `Drop`, arms a write while `pending_out() > 0`, re-arms the read, and reports `More`. Output pending after a flush is exactly the old `FlushResult::Pending`, so the polls are armed in the same order and under the same conditions.
+- **Configuration:** the connection layer gets its settings once, through `net::init(cfg, tls)`, instead of reading `main.cpp`'s globals. `Client`'s constructor uses them for `authenticated` and the TLS session. The buffer total (SEC-22) moved with it.
+- **Auth:** `auth()` and `hello()` take the password as a parameter, so `auth.cpp` does not depend on the connection's settings. The SEC-20 counter lives there; the sweep reads and resets it with `net::take_auth_failures()`.
+- The buffer limits became `constexpr` constants inside `connection.cpp`; the output cap uses `Database::MAX_REPLY` directly.
+- `SOMNIUM_TRACE_FD` (decision D3) is untouched: the one trace line in `flush_output()` moved with it.
+
+**Result:**
+- `src/net/connection.{h,cpp}` (257 lines) and `src/net/auth.{h,cpp}` (106 lines). The `AUTH` gate, buffer accounting and caps, and TLS now live there, as one reviewable unit.
+- `main.cpp` went from 652 to 394 lines, not the planned "roughly 300". What remains is startup (configuration, TLS context, socket, ring, components) and the io_uring loop itself. Shrinking it further would mean splitting the loop, which is a separate decision, not part of this step.
+- **Verification so far:** every file compiles cleanly with GCC 13 (stub headers). A differential check `#include`d the old and the new `main.cpp` into the same driver, with a `send()` stub that records the bytes and can simulate a full socket. It ran 20 scenarios through both: pipelined and partial commands, `QUIT`, malformed input, the 8,192-command budget, a full socket, RESP3, and, with a password, `NOAUTH`, wrong and right passwords, `HELLO 3 AUTH`, an unauthenticated client hitting the 16 KB cap, and one facing a full socket. Bytes sent, closing, armed polls, the "more work" signal, leftover input, pending output and the failed-attempt count were identical. The server and the suites need Linux, so CI on this PR is the first real run.
 
 ## Phase 3: Layout and tests
 
