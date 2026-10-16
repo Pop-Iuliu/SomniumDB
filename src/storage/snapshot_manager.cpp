@@ -61,8 +61,10 @@ bool SnapshotManager::wakeup_room(Room& room, PoolAllocator<Record, 1024>& pool)
     bool corrupt = false;
     size_t off = 0;
 
+    // off <= data.size() mereu; "off + n" ar trece peste SIZE_MAX la o lungime absurda
+    // (ex. octeti 0xFF) si un std::string de SIZE_MAX ar opri procesul la fiecare pornire
     const auto need = [&](const size_t n) {
-        return off + n <= data.size();
+        return n <= data.size() - off;
     };
     const auto read_bytes = [&](void* dst, const size_t n) {
         std::memcpy(dst, data.data() + off, n);
@@ -90,7 +92,8 @@ bool SnapshotManager::wakeup_room(Room& room, PoolAllocator<Record, 1024>& pool)
         if (is_v2) {
             // magic(4) + version(4) sunt deja validati: sarim peste ei
             off = 8;
-            read_bytes(&num_records, sizeof(num_records));
+            if (need(sizeof(num_records))) read_bytes(&num_records, sizeof(num_records));
+            else corrupt = true; // header trunchiat dupa versiune
         } else {
             // format v1 (legacy): primii 8 bytes sunt num_records, fara magic
             std::memcpy(&num_records, data.data(), sizeof(num_records));

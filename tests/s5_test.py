@@ -283,6 +283,10 @@ def main():
             ("magic prost", b"GARBAGE-GARBAGE-9"),
             ("versiune necunoscuta", b"RSNP" + struct.pack("<I", 99) + struct.pack("<Q", 1)),
             ("trunchiat la mijloc", None),  # construit mai jos
+            # o lungime de cheie 0xFF..FF trecea de verificare (off + n depasea SIZE_MAX)
+            # si std::string-ul de SIZE_MAX oprea serverul la fiecare trezire
+            ("lungime de cheie 0xFF", b"RSNP" + struct.pack("<I", 2) + struct.pack("<Q", 1) + b"\xff" * 8),
+            ("header trunchiat dupa versiune", b"RSNP" + struct.pack("<I", 2) + b"\x01\x00"),
         ):
             srv = Server(env_extra={"SOMNIUM_NO_METRICS": "1"}, keep_dir_on_retry=True)
             try:
