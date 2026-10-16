@@ -61,34 +61,11 @@ namespace {
     }
 } // namespace
 
-AOFManager::AOFManager() {
-    const char* env = getenv("SOMNIUM_AOF_SYNC");
-    const std::string val = env ? env : "everysec";
-    if (val == "always") sync_policy_ = SyncPolicy::Always;
-    else if (val == "everysec") sync_policy_ = SyncPolicy::Everysec;
-    else if (val == "no" || val == "none" || val == "off") sync_policy_ = SyncPolicy::Off;
-    else {
-        sync_policy_ = SyncPolicy::Everysec;
-        fprintf(stderr, "SOMNIUM_AOF_SYNC necunoscut: '%s' (folosesc everysec)\n", val.c_str());
-    }
-    if (const char* min = getenv("SOMNIUM_AOF_REWRITE_MIN_BYTES"); min && !fsutil::parse_u64(min, &rewrite_min_)) {
-        fprintf(stderr, "SOMNIUM_AOF_REWRITE_MIN_BYTES invalid: '%s'\n", min);
-    }
-    long long interval = 1000;
-    if (const char* env = getenv("SOMNIUM_AOF_SYNC_INTERVAL_MS"); env && !fsutil::parse_i64(env, &interval)) {
-        fprintf(stderr, "SOMNIUM_AOF_SYNC_INTERVAL_MS invalid: '%s' (folosesc 1000)\n", env);
-        interval = 1000;
-    }
-    if (interval < 1) interval = 1;
-    if (interval > 60000) interval = 60000;
-    sync_interval_ms_ = interval;
-    long long delay = 0;
-    if (const char* env = getenv("SOMNIUM_AOF_SYNC_DELAY_MS"); env && !fsutil::parse_i64(env, &delay)) {
-        fprintf(stderr, "SOMNIUM_AOF_SYNC_DELAY_MS invalid: '%s'\n", env);
-        delay = 0;
-    }
-    if (delay < 0 || delay > 60000) delay = 0;
-    sync_delay_ms_ = static_cast<int>(delay);
+AOFManager::AOFManager(const Config& cfg)
+    : sync_policy_(cfg.aof_sync),
+      sync_interval_ms_(cfg.aof_sync_interval_ms),
+      sync_delay_ms_(cfg.aof_sync_delay_ms),
+      rewrite_min_(cfg.aof_rewrite_min_bytes) {
     next_attempt_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(sync_interval_ms_);
     if (sync_policy_ == SyncPolicy::Everysec) {
         sync_thread_ = std::thread([this] { sync_worker(); });

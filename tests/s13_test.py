@@ -100,9 +100,29 @@ def sec_peer_down(check):
         b.cleanup()
 
 
+def sec_malformed_peer(check):
+    # REF-2: replicatorul sare peste o intrare invalida, deci nici colectarea nu o mai asteapta
+    a = Server(port=PORT_A, keep_dir_on_retry=True, env_extra={
+        **ENV, "SOMNIUM_NODE_ID": "1", "SOMNIUM_PEERS": f"127.0.0.1:{PORT_B},not-a-peer"})
+    b = node(2, PORT_B, PORT_A)
+    try:
+        a.start()
+        b.start()
+        ca = Client(a)
+        ca.cmd("SET", "x", "1")
+        ca.cmd("DEL", "x")
+        check("REF-2: tombstone pe A", tombstones(ca) >= 1)
+        check("REF-2: o intrare invalida in SOMNIUM_PEERS nu opreste uitarea tombstone-urilor",
+              wait_until(lambda: tombstones(ca) == 0), tombstones(ca))
+        ca.close()
+    finally:
+        a.cleanup()
+        b.cleanup()
+
+
 def main():
     fails = []
-    for sec in (sec_converge, sec_peer_down):
+    for sec in (sec_converge, sec_peer_down, sec_malformed_peer):
         run_with_retry(sec, fails)
     report(fails, "s13")
 

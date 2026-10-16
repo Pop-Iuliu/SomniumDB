@@ -9,43 +9,24 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace {
-    long long get_current_time_ms() {
-        // SOMNIUM_CLOCK_OFFSET_MS muta ceasul: ceas controlabil pentru testele
-        // de expirare peste restart (timp "trecut" cat serverul era oprit)
-        static const long long offset = [] {
-            long long v = 0;
-            const char* env = getenv("SOMNIUM_CLOCK_OFFSET_MS");
-            return env && fsutil::parse_i64(env, &v) ? v : 0;
-        }();
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()
-        ).count() + offset;
-    }
+// SOMNIUM_CLOCK_OFFSET_MS muta ceasul: ceas controlabil pentru testele
+// de expirare peste restart (timp "trecut" cat serverul era oprit)
+long long Database::get_current_time_ms() const {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count() + clock_offset_ms_;
 }
 
-Database::Database() {
+Database::Database(const Config& cfg)
+    : local_node_id(cfg.node_id),
+      peer_count_(cfg.peers.size()), // aceeasi lista ca replicatorul (REF-2)
+      max_clock_offset_ms(cfg.max_clock_offset_ms),
+      max_rooms_(cfg.max_rooms),
+      clock_offset_ms_(cfg.clock_offset_ms),
+      snapshot_delay_ms_(cfg.snapshot_delay_ms),
+      aof(cfg),
+      eviction(cfg) {
     start_time = std::chrono::steady_clock::now();
-    if (const char* env = getenv("SOMNIUM_NODE_ID")) {
-        uint64_t id = 0;
-        if (fsutil::parse_u64(env, &id) && id >= 1 && id <= UINT32_MAX) local_node_id = static_cast<uint32_t>(id);
-        else fprintf(stderr, "SOMNIUM_NODE_ID invalid: '%s' (folosesc 1)\n", env);
-    }
-    if (const char* env = getenv("SOMNIUM_PEERS")) {
-        const std::string peers = env;
-        for (size_t start = 0; start < peers.size();) {
-            const size_t comma = std::min(peers.find(',', start), peers.size());
-            peer_count_ += comma > start;
-            start = comma + 1;
-        }
-    }
-    if (const char* env = getenv("SOMNIUM_MAX_CLOCK_OFFSET_MS"); env && !fsutil::parse_i64(env, &max_clock_offset_ms)) {
-        fprintf(stderr, "SOMNIUM_MAX_CLOCK_OFFSET_MS invalid: '%s'\n", env);
-    }
-    if (const char* env = getenv("SOMNIUM_MAX_ROOMS"); env && !fsutil::parse_u64(env, &max_rooms_)) {
-        fprintf(stderr, "SOMNIUM_MAX_ROOMS invalid: '%s' (folosesc %llu)\n", env,
-                static_cast<unsigned long long>(max_rooms_));
-    }
 
     // 1) redare istoric (snapshot-urile se incarca sub prima mutatie a fiecarei camere,
     //    apoi mutatiile AOF se aplica peste ele: un snapshot vechi nu poate
@@ -331,7 +312,7 @@ bool Database::hibernate(Room& room) {
     room.state = RoomState::Hibernating;
     const size_t resident = room.keys.size();
     const size_t cost = room.keys_cost();
-    if (!SnapshotManager::hibernate_room(room, record_pool)) {
+    if (!SnapshotManager::hibernate_room(room, record_pool, snapshot_delay_ms_)) {
         room.state = RoomState::Active;
         return false;
     }

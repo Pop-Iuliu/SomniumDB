@@ -17,6 +17,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_link_options(-pie -Wl,-z,relro,-z,now)
 
 add_executable(Redis main.cpp
+        src/config.h
+        src/config.cpp
         src/core/database.h
         src/core/database.cpp
         src/core/resp.h

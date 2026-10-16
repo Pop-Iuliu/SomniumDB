@@ -25,13 +25,12 @@
 #include "metrics.h"
 #include "src/core/database.h"
 #include "src/core/resp.h"
-#include "src/storage/fs_util.h"
+#include "src/config.h"
 #include "src/storage/replicator.h"
 #include "watchdog.h"
 
 using namespace std;
 
-#define PORT 6379
 #define URING_ENTRIES 4096
 #define READ_CHUNK 16384
 #define MAX_COMMANDS_PER_TURN 8192
@@ -41,10 +40,8 @@ using namespace std;
 static constexpr auto AUTH_TIMEOUT = chrono::seconds(10); // SEC-18: cat poate tine un strain un loc
 
 static optional<Database> db; // REF-1: construita in main(), dupa verificarile de pornire
-static string g_password; // SEC-2: SOMNIUM_PASSWORD; gol = fara autentificare
+static Config cfg; // REF-2: citita o singura data, la pornire (load_config)
 static unsigned g_auth_failures = 0; // SEC-20: parole gresite inca nelogate
-static uint64_t g_maxclients = 10000; // SEC-6: SOMNIUM_MAXCLIENTS, ca Redis
-static uint64_t g_max_client_buffers = 1ull << 30; // SEC-22: SOMNIUM_MAX_CLIENT_BUFFERS
 static uint64_t g_client_buffers = 0; // SEC-22: octetii din bufferele tuturor clientilor
 static SSL_CTX* g_tls = nullptr; // SEC-16: SOMNIUM_TLS_CERT + SOMNIUM_TLS_KEY; nullptr = text clar
 
@@ -75,7 +72,7 @@ struct Client {
     bool read_armed = false;
     bool write_armed = false;
     bool resp3 = false; // protocolul negociat prin HELLO
-    bool authenticated = g_password.empty();
+    bool authenticated = cfg.password.empty();
     size_t held = 0; // cat din g_client_buffers e al acestui client
     unique_ptr<SSL, decltype(&SSL_free)> ssl{g_tls ? tls_session() : nullptr, SSL_free}; // SEC-16
     const chrono::steady_clock::time_point connected = chrono::steady_clock::now();
@@ -95,7 +92,7 @@ static void track(Client& c) {
 }
 
 static bool over_buffer_budget(const Client& c, const size_t extra) {
-    if (g_client_buffers + extra <= g_max_client_buffers) return false;
+    if (g_client_buffers + extra <= cfg.max_client_buffers) return false;
     printf("[ClientBuffers] FD %d: bufferele clientilor depasesc SOMNIUM_MAX_CLIENT_BUFFERS. Deconectat.\n", c.fd);
     return true;
 }
@@ -143,7 +140,6 @@ static unordered_map<int, shared_ptr<Client>> clients;
 static vector<PollTicket*> arm_backlog;
 static int g_eventfd = -1;
 static int g_server_fd = -1;
-static int g_trace = -1; // fd cu trace activ (debug), -1 = off
 
 static void set_nonblocking(const int fd) {
     const int flags = fcntl(fd, F_GETFL, 0);
@@ -154,7 +150,7 @@ static void schedule_close(const shared_ptr<Client>& c) {
     if (c->closed) return;
     c->closed = true;
     track(*c);
-    if (g_trace == -2 || g_trace == c->fd)
+    if (cfg.trace_fd == -2 || cfg.trace_fd == c->fd)
         printf("[TRACE] fd %d CLOSE\n", c->fd);
     db->cleanup_client(c->fd);
     // un poll armat in ring tine socketul (si clientul, cu bufferele lui) in viata
@@ -172,7 +168,7 @@ static void arm_client(const shared_ptr<Client>& c, const bool for_write) {
     // flagul se reporneste la CQE (sau la inchiderea clientului)
     if (for_write) c->write_armed = true;
     else c->read_armed = true;
-    if (g_trace == -2 || g_trace == c->fd)
+    if (cfg.trace_fd == -2 || cfg.trace_fd == c->fd)
         printf("[TRACE] fd %d arm %s (backlog %zu)\n", c->fd, for_write ? "POLLOUT" : "POLLIN", arm_backlog.size());
     arm_backlog.push_back(new PollTicket{c, for_write});
 }
@@ -207,13 +203,13 @@ static uint64_t eventfd_drain_buffer; // buffer stabil pentru citirea eventfd-ul
 static void arm_listener(io_uring* ring) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring);
     if (!sqe) {
-        if (g_trace == -2) printf("[TRACE] arm_listener ESUAT (sqe null)\n");
+        if (cfg.trace_fd == -2) printf("[TRACE] arm_listener ESUAT (sqe null)\n");
         return;
     }
     io_uring_prep_accept(sqe, g_server_fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
     io_uring_sqe_set_data(sqe, &listener_ticket);
     const int submitted = io_uring_submit(ring);
-    if (g_trace == -2) printf("[TRACE] arm_listener submit=%d\n", submitted);
+    if (cfg.trace_fd == -2) printf("[TRACE] arm_listener submit=%d\n", submitted);
 }
 
 static void arm_eventfd(io_uring* ring) {
@@ -223,7 +219,7 @@ static void arm_eventfd(io_uring* ring) {
     io_uring_prep_read(sqe, g_eventfd, &eventfd_drain_buffer, sizeof(eventfd_drain_buffer), 0);
     io_uring_sqe_set_data(sqe, &eventfd_ticket);
     const int submitted = io_uring_submit(ring);
-    if (g_trace == -2) printf("[TRACE] arm_eventfd submit=%d\n", submitted);
+    if (cfg.trace_fd == -2) printf("[TRACE] arm_eventfd submit=%d\n", submitted);
 }
 
 // tri-state: Complete = tot a plecat; Pending = fd plin, reluam pe POLLOUT; Dead = eroare
@@ -239,7 +235,7 @@ static FlushResult flush_output(Client& c) {
         }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (g_trace == -2 || g_trace == c.fd)
+            if (cfg.trace_fd == -2 || cfg.trace_fd == c.fd)
                 printf("[TRACE] fd %d flush Pending la %zu/%zu\n", c.fd, c.out_off, c.out_buf.size());
             return FlushResult::Pending;
         }
@@ -302,9 +298,9 @@ static void queue_work() {
 // SEC-2: un singur utilizator, "default". Parola se compara in timp constant:
 // bucla merge mereu pe toata lungimea asteptata, fara iesire timpurie.
 static bool credentials_ok(const string& user, const string& pass) {
-    unsigned char diff = pass.size() != g_password.size();
-    for (size_t i = 0; i < g_password.size(); ++i) {
-        diff |= static_cast<unsigned char>(g_password[i] ^ (i < pass.size() ? pass[i] : 0));
+    unsigned char diff = pass.size() != cfg.password.size();
+    for (size_t i = 0; i < cfg.password.size(); ++i) {
+        diff |= static_cast<unsigned char>(cfg.password[i] ^ (i < pass.size() ? pass[i] : 0));
     }
     return diff == 0 && user == "default";
 }
@@ -321,7 +317,7 @@ static string authenticate(Client& c, const string& user, const string& pass) {
 // AUTH [user] pass
 static string auth(Client& c, const vector<string>& args) {
     if (args.size() != 2 && args.size() != 3) return "-ERR wrong number of arguments for 'auth' command\r\n";
-    if (g_password.empty()) {
+    if (cfg.password.empty()) {
         return "-ERR AUTH <password> called without any password configured for the default user. "
                "Are you sure your configuration is correct?\r\n";
     }
@@ -342,7 +338,7 @@ static string hello(Client& c, const vector<string>& args) {
         if (proto != 2 && proto != 3) return "-NOPROTO unsupported protocol version\r\n";
         for (size_t i = 2; i < args.size();) {
             if (strcasecmp(args[i].c_str(), "AUTH") == 0 && i + 2 < args.size()) {
-                if (!g_password.empty()) {
+                if (!cfg.password.empty()) {
                     if (string r = authenticate(c, args[i + 1], args[i + 2]); r[0] == '-') return r;
                 }
                 i += 3;
@@ -443,13 +439,13 @@ static bool drain_read(const shared_ptr<Client>& c) {
 
 // SEC-16: SOMNIUM_TLS_CERT si SOMNIUM_TLS_KEY pornesc TLS pentru clienti si pentru replicare
 static bool load_tls() {
-    const char* cert = getenv("SOMNIUM_TLS_CERT");
-    const char* key = getenv("SOMNIUM_TLS_KEY");
+    const auto& cert = cfg.tls_cert;
+    const auto& key = cfg.tls_key;
     if (!cert && !key) return true;
     g_tls = SSL_CTX_new(TLS_method());
     if (cert && key && g_tls && SSL_CTX_set_min_proto_version(g_tls, TLS1_2_VERSION) == 1 &&
-        SSL_CTX_use_certificate_chain_file(g_tls, cert) == 1 &&
-        SSL_CTX_use_PrivateKey_file(g_tls, key, SSL_FILETYPE_PEM) == 1 && SSL_CTX_check_private_key(g_tls) == 1) {
+        SSL_CTX_use_certificate_chain_file(g_tls, cert->c_str()) == 1 &&
+        SSL_CTX_use_PrivateKey_file(g_tls, key->c_str(), SSL_FILETYPE_PEM) == 1 && SSL_CTX_check_private_key(g_tls) == 1) {
         return true;
     }
     cerr << "TLS: SOMNIUM_TLS_CERT si SOMNIUM_TLS_KEY trebuie sa fie impreuna un certificat PEM si cheia lui\n";
@@ -483,49 +479,14 @@ int main() {
     // SEC-3: tot ce cream e doar al proprietarului (si 0600 explicit la fiecare open)
     umask(077);
 
-    // portul poate fi suprascris (ex: masina de dev are deja un redis pe 6379)
-    int port = PORT;
-    if (const char* env_port = getenv("REDIS_PORT"); env_port != nullptr) {
-        try {
-            port = stoi(env_port);
-        } catch (...) {
-            cerr << "REDIS_PORT invalid: " << env_port << "\n";
-            return 1;
-        }
-    }
-
-    if (const char* env = getenv("SOMNIUM_MAXCLIENTS"); env && (!fsutil::parse_u64(env, &g_maxclients) || g_maxclients == 0)) {
-        cerr << "SOMNIUM_MAXCLIENTS invalid: " << env << "\n";
-        return 1;
-    }
-
-    if (const char* env = getenv("SOMNIUM_MAX_CLIENT_BUFFERS"); env && !fsutil::parse_u64(env, &g_max_client_buffers)) {
-        cerr << "SOMNIUM_MAX_CLIENT_BUFFERS invalid: " << env << "\n";
-        return 1;
-    }
-
-    // SEC-1: implicit doar localhost; expunerea in retea e o decizie explicita
-    const char* bind_env = getenv("SOMNIUM_BIND");
-    const string bind_ip = bind_env ? bind_env : "127.0.0.1";
-    in_addr bind_addr{};
-    if (inet_pton(AF_INET, bind_ip.c_str(), &bind_addr) != 1) {
-        cerr << "SOMNIUM_BIND invalid: " << bind_ip << " (astept o adresa IPv4)\n";
-        return 1;
-    }
-    if (const char* pw = getenv("SOMNIUM_PASSWORD")) g_password = pw;
-    if (ntohl(bind_addr.s_addr) >> 24 != 127 && g_password.empty()) {
-        cerr << "Refuz sa pornesc: SOMNIUM_BIND=" << bind_ip
-             << " expune serverul in retea, dar SOMNIUM_PASSWORD nu e setat\n";
-        return 1;
-    }
+    std::optional<Config> loaded = load_config();
+    if (!loaded) return 1;
+    cfg = std::move(*loaded);
     if (!load_tls()) return 1;
 
-    if (getenv("SOMNIUM_NO_METRICS") == nullptr) {
-        start_prometheus_exporter(9090);
-    }
+    if (cfg.metrics) start_prometheus_exporter(9090, cfg.metrics_bind);
     signal(SIGPIPE, SIG_IGN);
 
-    if (const char* t = getenv("SOMNIUM_TRACE_FD"); t != nullptr) g_trace = atoi(t);
     // loguri utile in fisiere si la moarte prin semnal
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
@@ -543,11 +504,11 @@ int main() {
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr = bind_addr;
-    address.sin_port = htons(static_cast<uint16_t>(port));
+    inet_pton(AF_INET, cfg.bind.c_str(), &address.sin_addr); // validata de load_config
+    address.sin_port = htons(static_cast<uint16_t>(cfg.port));
 
     if (bind(g_server_fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) {
-        cerr << "Nu pot face bind pe " << bind_ip << ":" << port << ": " << strerror(errno) << "\n";
+        cerr << "Nu pot face bind pe " << cfg.bind << ":" << cfg.port << ": " << strerror(errno) << "\n";
         close(g_server_fd);
         return 1;
     }
@@ -561,7 +522,7 @@ int main() {
     // REF-1: datele se deschid abia dupa toate verificarile, deci o pornire gresita
     // (alt server pe port, configuratie invalida) nu atinge directorul de date.
     // Portul accepta conexiuni abia dupa replay-ul AOF, ca inainte.
-    db.emplace();
+    db.emplace(cfg);
     listen(g_server_fd, 4096);
 
     // mesajele Pub/Sub intra in cozile de output ale abonatilor
@@ -570,12 +531,12 @@ int main() {
     arm_listener(&ring);
     arm_eventfd(&ring);
 
-    cout << "Server pornit (io_uring" << (g_tls ? ", TLS" : "") << ") pe " << bind_ip << ":" << port << "...\n";
+    cout << "Server pornit (io_uring" << (g_tls ? ", TLS" : "") << ") pe " << cfg.bind << ":" << cfg.port << "...\n";
     static Watchdog watchdog(*db);
     watchdog.start();
 
     // replicare CRDT catre SOMNIUM_PEERS (nimic fara peers)
-    static Replicator replicator(db->replication_frontier(), g_tls);
+    static Replicator replicator(db->replication_frontier(), cfg, g_tls);
     replicator.start();
 
     bool first_wait = true; // doar prima asteptare e sensibila la CQE-uri pierdute
@@ -594,7 +555,7 @@ int main() {
             io_uring_submit(&ring);
             ret = io_uring_wait_cqe_timeout(&ring, &first_cqe, &wait_ts);
             if (ret == -ETIME) {
-                if (g_trace == -2) printf("[TRACE] prima asteptare timeout - resubmit armarilor\n");
+                if (cfg.trace_fd == -2) printf("[TRACE] prima asteptare timeout - resubmit armarilor\n");
                 arm_listener(&ring);
                 arm_eventfd(&ring);
                 continue;
@@ -610,7 +571,7 @@ int main() {
             cerr << "io_uring_submit_and_wait esuat: " << strerror(-ret) << "\n";
             continue;
         }
-        if (g_trace == -2) printf("[TRACE] submit_and_wait ret=%d\n", ret);
+        if (cfg.trace_fd == -2) printf("[TRACE] submit_and_wait ret=%d\n", ret);
 
         io_uring_cqe *cqe;
         unsigned head;
@@ -620,18 +581,18 @@ int main() {
             count++;
             auto* ticket = static_cast<PollTicket*>(io_uring_cqe_get_data(cqe));
 
-            if (g_trace == -2)
+            if (cfg.trace_fd == -2)
                 printf("[TRACE] CQE res=%d ticket=%p\n", cqe->res, (void*)ticket);
 
             if (ticket == &listener_ticket) {
                 const int res = cqe->res;
-                if (res >= 0 && clients.size() >= g_maxclients) {
+                if (res >= 0 && clients.size() >= cfg.maxclients) {
                     // SEC-6: fara Client, deci fara buffere; doar eroarea si inchiderea
                     static constexpr char kFull[] = "-ERR max number of clients reached\r\n";
                     ::send(res, kFull, sizeof(kFull) - 1, MSG_NOSIGNAL);
                     ::close(res);
                 } else if (res >= 0) {
-                    if (g_trace == -2) printf("[TRACE] accept fd %d\n", res);
+                    if (cfg.trace_fd == -2) printf("[TRACE] accept fd %d\n", res);
                     set_nonblocking(res); // SOCK_NONBLOCK deja; defensive
                     auto c = make_shared<Client>(res);
                     clients[res] = c;

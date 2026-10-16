@@ -68,14 +68,12 @@ std::string peers_report(const bool prometheus) {
     return out;
 }
 
-static void prometheus_thread(int port) {
+static void prometheus_thread(int port, const std::string bind_ip) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     // SEC-8: ca listenerul principal, implicit doar localhost
-    const char* bind_env = getenv("SOMNIUM_METRICS_BIND");
-    const std::string bind_ip = bind_env ? bind_env : "127.0.0.1";
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
@@ -189,6 +187,6 @@ static void prometheus_thread(int port) {
     }
 }
 
-void start_prometheus_exporter(int port) {
-    std::thread(prometheus_thread, port).detach(); // ruleaza separat de db
+void start_prometheus_exporter(int port, const std::string& bind_ip) {
+    std::thread(prometheus_thread, port, bind_ip).detach(); // ruleaza separat de db
 }

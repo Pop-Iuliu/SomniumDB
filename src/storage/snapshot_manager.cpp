@@ -163,19 +163,9 @@ bool SnapshotManager::wakeup_room(Room& room, PoolAllocator<Record, 1024>& pool)
     return true;
 }
 
-bool SnapshotManager::hibernate_room(Room& room, PoolAllocator<Record, 1024>& pool) {
+bool SnapshotManager::hibernate_room(Room& room, PoolAllocator<Record, 1024>& pool, const int delay_ms) {
     // SOMNIUM_SNAPSHOT_DELAY_MS tine thread-ul de intretinere ocupat, ca testele
     // sa vada ca sincronizarea AOF nu mai asteapta dupa snapshot.
-    static const int delay_ms = [] {
-        const char* env = getenv("SOMNIUM_SNAPSHOT_DELAY_MS");
-        long long n = 0;
-        if (!env || !env[0]) return 0;
-        if (!fsutil::parse_i64(env, &n) || n < 0 || n > 60000) {
-            fprintf(stderr, "SOMNIUM_SNAPSHOT_DELAY_MS invalid: '%s'\n", env);
-            return 0;
-        }
-        return static_cast<int>(n);
-    }();
     if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
 
     const std::string filename = "room_" + room.name + ".bin";

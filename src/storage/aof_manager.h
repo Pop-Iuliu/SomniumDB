@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "../config.h"
 
 // O mutatie persistata: comanda tintita intr-o camera plus starea REZULTATA.
 // Meta-informatia (expirare absoluta, timestamp CRDT, nod) calatoreste cu
@@ -41,9 +42,9 @@ public:
     //              stricta de o secunda: daca fdatasync depaseste intervalul, pierderea
     //              posibila creste si overrun-ul apare in metrici
     //   no       - niciodata explicit; doar page cache (pierdere la pana de curent)
-    enum class SyncPolicy { Always, Everysec, Off };
+    using SyncPolicy = AofSync;
 
-    AOFManager();
+    explicit AOFManager(const Config& cfg);
     ~AOFManager();
 
     // Reda istoricul prin callback, inregistrare cu inregistrare.
@@ -105,15 +106,15 @@ private:
     uint64_t generation_ = 0;
     uint64_t synced_ = 0; // prefixul durabil al generatiei curente
     long long last_sync_epoch_ms_ = 0;
-    long long sync_interval_ms_ = 1000;
-    int sync_delay_ms_ = 0; // SOMNIUM_AOF_SYNC_DELAY_MS: intarziere de test in fdatasync
+    long long sync_interval_ms_;
+    int sync_delay_ms_; // SOMNIUM_AOF_SYNC_DELAY_MS: intarziere de test in fdatasync
     std::chrono::steady_clock::time_point next_attempt_{};
     std::atomic<bool> healthy_{true}; // citit fara mutex de thread-ul de comenzi
     bool needs_rewrite_ = false;
     std::atomic<uint64_t> size_{0};      // octetii fisierului curent
     std::atomic<uint64_t> base_size_{0}; // dimensiunea dupa ultima rescriere (sau la pornire)
     uint64_t last_tail_ = 0;             // coada copiata peste instantaneu, la ultima rescriere
-    uint64_t rewrite_min_ = 64ull << 20;
+    uint64_t rewrite_min_; // SOMNIUM_AOF_REWRITE_MIN_BYTES
 
     void publish_sizes() const;
     void publish_sync_locked() const; // presupune mutex_ prins

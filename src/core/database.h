@@ -16,6 +16,7 @@
 #include "../storage/eviction_manager.h"
 #include "../storage/snapshot_manager.h"
 #include "../../record.h"
+#include "../config.h"
 #include "room.h"
 #include "hlc.h"
 
@@ -43,7 +44,7 @@ private:
     static constexpr const char* ROOMS_FULL =
         "-ERR ROOMS FULL: active room budget reached, ROOM.HIBERNATE one or wait\r\n";
     static constexpr long long ROOM_IDLE_MS = 10000;
-    uint32_t local_node_id = 1; // SOMNIUM_NODE_ID: versiunea CRDT a scrierilor locale
+    uint32_t local_node_id;     // SOMNIUM_NODE_ID: versiunea CRDT a scrierilor locale
     hlc::Clock clock_;          // versiunile scrierilor locale (thread-ul de comenzi)
 
     // S13: delete markers versionate, doar cu replicare (camera -> cheie -> versiune).
@@ -52,10 +53,12 @@ private:
     std::unordered_map<std::string, std::unordered_map<std::string, Version>> tombstones_;
     std::unordered_map<uint32_t, uint64_t> frontiers_; // nod -> "toate scrierile mele <= F au ajuns"
     uint64_t watermark_ = 0;
-    size_t peer_count_ = 0;                            // intrarile din SOMNIUM_PEERS
+    size_t peer_count_;                                // intrarile valide din SOMNIUM_PEERS
     std::atomic<uint64_t> frontier_{0};                // frontiera locala, citita de replicator
-    long long max_clock_offset_ms = 600000; // SOMNIUM_MAX_CLOCK_OFFSET_MS
-    uint64_t max_rooms_ = 10000;            // SEC-7: SOMNIUM_MAX_ROOMS, marimea registrului
+    long long max_clock_offset_ms; // SOMNIUM_MAX_CLOCK_OFFSET_MS
+    uint64_t max_rooms_;           // SEC-7: SOMNIUM_MAX_ROOMS, marimea registrului
+    long long clock_offset_ms_;    // SOMNIUM_CLOCK_OFFSET_MS (teste), vezi get_current_time_ms()
+    int snapshot_delay_ms_;        // SOMNIUM_SNAPSHOT_DELAY_MS (teste), la fiecare hibernare
 
     PubSubManager pubsub;
     PoolAllocator<Record, 1024> record_pool;
@@ -130,6 +133,7 @@ private:
     std::string handle_room_admin(const std::string& command, const std::vector<std::string>& args);
 
     static std::string bulk_string(const std::string& payload);
+    long long get_current_time_ms() const; // ceasul de perete, plus SOMNIUM_CLOCK_OFFSET_MS
 
     // protocolul clientului a carui comanda ruleaza acum; il citesc doar
     // raspunsurile care difera intre RESP2 si RESP3 (thread-ul de comenzi)
@@ -143,7 +147,7 @@ public:
     // capul de output al unui client autentificat: un raspuns mai mare l-ar deconecta oricum
     static constexpr size_t MAX_REPLY = 32ull * 1024 * 1024;
 
-    Database();
+    explicit Database(const Config& cfg);
     ~Database();
 
     void set_client_room(int client_fd, const std::string& room_name);
