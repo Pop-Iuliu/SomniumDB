@@ -18,7 +18,7 @@ sleep 0.3
 # nu primeste nicio completare io_uring. Afecteaza si codul vechi; un restart
 # o rezolva, deci o suita picata mai e rulata o data inainte sa declaram FAIL.
 # A doua cadere opreste scriptul (set -e), deci CI-ul vede orice suita picata.
-for suite in smoke s5 s4 s1 s2 s6 s7 s8 s9 s10 s11 s12 s13 s14 s18 s3 hib sec ref; do
+for suite in smoke s5 s4 s1 s2 s6 s7 s8 s9 s10 s11 s12 s13 s14 s18 s3 hib sec ref stab; do
     python3 "tests/${suite}_test.py" || {
         echo "!!! $suite a picat (posibila flake de mediu io_uring) - reincerc o data"
         pkill -x Redis 2>/dev/null || true

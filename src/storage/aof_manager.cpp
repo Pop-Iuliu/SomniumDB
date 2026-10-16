@@ -255,6 +255,9 @@ bool AOFManager::open_file() {
         if (!fsutil::write_all(fd_, kAofHeader, sizeof(kAofHeader) - 1)) {
             fprintf(stderr, "AOF: nu pot scrie headerul v3\n");
             healthy_ = false;
+            if (::ftruncate(fd_, 0) != 0) { // un header partial ar face fisierul ilizibil la replay
+                fprintf(stderr, "AOF: headerul partial nu poate fi sters: %s\n", strerror(errno));
+            }
             ::close(fd_);
             fd_ = -1;
             return false;
@@ -292,7 +295,7 @@ bool AOFManager::append(const std::string& room_name, const std::vector<std::str
     const auto wait_t0 = std::chrono::steady_clock::now();
     std::lock_guard lock(mutex_);
     note_append_wait(wait_t0);
-    if (replaying_) return false;
+    if (replaying_ || torn_) return false;
 
     AofRecord rec;
     rec.room = room_name;
@@ -313,9 +316,20 @@ bool AOFManager::append(const std::string& room_name, const std::vector<std::str
         healthy_ = true;
     }
 
-    if (!fsutil::write_all(fd_, data.data(), data.size())) {
+    size_t written = 0;
+    if (!fsutil::write_all(fd_, data.data(), data.size(), &written)) {
         healthy_ = false;
         fprintf(stderr, "AOF: scriere esuata: %s (mutatia exista doar in RAM!)\n", strerror(errno));
+        // o scriere partiala (ENOSPC, EFBIG) lasa o inregistrare rupta: replay-ul ar lua tot
+        // ce se adauga dupa ea drept coada incompleta si ar trunchia-o. O taiem acum (O_APPEND:
+        // a inceput la capatul fisierului, deci sunt ultimii `written` octeti)
+        struct stat sb{};
+        if (written > 0 &&
+            (::fstat(fd_, &sb) != 0 || ::ftruncate(fd_, sb.st_size - static_cast<off_t>(written)) != 0)) {
+            fprintf(stderr, "AOF: inregistrarea partiala nu poate fi taiata: %s (append oprit pana la "
+                            "o rescriere)\n", strerror(errno));
+            torn_ = true;
+        }
         ::close(fd_);
         fd_ = -1;
         bump_generation_locked();
@@ -565,6 +579,7 @@ bool AOFManager::commit_rewrite() {
     // generatie noua: o sincronizare in zbor pe fd-ul vechi nu marcheaza fisierul nou
     bump_generation_locked();
     healthy_ = fd_ >= 0;
+    torn_ = false; // fisier nou: coada copiata se opreste la size_, inaintea octetilor rupti
     needs_rewrite_ = false;
     size_ = written;
     // baza e instantaneul, nu fisierul cu coada: daca scrierile din timpul

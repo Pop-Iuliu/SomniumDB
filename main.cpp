@@ -229,6 +229,9 @@ int main() {
 
     if (cfg.metrics) start_prometheus_exporter(9090, cfg.metrics_bind);
     signal(SIGPIPE, SIG_IGN);
+    // o limita de marime a fisierelor (ulimit -f, LimitFSIZE=) ar omori procesul la fiecare
+    // pornire cand AOF-ul o atinge; ignorat, write() da EFBIG, tratat ca orice scriere esuata
+    signal(SIGXFSZ, SIG_IGN);
 
     // loguri utile in fisiere si la moarte prin semnal
     setvbuf(stdout, nullptr, _IOLBF, 0);

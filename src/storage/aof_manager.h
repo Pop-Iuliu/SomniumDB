@@ -110,6 +110,9 @@ private:
     int sync_delay_ms_; // SOMNIUM_AOF_SYNC_DELAY_MS: intarziere de test in fdatasync
     std::chrono::steady_clock::time_point next_attempt_{};
     std::atomic<bool> healthy_{true}; // citit fara mutex de thread-ul de comenzi
+    // o inregistrare partiala nu a putut fi taiata din fisier: append-ul ramane oprit
+    // pana cand o rescriere inlocuieste fisierul (altfel replay-ul ar pierde ce urmeaza)
+    bool torn_ = false;
     bool needs_rewrite_ = false;
     std::atomic<uint64_t> size_{0};      // octetii fisierului curent
     std::atomic<uint64_t> base_size_{0}; // dimensiunea dupa ultima rescriere (sau la pornire)

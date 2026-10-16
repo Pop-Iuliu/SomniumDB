@@ -36,7 +36,8 @@ namespace {
 } // namespace
 
 EvictionManager::EvictionManager(const Config& cfg) : max_keys_per_room(cfg.max_keys), max_bytes(cfg.maxmemory) {
-    fd =::open(kColdPath, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0600);
+    // fara O_APPEND: inregistrarile se scriu cu pwrite la file_bytes (evict_despised_keys)
+    fd =::open(kColdPath, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) {
         fprintf(stderr, "Cold storage indisponibil (%s): cheile raman in RAM\n", strerror(errno));
     }
@@ -84,7 +85,9 @@ void EvictionManager::evict_despised_keys(Room& room, PoolAllocator<Record, 1024
 
         const auto it = room.keys.find(*victim);
         const std::string data = encode(*it->second);
-        if (fd < 0 || !fsutil::write_all(fd, data.data(), data.size())) {
+        // la capatul logic, nu cu O_APPEND: o scriere partiala (ENOSPC) ar fi decalat toate
+        // inregistrarile urmatoare fata de offseturile din index (citiri cu valoarea altei chei)
+        if (fd < 0 || !fsutil::pwrite_all(fd, data.data(), data.size(), static_cast<off_t>(file_bytes))) {
             fprintf(stderr, "Cold storage: scriere esuata, cheile raman in RAM\n");
             break;
         }
@@ -136,7 +139,7 @@ bool EvictionManager::for_each(
 }
 
 long long EvictionManager::compact(const long long now_ms) {
-    const int out = ::open(kColdTmp, O_RDWR | O_CREAT | O_TRUNC | O_APPEND, 0600);
+    const int out = ::open(kColdTmp, O_RDWR | O_CREAT | O_TRUNC, 0600); // devine fd: fara O_APPEND
     if (out < 0) {
         fprintf(stderr, "Compactare: nu pot crea %s: %s\n", kColdTmp, strerror(errno));
         return -1;
