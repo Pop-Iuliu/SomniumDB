@@ -16,7 +16,7 @@ import stat
 import tempfile
 import time
 
-from common import REPO, Client, Server, report, resp_cmd, run_with_retry
+from common import REPO, Client, Server, report, resp_cmd, run_with_retry, wait_until
 
 ENV = {"SOMNIUM_NO_METRICS": "1", "SOMNIUM_AOF_SYNC": "no"}
 UNLIMITED = resource.RLIM_INFINITY
@@ -112,6 +112,36 @@ def sec_saturated_eviction(check):
         c.close()
     finally:
         srv.cleanup()
+
+
+def sec_replication_misaligned_offset(check):
+    # offsetul salvat cu acelasi inode dar in mijlocul unei inregistrari: ce lasa doua
+    # rescrieri AOF pe ext4 (inode-ul eliberat e refolosit) cat timp peer-ul e oprit
+    peer = lambda node, port, other: Server(port=port, keep_dir_on_retry=True, env_extra={
+        **ENV, "SOMNIUM_NODE_ID": str(node), "SOMNIUM_PEERS": f"127.0.0.1:{other}"})
+    a, b = peer(1, 6391, 6392), peer(2, 6392, 6391)
+    try:
+        a.start()
+        b.start()
+        ca, cb = Client(a), Client(b)
+        ca.cmd("SET", "k1", "v1")
+        check("pregatire: k1 se replica", wait_until(lambda: cb.cmd("GET", "k1") == ("bulk", b"v1")))
+        ca.close()
+        a.stop()
+        inode = os.stat(os.path.join(a.workdir, "appendonly.aof")).st_ino
+        with open(os.path.join(a.workdir, "replication_127.0.0.1_6392.offset"), "w") as f:
+            f.write(f"{inode} 7\n")  # in mijlocul headerului
+        a.wait_port_free()
+        a.start()
+        ca = Client(a)
+        ca.cmd("SET", "k2", "v2")
+        check("offset nealiniat: replicarea isi revine",
+              wait_until(lambda: cb.cmd("GET", "k2") == ("bulk", b"v2"), timeout=10))
+        ca.close()
+        cb.close()
+    finally:
+        a.cleanup()
+        b.cleanup()
 
 
 def with_ulimit(flags):
@@ -211,7 +241,8 @@ def sec_accept_backoff(check):
 
 def main():
     fails = []
-    for sec in (sec_torn_aof, sec_torn_cold, sec_saturated_eviction, sec_fd_limit, sec_accept_backoff):
+    for sec in (sec_torn_aof, sec_torn_cold, sec_saturated_eviction, sec_replication_misaligned_offset,
+                sec_fd_limit, sec_accept_backoff):
         run_with_retry(sec, fails)
     report(fails, "stab")
 
