@@ -40,6 +40,11 @@ def sec_converge(check):
         check("DEL", ca.cmd("DEL", "k") == ("int", 1))
         check("DEL se replica", wait_until(lambda: cb.cmd("GET", "k")[0] == "nil"))
 
+        ca.cmd("MSET", "m1", "1", "m2", "2")
+        check("MSET ajunge pe B", wait_until(lambda: cb.cmd("EXISTS", "m1", "m2") == ("int", 2)))
+        check("DEL cu doua chei", ca.cmd("DEL", "m1", "m2") == ("int", 2))
+        check("DEL cu doua chei se replica", wait_until(lambda: cb.cmd("EXISTS", "m1", "m2") == ("int", 0)))
+
         ca.cmd("SET", "e", "v")
         check("EXPIRE", ca.cmd("EXPIRE", "e", "100") == ("int", 1))
         check("EXPIRE se replica", wait_until(lambda: cb.cmd("TTL", "e")[1] in (99, 100)), cb.cmd("TTL", "e"))

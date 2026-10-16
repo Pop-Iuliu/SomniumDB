@@ -194,13 +194,15 @@ bool Replicator::ship(Peer& peer) {
     std::string out;
     std::string room = peer.room;
     std::vector<std::pair<size_t, uint64_t>> marks;
+    bool misaligned = false; // prima inregistrare de la offset nu e RESP valid
     const auto build = [&] {
         size_t expected = 0, pos = 0, end = 0;
         std::vector<std::string> t;
         out.clear();
         room = peer.room;
         marks.clear();
-        while (resp::parse(buf, pos, &end, &t) == resp::Status::Complete) {
+        resp::Status st;
+        while ((st = resp::parse(buf, pos, &end, &t)) == resp::Status::Complete) {
             pos = end;
             // v3: [room, CMD, args..., META, expire, ts, node]; headerul si
             // inregistrarile venite de la alti noduri doar avanseaza offsetul
@@ -230,16 +232,27 @@ bool Replicator::ship(Peer& peer) {
             }
             marks.emplace_back(expected, peer.offset + pos);
         }
+        misaligned = pos == 0 && st == resp::Status::Malformed;
         return expected;
     };
     size_t expected = read_ok ? build() : 0;
-    if (read_ok && marks.empty() && buf.size() < size - peer.offset) {
+    if (read_ok && marks.empty() && !misaligned && buf.size() < size - peer.offset) {
         // o singura inregistrare mai mare decat un batch: o citim intreaga
         buf.assign(size - peer.offset, '\0');
         read_ok = fsutil::pread_all(aof, buf.data(), buf.size(), static_cast<off_t>(peer.offset));
         expected = read_ok ? build() : 0;
     }
     ::close(aof);
+    if (read_ok && misaligned && peer.offset > 0) {
+        // offsetul nu cade pe o inregistrare: alt fisier cu acelasi inode (ext4 refoloseste
+        // inode-ul eliberat, deci doua rescrieri cat peer-ul e oprit il pot aduce inapoi).
+        // Fara asta replicarea se oprea pentru totdeauna, cu heartbeat-uri sanatoase si lag
+        // crescator. Retrimitem de la inceput: merge-urile sunt idempotente.
+        fprintf(stderr, "Replicare: %s:%s offset %llu nu e inceputul unei inregistrari; retrimit de la 0\n",
+                peer.host.c_str(), peer.port.c_str(), static_cast<unsigned long long>(peer.offset));
+        peer.offset = 0;
+        save(peer);
+    }
 
     // un batch care a ajuns la capatul AOF-ului se incheie cu frontiera (si tine loc
     // de heartbeat); altfel, fara nimic de trimis, un PING. Marcajele nu le numara.

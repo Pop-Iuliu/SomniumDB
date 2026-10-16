@@ -14,13 +14,32 @@
 
 namespace fsutil {
 
-// scriere completa (write poate pleca partial sau cu EINTR)
-inline bool write_all(int fd, const char* data, size_t len) {
+// scriere completa (write poate pleca partial sau cu EINTR); *written = octetii care au
+// ajuns in fisier, si la esec (ENOSPC dupa o scriere partiala lasa o inregistrare rupta)
+inline bool write_all(int fd, const char* data, size_t len, size_t* written = nullptr) {
     size_t off = 0;
     while (off < len) {
         const ssize_t n = ::write(fd, data + off, len - off);
         if (n > 0) {
             off += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (written) *written = off;
+        return false;
+    }
+    if (written) *written = off;
+    return true;
+}
+
+// scriere completa la un offset: o scriere partiala nu muta capatul logic, deci
+// urmatoarea scriere la acelasi offset o suprascrie
+inline bool pwrite_all(int fd, const char* data, size_t len, off_t off) {
+    size_t done = 0;
+    while (done < len) {
+        const ssize_t n = ::pwrite(fd, data + done, len - done, off + static_cast<off_t>(done));
+        if (n > 0) {
+            done += static_cast<size_t>(n);
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
