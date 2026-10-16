@@ -20,7 +20,7 @@ jobs:
         run: |
           sudo apt-get update
           # redis-tools: redis-cli si redis-benchmark pentru testul de compatibilitate (S7)
-          sudo apt-get install -y liburing-dev cmake build-essential redis-tools
+          sudo apt-get install -y liburing-dev libssl-dev cmake build-essential redis-tools
           cmake --version
           g++ --version
 
@@ -65,7 +65,7 @@ jobs:
       - name: Instaleaza dependente
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev cmake build-essential
+          sudo apt-get install -y liburing-dev libssl-dev cmake build-essential
 
       # TSan din GCC 13 nu suporta entropia ASLR implicita a kernelului de pe runner
       - name: Reduce entropia mmap pentru TSan
@@ -121,7 +121,7 @@ jobs:
       - name: Instaleaza dependente
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev cmake build-essential redis-server redis-tools
+          sudo apt-get install -y liburing-dev libssl-dev cmake build-essential redis-server redis-tools
           cmake --version
 
       - name: Build (Release)

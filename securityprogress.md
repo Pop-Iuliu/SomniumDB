@@ -30,7 +30,7 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-13 | Remove the unused vendored `json.hpp` | 3. Find bugs first | DONE (#19) |
 | SEC-14 | `SECURITY.md` and a deployment checklist | 4. Process and transport | DONE (#20) |
 | SEC-15 | Encrypted transport through a tunnel (docs) | 4. Process and transport | DONE (#21) (WireGuard run pending) |
-| SEC-16 | Native TLS | 4. Process and transport | DEFERRED (trigger below) |
+| SEC-16 | Native TLS | 4. Process and transport | IMPLEMENTED (awaiting CI) |
 | SEC-17 | Really close dropped connections | 5. Audit 2026-10-05 | DONE (#22) |
 | SEC-18 | Time out connections that never authenticate | 5. Audit 2026-10-05 | DONE (#23) |
 | SEC-19 | Bound `MGET` replies | 5. Audit 2026-10-05 | DONE (#24) |
@@ -334,14 +334,31 @@ Rows 18 and 19 come from the review of what would remain after every step (2026-
 
 **Result:** the stunnel setup was run end to end: `redis-cli -a` worked through the tunnel, plain RESP sent to the TLS port got no reply, a client pinning a different certificate was refused at the handshake, and a replication peer authenticated and replicated through the client-side stunnel. The WireGuard setup was not run: the test container's kernel has no WireGuard support. It still needs one manual run on real hosts.
 
-### SEC-16: Native TLS (deferred)
+### SEC-16: Native TLS
 
-**Trigger:** the first real deployment that cannot use a tunnel, for example a managed client library that requires `rediss://`.
+**Why:** gap 12. A tunnel works today, but clients that require `rediss://` (many managed client libraries) cannot use one.
 
-**Sketch for when it comes:**
-- **Server side:** OpenSSL with memory BIOs. The io_uring loop keeps moving raw bytes, and TLS runs inside `Client` before parsing.
-- **Replicator side:** a plain blocking `SSL_connect` on its existing per-peer sockets.
-- **Configuration:** certificate and key paths through `SOMNIUM_TLS_CERT` and `SOMNIUM_TLS_KEY`.
+**Order:** deferred until a deployment could not use a tunnel. Brought back at the maintainer's request on 2026-10-16, after every other step was done.
+
+**Do:**
+1. **Configuration:** `SOMNIUM_TLS_CERT` and `SOMNIUM_TLS_KEY`. Both set: the client port speaks only TLS (1.2 or later). One of them, a missing file or a key that does not match: refuse to start.
+2. **Server side:** OpenSSL with memory BIOs. The io_uring loop and the socket reads and writes stay as they are; TLS runs inside `Client`, between the socket and the buffers.
+3. **Replicator side:** a plain blocking `SSL_connect` on its existing per-peer sockets.
+4. **Peer trust:** all nodes share one certificate and key, as they share one password. A node replicates only to a peer that presents exactly that certificate.
+
+**Done when:**
+- a TLS client authenticates, round-trips 1 MB and switches to RESP3; `redis-cli --tls` works;
+- a plain-text client is disconnected;
+- two nodes with the same certificate replicate, and a node with another certificate does not;
+- the three bad configurations refuse to start.
+
+**Files:** `main.cpp`, `src/storage/replicator.*`, `CMakeLists.txt`, `.github/workflows/ci.yml`, `README.md`, `tests/sec_test.py`.
+
+**Result:**
+- **Server:** each `Client` owns an `SSL` on two memory BIOs. `drain_read()` feeds the bytes it read to OpenSSL and appends the decrypted text to `in_buf`; `enqueue_output()` encrypts replies into `out_buf`; handshake messages and alerts go to `out_buf` too. So `out_buf` holds exactly what goes on the wire, and the output caps (SEC-17, SEC-19), the buffer budget (SEC-22), flushing and closing work unchanged. OpenSSL never needs to write while the loop is reading, and the event loop knows nothing about TLS.
+- **Replication:** `secure()` runs `SSL_connect` right after connecting, before `AUTH`, then compares the peer's certificate with the node's own (`X509_cmp`). No CA store and no hostname check: the trust anchor is the cluster certificate itself, like the pinned certificate in the SEC-15 stunnel setup. One `disconnect()` now closes a peer on every path.
+- **Not changed:** TLS encrypts but does not authenticate clients, so `SOMNIUM_PASSWORD` is still required off localhost (SEC-2). No client certificates, as with Redis `tls-auth-clients no`. The SEC-6 "max clients" error is still written in plain text before the handshake; a TLS client sees a failed handshake instead.
+- **Verification so far:** `main.cpp` and `replicator.cpp` compile cleanly with GCC 13 (`-Wall -Wextra`) against stub headers carrying the exact OpenSSL 3 prototypes used, since this machine has no OpenSSL headers. The test's certificate generation (`openssl` 3.5 CLI) and TLS client were checked against a Python TLS server: the cluster certificate verifies, a foreign certificate is rejected, and a plain client sees its connection closed. The server itself needs Linux, so CI on this PR is the first real run. The `redis-cli --tls` check assumes Ubuntu's `redis-tools` is built with TLS.
 
 ## Phase 5: Audit 2026-10-05
 
@@ -503,7 +520,6 @@ Each item comes back only when its trigger happens.
 
 | Item | Trigger |
 | --- | --- |
-| Native TLS (SEC-16) | A deployment that cannot use a tunnel |
 | ACLs, multiple users, per-command permissions | A need to give an untrusted application restricted access |
 | Separate peer credentials, authenticated `REPLFRONTIER` | Clients and replication peers living in different trust zones |
 | Rate limiting or lockout of failed `AUTH` attempts | The password port being exposed beyond localhost or a tunnel (prefer long random passwords first) |

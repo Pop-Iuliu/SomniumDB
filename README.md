@@ -75,7 +75,7 @@ An embedded HTTP metrics server runs on `127.0.0.1:9090` (`/metrics`; the addres
 
 Commands can be sent as RESP arrays or inline (one line split on spaces, with `"..."` and `'...'` quoting as in `redis-cli`, e.g. from `telnet`), so `redis-cli` and `redis-benchmark` work unmodified, in RESP2 or RESP3.
 
-Environment: `REDIS_PORT`, `SOMNIUM_BIND` (IPv4 address to listen on, default `127.0.0.1`; refuses to start on a non-loopback address without a password), `SOMNIUM_PASSWORD` (require `AUTH` from every client; replication peers send it too, so all nodes of a cluster share one password. Like Redis `requirepass`, an authenticated client is fully trusted, including with replication and admin commands), `SOMNIUM_MAXCLIENTS` (maximum simultaneous connections, default 10,000; extra connections get `-ERR max number of clients reached` and are closed), `SOMNIUM_MAX_CLIENT_BUFFERS` (bytes all connections may hold in input and output buffers together, default 1 GB; a client whose read or reply would go over it is disconnected. Size it to the host's RAM: each client is also capped at 128 MB of input and 32 MB of pending output), `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_AOF_SYNC_INTERVAL_MS` (everysec target interval, default 1000; a dedicated thread fsyncs outside the append lock, so a slow snapshot cannot postpone it. This is not a strict one-second power-loss window: if `fdatasync` overruns, `INFO` and `/metrics` show sync age, pending bytes and overrun count), `SOMNIUM_AOF_SYNC_DELAY_MS` and `SOMNIUM_SNAPSHOT_DELAY_MS` (test-only delays, default 0), `SOMNIUM_MAX_ROOMS` (maximum number of known rooms, default 10,000; a new name beyond it gets `-ERR too many rooms`, existing rooms are unaffected), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_MAXMEMORY` (global budget in bytes for resident keys and values, estimated; default unlimited), `SOMNIUM_AOF_REWRITE_MIN_BYTES` (the AOF is rewritten automatically once it doubles past this size, default 64 MB), `SOMNIUM_NODE_ID` (CRDT node id of local writes, default 1), `SOMNIUM_PEERS` (`host:port,...`: replicate local writes and deletes to these nodes as batched CRDT merges, one thread per peer, assuming a symmetric peer list; delete markers are garbage-collected once every peer's frontier has passed them; per-peer phi and lag appear in `INFO` and `/metrics`), `SOMNIUM_MAX_CLOCK_OFFSET_MS` (reject merges whose timestamp is further in the future, default 10 minutes), `SOMNIUM_METRICS_BIND` (IPv4 address of the metrics exporter, default `127.0.0.1`), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
+Environment: `REDIS_PORT`, `SOMNIUM_BIND` (IPv4 address to listen on, default `127.0.0.1`; refuses to start on a non-loopback address without a password), `SOMNIUM_PASSWORD` (require `AUTH` from every client; replication peers send it too, so all nodes of a cluster share one password. Like Redis `requirepass`, an authenticated client is fully trusted, including with replication and admin commands), `SOMNIUM_TLS_CERT` and `SOMNIUM_TLS_KEY` (PEM certificate and key; together they make the client port TLS-only and encrypt replication, see [Encrypted transport](#encrypted-transport)), `SOMNIUM_MAXCLIENTS` (maximum simultaneous connections, default 10,000; extra connections get `-ERR max number of clients reached` and are closed), `SOMNIUM_MAX_CLIENT_BUFFERS` (bytes all connections may hold in input and output buffers together, default 1 GB; a client whose read or reply would go over it is disconnected. Size it to the host's RAM: each client is also capped at 128 MB of input and 32 MB of pending output), `SOMNIUM_AOF_SYNC` (`always`/`everysec`/`no`), `SOMNIUM_AOF_SYNC_INTERVAL_MS` (everysec target interval, default 1000; a dedicated thread fsyncs outside the append lock, so a slow snapshot cannot postpone it. This is not a strict one-second power-loss window: if `fdatasync` overruns, `INFO` and `/metrics` show sync age, pending bytes and overrun count), `SOMNIUM_AOF_SYNC_DELAY_MS` and `SOMNIUM_SNAPSHOT_DELAY_MS` (test-only delays, default 0), `SOMNIUM_MAX_ROOMS` (maximum number of known rooms, default 10,000; a new name beyond it gets `-ERR too many rooms`, existing rooms are unaffected), `SOMNIUM_MAX_KEYS` (keys per room before eviction, default 1,000,000), `SOMNIUM_MAXMEMORY` (global budget in bytes for resident keys and values, estimated; default unlimited), `SOMNIUM_AOF_REWRITE_MIN_BYTES` (the AOF is rewritten automatically once it doubles past this size, default 64 MB), `SOMNIUM_NODE_ID` (CRDT node id of local writes, default 1), `SOMNIUM_PEERS` (`host:port,...`: replicate local writes and deletes to these nodes as batched CRDT merges, one thread per peer, assuming a symmetric peer list; delete markers are garbage-collected once every peer's frontier has passed them; per-peer phi and lag appear in `INFO` and `/metrics`), `SOMNIUM_MAX_CLOCK_OFFSET_MS` (reject merges whose timestamp is further in the future, default 10 minutes), `SOMNIUM_METRICS_BIND` (IPv4 address of the metrics exporter, default `127.0.0.1`), `SOMNIUM_NO_METRICS`, `SOMNIUM_CLOCK_OFFSET_MS` (shifts the clock, used by expiry tests).
 
 Data files (`appendonly.aof`, `room_*.bin`, `cold.bin`, replication offsets) are created readable by the server's user only. Files created by older versions keep their mode: run `chmod 600` on them once after upgrading.
 
@@ -126,7 +126,7 @@ Ensure your system meets the following requirements:
 * **OS:** Linux Kernel 5.1+ (required for native `io_uring` support)
 * **Compiler:** C++20 compliant compiler (GCC 10+ or Clang 10+)
 * **Build Tools:** CMake 3.10+
-* **Libraries:** `liburing` installed (`sudo apt install liburing-dev` on Debian/Ubuntu)
+* **Libraries:** `liburing` and OpenSSL 3 (`sudo apt install liburing-dev libssl-dev` on Debian/Ubuntu)
 
 ### Build Instructions
 
@@ -162,11 +162,26 @@ Deployment checklist:
 * Set `SOMNIUM_PASSWORD` to a long random value (for example `openssl rand -hex 32`). Every client and replication peer that knows it is fully trusted.
 * Keep `SOMNIUM_BIND` and `SOMNIUM_METRICS_BIND` on localhost unless something outside the host needs them.
 * Firewall the server port (`6379` by default) and the metrics port (`9090`).
-* Traffic is not encrypted: put a tunnel in front of anything that crosses a network (see below).
+* Encrypt anything that crosses a network, with native TLS or a tunnel (see below).
 
 ### Encrypted transport
 
-SomniumDB speaks plain TCP, so the password and the data are readable on the wire. Encrypt everything that leaves the host with a tunnel; the server itself stays as it is.
+Without TLS settings SomniumDB speaks plain TCP, so the password and the data are readable on the wire. Encrypt everything that leaves the host, either natively or with a tunnel.
+
+**Native TLS.** Set `SOMNIUM_TLS_CERT` and `SOMNIUM_TLS_KEY` on every node. The client port then accepts only TLS (1.2 or later), and replication runs over TLS too. All nodes of a cluster share one certificate and key, as they share one password: a node replicates only to peers that present that same certificate, so there is no CA to configure. Clients verify the server against the certificate (or the CA that issued it):
+
+```bash
+# once per cluster; copy both files to every node, readable only by the server's user
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 365 \
+  -subj /CN=db.example.com -addext "subjectAltName=DNS:db.example.com" \
+  -keyout somnium.key -out somnium.crt
+SOMNIUM_TLS_CERT=somnium.crt SOMNIUM_TLS_KEY=somnium.key SOMNIUM_PASSWORD=<secret> ./Redis
+redis-cli --tls --cacert somnium.crt -h db.example.com -a <secret>   # or rediss:// in client libraries
+```
+
+TLS encrypts; it does not replace the password, so `SOMNIUM_PASSWORD` is still required off localhost. Plain-text clients are disconnected. Every node and client needs the same setting: a plain-text node cannot replicate to a TLS node, and the reverse.
+
+The tunnels below need no change to the server.
 
 **Replication: WireGuard.** Put the nodes on a private WireGuard network and replicate over its addresses. On node 1 (`10.0.0.1`); node 2 mirrors it:
 

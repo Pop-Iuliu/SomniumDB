@@ -14,6 +14,7 @@
 #include <utility>
 #include <fcntl.h>
 #include <netdb.h>
+#include <openssl/err.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -77,7 +78,7 @@ namespace {
     }
 } // namespace
 
-Replicator::Replicator(const std::atomic<uint64_t>& frontier) : frontier_(frontier) {
+Replicator::Replicator(const std::atomic<uint64_t>& frontier, SSL_CTX* tls) : tls_(tls), frontier_(frontier) {
     if (const char* env = getenv("SOMNIUM_NODE_ID")) {
         uint64_t id = 0;
         if (fsutil::parse_u64(env, &id) && id >= 1 && id <= UINT32_MAX) node_id_ = static_cast<uint32_t>(id);
@@ -109,9 +110,15 @@ Replicator::Replicator(const std::atomic<uint64_t>& frontier) : frontier_(fronti
 Replicator::~Replicator() {
     running_ = false;
     for (std::thread& worker : workers_) worker.join();
-    for (const Peer& peer : peers_) {
-        if (peer.fd >= 0) ::close(peer.fd);
-    }
+    for (Peer& peer : peers_) disconnect(peer);
+}
+
+void Replicator::disconnect(Peer& peer) {
+    SSL_free(peer.ssl); // nullptr: nimic
+    peer.ssl = nullptr;
+    if (peer.fd >= 0) ::close(peer.fd);
+    peer.fd = -1;
+    ERR_clear_error(); // erorile TLS ale conexiunii inchise nu mai conteaza
 }
 
 void Replicator::start() {
@@ -189,10 +196,7 @@ bool Replicator::ship(Peer& peer) {
     if (peer.fd < 0) {
         peer.fd = connect_to(peer.host, peer.port);
         peer.room.clear(); // conexiune noua: camera selectata e iar "default"
-        if (peer.fd >= 0 && !authenticate(peer)) {
-            ::close(peer.fd);
-            peer.fd = -1;
-        }
+        if (peer.fd >= 0 && (!secure(peer) || !authenticate(peer))) disconnect(peer);
         if (peer.fd < 0) {
             ::close(aof);
             return false;
@@ -269,8 +273,7 @@ bool Replicator::ship(Peer& peer) {
     size_t acked = 0;
     const bool alive = deliver(peer, out, total, &acked);
     if (!alive) {
-        ::close(peer.fd);
-        peer.fd = -1;
+        disconnect(peer);
         acked = 0;
     }
     // un raspuns de eroare (ex. ROOMS FULL la peer) lasa camera incerta
@@ -286,6 +289,21 @@ bool Replicator::ship(Peer& peer) {
     return alive;
 }
 
+// SEC-16: cu TLS, peer-ul trebuie sa prezinte certificatul clusterului, acelasi pe
+// toate nodurile (ca parola): fara CA de configurat si fara verificarea numelui
+bool Replicator::secure(Peer& peer) {
+    if (!tls_) return true;
+    peer.ssl = SSL_new(tls_);
+    bool ok = peer.ssl && SSL_set_fd(peer.ssl, peer.fd) == 1 && SSL_connect(peer.ssl) == 1;
+    if (ok) {
+        X509* theirs = SSL_get1_peer_certificate(peer.ssl);
+        ok = theirs && X509_cmp(theirs, SSL_CTX_get0_certificate(tls_)) == 0;
+        X509_free(theirs);
+    }
+    if (!ok) fprintf(stderr, "Replicare: %s:%s nu prezinta certificatul clusterului (TLS)\n", peer.host.c_str(), peer.port.c_str());
+    return ok;
+}
+
 // prima comanda pe o conexiune noua, cand nodurile au parola
 bool Replicator::authenticate(Peer& peer) {
     if (password_.empty()) return true;
@@ -296,7 +314,9 @@ bool Replicator::authenticate(Peer& peer) {
 }
 
 bool Replicator::deliver(Peer& peer, const std::string& out, const size_t expected, size_t* acked) {
-    if (!fsutil::write_all(peer.fd, out.data(), out.size())) return false;
+    const bool sent = peer.ssl ? SSL_write(peer.ssl, out.data(), static_cast<int>(out.size())) > 0
+                               : fsutil::write_all(peer.fd, out.data(), out.size());
+    if (!sent) return false;
 
     // raspunsurile la ROOM si CRDTMERGE sunt linii simple: "+..." sau "-..."
     std::string in;
@@ -307,7 +327,7 @@ bool Replicator::deliver(Peer& peer, const std::string& out, const size_t expect
         const size_t crlf = in.find("\r\n", pos);
         if (crlf == std::string::npos) {
             char chunk[4096];
-            const ssize_t n = ::recv(peer.fd, chunk, sizeof(chunk), 0);
+            const ssize_t n = peer.ssl ? SSL_read(peer.ssl, chunk, sizeof(chunk)) : ::recv(peer.fd, chunk, sizeof(chunk), 0);
             if (n <= 0) return false;
             in.append(chunk, static_cast<size_t>(n));
             continue;

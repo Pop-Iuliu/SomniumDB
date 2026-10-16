@@ -6,6 +6,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <openssl/ssl.h>
 
 // S10 "koreish": replicare CRDT in caravane. Thread-uri proprii (I/O-ul de retea
 // nu are voie sa intarzie fsync-ul AOF din watchdog) citeste AOF-ul local de la
@@ -32,8 +33,9 @@
 class Replicator {
 public:
     // citeste SOMNIUM_NODE_ID si SOMNIUM_PEERS ("host:port,host:port"); frontier e
-    // versiunea pana la care toate scrierile locale sunt deja in AOF (Database)
-    explicit Replicator(const std::atomic<uint64_t>& frontier);
+    // versiunea pana la care toate scrierile locale sunt deja in AOF (Database);
+    // tls e contextul serverului (SEC-16), nullptr = replicare in text clar
+    Replicator(const std::atomic<uint64_t>& frontier, SSL_CTX* tls);
     ~Replicator();
 
     void start(); // nu face nimic fara peers
@@ -44,6 +46,7 @@ private:
         std::string port;
         std::string state_file; // "inode offset", ca restartul sa reia de unde a ramas
         int fd = -1;
+        SSL* ssl = nullptr; // SEC-16: sesiunea TLS peste fd, cand clusterul are TLS
         uint64_t inode = 0;
         uint64_t offset = 0;
         std::string room; // camera selectata pe conexiune ("" = necunoscuta)
@@ -54,13 +57,16 @@ private:
 
     uint32_t node_id_ = 1;
     std::string password_; // SOMNIUM_PASSWORD, aceeasi pe toate nodurile
+    SSL_CTX* tls_; // certificatul clusterului, acelasi pe toate nodurile
     const std::atomic<uint64_t>& frontier_;
     std::vector<Peer> peers_;
     std::atomic<bool> running_{false};
     std::vector<std::thread> workers_;
 
     bool ship(Peer& peer); // true = peer-ul a raspuns (heartbeat)
+    bool secure(Peer& peer);
     bool authenticate(Peer& peer);
+    static void disconnect(Peer& peer);
     void beat(Peer& peer);
     static void publish(const Peer& peer);
     bool deliver(Peer& peer, const std::string& out, size_t expected, size_t* acked);

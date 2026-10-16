@@ -5,7 +5,9 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
+import tempfile
 import time
 import urllib.request
 
@@ -245,6 +247,97 @@ def sec8_metrics(check):
         srv.cleanup()
 
 
+def make_cert(directory, name):
+    """Certificat autosemnat pentru localhost si 127.0.0.1, cu cheia lui."""
+    cert, key = os.path.join(directory, f"{name}.crt"), os.path.join(directory, f"{name}.key")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                    "-nodes", "-days", "1", "-subj", "/CN=localhost",
+                    "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1", "-keyout", key, "-out", cert],
+                   check=True, capture_output=True)
+    return cert, key
+
+
+class TlsClient(Client):
+    """Client RESP peste TLS; are incredere doar in certificatul dat."""
+
+    def __init__(self, srv, cert):
+        ctx = ssl.create_default_context(cafile=cert)
+        self.s = ctx.wrap_socket(srv.connect(timeout=10), server_hostname="localhost")
+        self.buf = b""
+
+
+def tls_env(cert_key):
+    return {"SOMNIUM_TLS_CERT": cert_key[0], "SOMNIUM_TLS_KEY": cert_key[1]}
+
+
+def sec16_tls(check):
+    certs = tempfile.mkdtemp()
+    cluster, other = make_cert(certs, "cluster"), make_cert(certs, "other")
+    srv = Server(env_extra={**ENV, "SOMNIUM_PASSWORD": PW, **tls_env(cluster)})
+    try:
+        srv.start()
+        check("SEC-16: pornirea anunta TLS", "(io_uring, TLS)" in server_log(srv), server_log(srv))
+        c = TlsClient(srv, cluster[0])
+        check("SEC-16: GET inainte de AUTH, peste TLS", c.cmd("GET", "k")[1].startswith("NOAUTH"))
+        check("SEC-16: AUTH peste TLS", c.cmd("AUTH", PW) == ("ok", "OK"))
+        big = "x" * (1 << 20)  # multe inregistrari TLS in ambele sensuri
+        check("SEC-16: 1 MB dus-intors", c.cmd("SET", "big", big) == ("ok", "OK") and c.cmd("GET", "big") == ("bulk", big.encode()))
+        check("SEC-16: HELLO 3 peste TLS", c.cmd("HELLO", "3")[0] == "map" and c.cmd("GET", "nope") == ("null", None))
+        c.cmd("SET", "k", "v")
+        c.close()
+
+        plain = Client(srv)
+        try:
+            reply = plain.cmd("PING")
+        except ConnectionError as e:
+            reply = e
+        check("SEC-16: un client fara TLS e deconectat", isinstance(reply, ConnectionError), reply)
+        plain.close()
+
+        if cli := shutil.which("redis-cli"):
+            out = subprocess.run([cli, "-p", str(srv.port), "--tls", "--cacert", cluster[0], "-a", PW,
+                                  "--no-auth-warning", "GET", "k"], capture_output=True, timeout=10)
+            check("SEC-16: redis-cli --tls", out.stdout.strip() == b"v", out)
+        srv.stop()
+
+        for name, env in (("cheie care nu se potriveste", {"SOMNIUM_TLS_CERT": cluster[0], "SOMNIUM_TLS_KEY": other[1]}),
+                          ("certificat fara cheie", {"SOMNIUM_TLS_CERT": cluster[0]}),
+                          ("fisier lipsa", tls_env((cluster[0] + ".nope", cluster[1])))):
+            r = run_once(srv, env)
+            check(f"SEC-16: {name} refuza pornirea", r is not None and r.returncode == 1 and b"SOMNIUM_TLS" in r.stderr, r)
+    finally:
+        srv.cleanup()
+        shutil.rmtree(certs, ignore_errors=True)
+
+
+def sec16_tls_replication(check):
+    certs = tempfile.mkdtemp()
+    cluster, other = make_cert(certs, "cluster"), make_cert(certs, "other")
+
+    def node(node_id, port, peer_port, cert_key):
+        return Server(port=port, keep_dir_on_retry=True, env_extra={
+            **ENV, "SOMNIUM_NODE_ID": str(node_id), "SOMNIUM_PEERS": f"127.0.0.1:{peer_port}", **tls_env(cert_key)})
+
+    a, b, x = node(1, 6393, 6394, cluster), node(2, 6394, 6393, cluster), node(3, 6395, 6394, other)
+    try:
+        for srv in (a, b, x):
+            srv.start()
+        ca, cb, cx = TlsClient(a, cluster[0]), TlsClient(b, cluster[0]), TlsClient(x, other[0])
+        ca.cmd("SET", "from_a", "1")
+        cx.cmd("SET", "from_x", "1")
+        check("SEC-16: nodurile cu acelasi certificat replica peste TLS",
+              wait_until(lambda: cb.cmd("GET", "from_a") == ("bulk", b"1")))
+        time.sleep(1.5)  # cateva caravane
+        check("SEC-16: nodul cu alt certificat nu replica", cb.cmd("GET", "from_x")[0] == "nil")
+        check("SEC-16: ...si spune de ce", "nu prezinta certificatul clusterului" in server_log(x), server_log(x)[-500:])
+        for c in (ca, cb, cx):
+            c.close()
+    finally:
+        for srv in (a, b, x):
+            srv.cleanup()
+        shutil.rmtree(certs, ignore_errors=True)
+
+
 def flood(sock, seconds):
     """Trimite comenzi fara sa citeasca vreun raspuns (un client care nu urmeaza citirea)."""
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
@@ -386,6 +479,8 @@ def main():
     run_with_retry(sec6_maxclients, fails)
     run_with_retry(sec7_max_rooms, fails)
     run_with_retry(sec8_metrics, fails)
+    run_with_retry(sec16_tls, fails)
+    run_with_retry(sec16_tls_replication, fails)
     run_with_retry(sec17_dropped_clients, fails)
     run_with_retry(sec18_auth_timeout, fails)
     run_with_retry(sec19_mget_reply, fails)

@@ -18,6 +18,8 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/stat.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 
 #include "metrics.h"
 #include "src/core/database.h"
@@ -43,7 +45,21 @@ static unsigned g_auth_failures = 0; // SEC-20: parole gresite inca nelogate
 static uint64_t g_maxclients = 10000; // SEC-6: SOMNIUM_MAXCLIENTS, ca Redis
 static uint64_t g_max_client_buffers = 1ull << 30; // SEC-22: SOMNIUM_MAX_CLIENT_BUFFERS
 static uint64_t g_client_buffers = 0; // SEC-22: octetii din bufferele tuturor clientilor
+static SSL_CTX* g_tls = nullptr; // SEC-16: SOMNIUM_TLS_CERT + SOMNIUM_TLS_KEY; nullptr = text clar
 static Watchdog watchdog(db);
+
+// SEC-16: TLS sta intre socket si buffere, pe BIO-uri de memorie. I/O-ul pe socket
+// ramane neschimbat; in_buf primeste text clar, out_buf textul cifrat gata de
+// trimis, deci capurile, bugetul si flush-ul lucreaza la fel ca fara TLS.
+static SSL* tls_session() {
+    SSL* ssl = SSL_new(g_tls);
+    BIO* rbio = BIO_new(BIO_s_mem());
+    BIO* wbio = BIO_new(BIO_s_mem());
+    if (!ssl || !rbio || !wbio) abort(); // ca orice alocare esuata
+    SSL_set_bio(ssl, rbio, wbio);
+    SSL_set_accept_state(ssl);
+    return ssl;
+}
 
 // S3 "naigie": calutul de munca care nu se opreste pentru niciun client.
 // Fiecare client are o coada de output ordonata; scrierile partiale se reiau
@@ -61,6 +77,7 @@ struct Client {
     bool resp3 = false; // protocolul negociat prin HELLO
     bool authenticated = g_password.empty();
     size_t held = 0; // cat din g_client_buffers e al acestui client
+    unique_ptr<SSL, decltype(&SSL_free)> ssl{g_tls ? tls_session() : nullptr, SSL_free}; // SEC-16
     const chrono::steady_clock::time_point connected = chrono::steady_clock::now();
 
     explicit Client(int f) : fd(f) {}
@@ -81,6 +98,35 @@ static bool over_buffer_budget(const Client& c, const size_t extra) {
     if (g_client_buffers + extra <= g_max_client_buffers) return false;
     printf("[ClientBuffers] FD %d: bufferele clientilor depasesc SOMNIUM_MAX_CLIENT_BUFFERS. Deconectat.\n", c.fd);
     return true;
+}
+
+// ce a produs OpenSSL (handshake, inregistrari, alerte) trece in out_buf
+static void take_ciphertext(Client& c) {
+    BIO* wbio = SSL_get_wbio(c.ssl.get());
+    char* data = nullptr;
+    const long n = BIO_get_mem_data(wbio, &data);
+    c.out_buf.append(data, static_cast<size_t>(n));
+    (void)BIO_reset(wbio);
+}
+
+// octeti cifrati de pe socket -> text clar in in_buf; false = handshake esuat, alerta sau inchidere
+static bool tls_in(Client& c, const char* raw, const size_t len) {
+    BIO_write(SSL_get_rbio(c.ssl.get()), raw, static_cast<int>(len));
+    char plain[READ_CHUNK];
+    int n;
+    while ((n = SSL_read(c.ssl.get(), plain, sizeof(plain))) > 0) c.in_buf.append(plain, static_cast<size_t>(n));
+    take_ciphertext(c);
+    if (SSL_get_error(c.ssl.get(), n) == SSL_ERROR_WANT_READ) return true;
+    ERR_clear_error(); // coada de erori e a thread-ului: urmatorul client o vrea goala
+    return false;
+}
+
+// text clar -> inregistrari TLS in out_buf
+static bool tls_out(Client& c, const string& data) {
+    const bool ok = SSL_write(c.ssl.get(), data.data(), static_cast<int>(data.size())) > 0;
+    if (!ok) ERR_clear_error();
+    take_ciphertext(c);
+    return ok;
 }
 
 // un PollTicket zboara cu fiecare poll armat in ring; shared_ptr tine clientul
@@ -218,7 +264,11 @@ static bool enqueue_output(const shared_ptr<Client>& c, const string& data) {
         schedule_close(c);
         return false;
     }
-    c->out_buf += data;
+    if (!c->ssl) c->out_buf += data;
+    else if (!tls_out(*c, data)) {
+        schedule_close(c);
+        return false;
+    }
     track(*c);
     return true;
 }
@@ -376,7 +426,8 @@ static bool drain_read(const shared_ptr<Client>& c) {
     while (c->in_buf.size() < c->input_cap()) {
         const ssize_t n = read(c->fd, temp, sizeof(temp));
         if (n > 0) {
-            c->in_buf.append(temp, static_cast<size_t>(n));
+            if (!c->ssl) c->in_buf.append(temp, static_cast<size_t>(n));
+            else if (!tls_in(*c, temp, static_cast<size_t>(n))) return false;
             track(*c);
             if (over_buffer_budget(*c, 0)) return false; // apelantul il inchide
             if (static_cast<size_t>(n) < sizeof(temp)) return true; // s-a golit kernel bufferul
@@ -388,6 +439,22 @@ static bool drain_read(const shared_ptr<Client>& c) {
         return false;
     }
     return true; // cap de input: restul asteapta urmatorul ciclu
+}
+
+// SEC-16: SOMNIUM_TLS_CERT si SOMNIUM_TLS_KEY pornesc TLS pentru clienti si pentru replicare
+static bool load_tls() {
+    const char* cert = getenv("SOMNIUM_TLS_CERT");
+    const char* key = getenv("SOMNIUM_TLS_KEY");
+    if (!cert && !key) return true;
+    g_tls = SSL_CTX_new(TLS_method());
+    if (cert && key && g_tls && SSL_CTX_set_min_proto_version(g_tls, TLS1_2_VERSION) == 1 &&
+        SSL_CTX_use_certificate_chain_file(g_tls, cert) == 1 &&
+        SSL_CTX_use_PrivateKey_file(g_tls, key, SSL_FILETYPE_PEM) == 1 && SSL_CTX_check_private_key(g_tls) == 1) {
+        return true;
+    }
+    cerr << "TLS: SOMNIUM_TLS_CERT si SOMNIUM_TLS_KEY trebuie sa fie impreuna un certificat PEM si cheia lui\n";
+    ERR_print_errors_fp(stderr);
+    return false;
 }
 
 // SEC-18: o conexiune care nu se autentifica la timp elibereaza locul (fara
@@ -452,6 +519,7 @@ int main() {
              << " expune serverul in retea, dar SOMNIUM_PASSWORD nu e setat\n";
         return 1;
     }
+    if (!load_tls()) return 1;
 
     if (getenv("SOMNIUM_NO_METRICS") == nullptr) {
         start_prometheus_exporter(9090);
@@ -498,11 +566,11 @@ int main() {
     arm_listener(&ring);
     arm_eventfd(&ring);
 
-    cout << "Server pornit (io_uring) pe " << bind_ip << ":" << port << "...\n";
+    cout << "Server pornit (io_uring" << (g_tls ? ", TLS" : "") << ") pe " << bind_ip << ":" << port << "...\n";
     watchdog.start();
 
     // replicare CRDT catre SOMNIUM_PEERS (nimic fara peers)
-    static Replicator replicator(db.replication_frontier());
+    static Replicator replicator(db.replication_frontier(), g_tls);
     replicator.start();
 
     bool first_wait = true; // doar prima asteptare e sensibila la CQE-uri pierdute
