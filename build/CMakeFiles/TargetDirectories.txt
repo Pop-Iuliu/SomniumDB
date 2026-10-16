@@ -1,3 +1,0 @@
-/home/tiwerlol/CLionProjects/Redis/build/CMakeFiles/Redis.dir
-/home/tiwerlol/CLionProjects/Redis/build/CMakeFiles/edit_cache.dir
-/home/tiwerlol/CLionProjects/Redis/build/CMakeFiles/rebuild_cache.dir
