@@ -4,8 +4,8 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
-#include "../../record.h"
-#include "../../metrics.h"
+#include "record.h"
+#include "../server/metrics.h"
 
 // Ciclul de viata: Sleeping -> Loading -> Active -> Hibernating -> Sleeping.
 //

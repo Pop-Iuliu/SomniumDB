@@ -29,8 +29,8 @@ A step-by-step plan for restructuring SomniumDB after the security plan (`securi
 | REF-2 | One source of configuration | 1. Foundations | DONE (#36) |
 | REF-3 | Split `database.cpp` by concern | 2. Structure | DONE (#37) |
 | REF-4 | A command table | 2. Structure | DONE (#38) |
-| REF-5 | Split `main.cpp`: connection layer and authentication | 2. Structure | IMPLEMENTED (awaiting CI) |
-| REF-6 | Source layout | 3. Layout and tests | TODO |
+| REF-5 | Split `main.cpp`: connection layer and authentication | 2. Structure | DONE (#39) |
+| REF-6 | Source layout | 3. Layout and tests | IMPLEMENTED (awaiting CI) |
 | REF-7 | Shared test helpers | 3. Layout and tests | TODO |
 
 ## Current state
@@ -214,6 +214,12 @@ Add the new files to `CMakeLists.txt` and to the source list of the `fuzz` job i
 **Files:** the moved files and everything that includes them.
 
 **Timing:** last, because it touches includes in most files; merge it when few other pull requests are open.
+
+**Result:**
+- **Moves:** `metrics.*` and `watchdog.*` to `src/server/`; `pubsub.*`, `record.h` and `pool_allocator.h` to `src/core/`. Done with `git mv`, so Git records nine renames and no content change in the moved files, apart from `watchdog.h`'s include of `database.h` (now `../core/database.h`).
+- **Edits:** 17 include lines in 12 files, the source lists in `CMakeLists.txt` and the `fuzz` job, and the "Project Structure" section of `README.md`, which was out of date anyway (it described `utils/` as holding the allocator and the exporter, and missed `net/` and `tests/`). `CMakeLists.txt` now lists every source under `src/`, including `room.h`, which it had never listed.
+- **Changes from the plan:** `main.cpp` stays at the root, as the entry point; the plan's list of moves did not include it, though its "Done when" read as if the root would hold no source at all. `SPRINT.md` keeps the old paths, because it records past sprints.
+- **Verification so far:** every source compiles from its new location with GCC 13 (stub headers), the `fuzz` job's exact source list links and runs the harness's sample inputs, and a script confirmed that `CMakeLists.txt` lists every file under `src/`. The server and the suites need Linux, so CI on this PR is the first real run.
 
 ### REF-7: Shared test helpers
 

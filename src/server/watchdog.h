@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "src/core/database.h"
+#include "../core/database.h"
 #include <thread>
 #include <atomic>
 #include <mutex>

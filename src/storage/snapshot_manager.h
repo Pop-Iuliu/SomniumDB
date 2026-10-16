@@ -3,8 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include "../../record.h"
-#include "../../pool_allocator.h"
+#include "../core/record.h"
+#include "../core/pool_allocator.h"
 #include "../core/room.h"
 
 // Format fisier snapshot (v2):

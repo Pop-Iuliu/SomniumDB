@@ -2,7 +2,7 @@
 // Lock-uri (room.h): rooms_mutex inaintea room_mutex, niciodata invers; activate()
 // si hibernate() presupun room_mutex prins.
 #include "database.h"
-#include "../../metrics.h"
+#include "../server/metrics.h"
 
 std::shared_ptr<Room> Database::find_room(const std::string& name, const bool create) {
     {

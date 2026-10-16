@@ -5,9 +5,9 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include "../../record.h"
+#include "../core/record.h"
 #include "../config.h"
-#include "../../pool_allocator.h"
+#include "../core/pool_allocator.h"
 #include "../core/room.h"
 #include "../utils/count_min_sketch.h"
 
