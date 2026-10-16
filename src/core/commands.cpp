@@ -8,39 +8,13 @@
 #include <chrono>
 #include <climits>
 
-std::string Database::execute_in_room(const std::string& room_name, const std::vector<std::string>& args) {
-    if (args.empty()) return "-ERR empty command\r\n";
-
-    std::string command = args[0];
-    std::ranges::transform(command, command.begin(), ::toupper);
-
-    const std::shared_ptr<Room> room = find_room(room_name, true);
+std::string Database::execute_in_room(const Command& cmd, const Call& call) {
+    const std::shared_ptr<Room> room = find_room(call.room_name, true);
     // camera adormita se trezeste sub lock-ul ei, nu sub lock-ul global
     std::lock_guard room_lock(room->room_mutex);
     if (!activate(*room)) return ROOMS_FULL;
 
-    const std::string reply = [&]() -> std::string {
-        if (command == "GET") return handle_get(room_name, *room, args);
-        if (command == "SET") return handle_set(room_name, *room, args);
-        if (command == "DEL") return handle_del(room_name, *room, args);
-        if (command == "CRDTMERGE") return handle_crdtmerge(room_name, *room, args);
-        if (command == "CRDTDEL") return handle_crdtdel(room_name, *room, args);
-        if (command == "MGET") return handle_mget(room_name, *room, args);
-        if (command == "MSET") return handle_mset(room_name, *room, args);
-        if (command == "EXISTS") return handle_exists(room_name, *room, args);
-        if (command == "EXPIRE") return handle_expire(room_name, *room, args, 1000);
-        if (command == "PEXPIRE") return handle_expire(room_name, *room, args, 1);
-        if (command == "PERSIST") return handle_expire(room_name, *room, args, 0);
-        if (command == "TTL") return handle_ttl(room_name, *room, args, false);
-        if (command == "PTTL") return handle_ttl(room_name, *room, args, true);
-        if (command == "SAVE") {
-            // nu confirmam niciodata o persistenta suspectata
-            return aof.healthy() ? "+OK AOF is active and up to date\r\n"
-                                 : "-ERR AOF write error, persistenta suspecta\r\n";
-        }
-
-        return "-ERR unknown command\r\n";
-    }();
+    const std::string reply = cmd.run(*this, {call.client_fd, call.command, call.args, call.room_name, room.get()});
 
     // evictare o singura data, dupa comanda: acopera scrierile, dar si cheile
     // reincarcate din cold storage de citiri (raspunsul e deja construit)

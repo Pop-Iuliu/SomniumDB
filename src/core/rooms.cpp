@@ -80,6 +80,15 @@ const char* Database::wake_room(const std::string& name) {
     return activate(*room) ? nullptr : ROOMS_FULL;
 }
 
+// ROOM name selecteaza (si trezeste) camera clientului; comenzile de administrare au
+// prefixul "ROOM." ca nume precum LIST sa ramana camere valide
+std::string Database::handle_room(const int client_fd, const std::vector<std::string>& args) {
+    if (args.size() != 2) return "-ERR Wrong number of arguments for ROOM\r\n";
+    if (const char* err = wake_room(args[1])) return err;
+    set_client_room(client_fd, args[1]);
+    return "+OK\r\n";
+}
+
 std::string Database::handle_room_admin(const std::string& command, const std::vector<std::string>& args) {
     if (command == "ROOMS") {
         std::shared_lock lock(rooms_mutex);

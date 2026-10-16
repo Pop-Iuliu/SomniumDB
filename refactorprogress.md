@@ -27,8 +27,8 @@ A step-by-step plan for restructuring SomniumDB after the security plan (`securi
 | --- | --- | --- | --- |
 | REF-1 | Construct the server after startup checks | 1. Foundations | DONE (#35) |
 | REF-2 | One source of configuration | 1. Foundations | DONE (#36) |
-| REF-3 | Split `database.cpp` by concern | 2. Structure | IMPLEMENTED (awaiting CI) |
-| REF-4 | A command table | 2. Structure | TODO |
+| REF-3 | Split `database.cpp` by concern | 2. Structure | DONE (#37) |
+| REF-4 | A command table | 2. Structure | IMPLEMENTED (awaiting CI) |
 | REF-5 | Split `main.cpp`: connection layer and authentication | 2. Structure | TODO |
 | REF-6 | Source layout | 3. Layout and tests | TODO |
 | REF-7 | Shared test helpers | 3. Layout and tests | TODO |
@@ -159,6 +159,17 @@ Add the new files to `CMakeLists.txt` and to the source list of the `fuzz` job i
 **Files:** `src/core/database.{h,cpp}`, `src/core/rooms.cpp`, `src/core/commands.cpp`.
 
 **Depends on:** REF-3, so the change lands in the already-split files.
+
+**Changes from the plan:**
+- "Allowed in RESP2 subscribe mode" and "not counted" hold for exactly the same four commands (`PING`, `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`), so they are one column, `pubsub`, documented as both. Separating them belongs to decision D4, if the counter ever changes.
+- `ROOM.<anything>` stays a family: the dispatcher looks every `ROOM.` name up as the single row `"ROOM."`, and `handle_room_admin()` picks the subcommand, as before. So an unknown `ROOM.X` still answers with its argument, room or unknown-command error.
+- An unknown command is a fallback row with room scope. It still wakes the client's room (and can get `ROOMS FULL`) before answering `-ERR unknown command`, exactly as before.
+- Rows are one-line lambdas calling the existing handlers. Four inline bodies longer than three lines became handlers in the file of their concern: `handle_subscribe()` and `handle_ping()` (`database.cpp`), `handle_room()` (`rooms.cpp`) and `handle_replfrontier()` (`crdt.cpp`, next to the tombstone collection it drives).
+- `execute_in_room()` now receives the row and runs its handler. Its empty-arguments check went: `execute()` already returns on empty input, and it is the only caller.
+
+**Result:**
+- One table in `database.cpp`, 27 rows in three groups (4 Pub/Sub, 9 connection and server, 14 key commands). `execute()` uppercases the name once, finds the row, applies the subscribe-mode check and the counter unless the row is `pubsub`, and runs the handler, inside the client's room if the row says so.
+- **Verification so far:** every file compiles cleanly with GCC 13 (stub headers). A differential check built `Database` from `main` and from this branch with the same driver and ran a 75-command script through both: every row, both fallbacks, the `ROOM.*` error variants, subscribe mode on RESP2 and RESP3, lowercase names, wrong argument counts, and `INFO`'s command counter. The replies were byte-for-byte identical. The server and the suites need Linux, so CI on this PR is the first real run.
 
 ### REF-5: Split `main.cpp`: connection layer and authentication
 
