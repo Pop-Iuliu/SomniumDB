@@ -1,6 +1,7 @@
 build/
 build-release/
 build-asan/
+build-tsan/
 cmake-build-*/
 .idea/
 *.bin
