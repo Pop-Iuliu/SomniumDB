@@ -225,17 +225,23 @@ std::string Database::handle_del(const std::string& room_name, Room& room, const
         return "-ERR Wrong number of arguments for DEL\r\n";
     }
 
-    // lookup aduce si cheile din cold storage: stergerea le scoate din ambele
-    const std::string& key = args[1];
-    const Record* r = lookup(room_name, room, key);
-    if (!r) return ":0\r\n";
+    // DEL key [key ...], ca la Redis (inainte, cheile de dupa prima erau ignorate in tacere).
+    // O inregistrare AOF per cheie: replay-ul si replicarea (CRDTDEL) raman pe o singura cheie
+    size_t deleted = 0;
+    for (size_t i = 1; i < args.size(); ++i) {
+        // lookup aduce si cheile din cold storage: stergerea le scoate din ambele
+        const std::string& key = args[i];
+        const Record* r = lookup(room_name, room, key);
+        if (!r) continue;
 
-    // stergerea e o scriere versionata: peste versiunea cheii, deci castiga pe orice nod
-    const Version v{clock_.next(get_current_time_ms(), r->timestamp_ms), local_node_id};
-    erase(room, room.keys.find(key));
-    set_tomb(room_name, key, v);
-    aof.append(room_name, args, 0, v.ts, v.node);
-    return ":1\r\n";
+        // stergerea e o scriere versionata: peste versiunea cheii, deci castiga pe orice nod
+        const Version v{clock_.next(get_current_time_ms(), r->timestamp_ms), local_node_id};
+        erase(room, room.keys.find(key));
+        set_tomb(room_name, key, v);
+        aof.append(room_name, {"DEL", key}, 0, v.ts, v.node);
+        ++deleted;
+    }
+    return ":" + std::to_string(deleted) + "\r\n";
 }
 
 std::string Database::handle_info() {
