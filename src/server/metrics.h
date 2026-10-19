@@ -36,6 +36,16 @@ struct DbMetrics {
 
 extern DbMetrics global_metrics;
 
+// Contor cu un singur scriitor (thread-ul de comenzi: total_gets, total_sets,
+// cache_hits, cache_misses, total_commands): load + store e exact si evita
+// instructiunea lock a unui fetch_add, platita la fiecare comanda. Cititorii
+// (metrici, INFO) vad tot o valoare atomica. Un contor scris si de alt thread
+// (keys_in_ram, resident_bytes: watchdog-ul) ramane pe fetch_add.
+template <typename T>
+inline void bump(std::atomic<T>& counter, const T n = 1) {
+    counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+}
+
 // Varsta ultimei sincronizari reusite; -1 daca nu a existat niciuna.
 inline long long aof_sync_age_ms() {
     const auto last = global_metrics.aof_last_sync_epoch_ms.load(std::memory_order_relaxed);

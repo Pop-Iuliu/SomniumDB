@@ -108,6 +108,8 @@ Findings from stress-testing `main` at `b8d6f7b` (2026-10-16) on the Release and
 
 Once D1 is decided, it becomes STAB-4, with a test like the disk-full tests in `tests/stab_test.py`: no `+OK` while the file-size limit is in place, and nothing changed in RAM by a refused write.
 
+**Since the batched AOF (`tests/pipe_test.py`):** `AOFManager::append()` only buffers the record. The `write()` happens once per event-loop iteration in `flush()`, before any reply of that iteration leaves the server, so a failed write is known while the replies can still be changed. Behaviour on failure is unchanged: the writes stay in RAM and are acknowledged. Write-ahead as recommended above would have to call `flush()` before every mutation, which brings back one `write()` per write command (measured: about half the deep-pipeline throughput). The choice now includes doing write-ahead only while the AOF is unhealthy, and keeping the batched path while it is healthy.
+
 ## Done
 
 Fixed in #43, the pull request that added this plan. Each fix has a test that fails on `main` and passes after it.

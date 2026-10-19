@@ -2,6 +2,7 @@
 #include "auth.h"
 #include "../core/database.h"
 #include "../core/resp.h"
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,9 @@ namespace net {
 namespace {
     constexpr size_t READ_CHUNK = 16384;
     constexpr int MAX_COMMANDS_PER_TURN = 8192;
+    constexpr size_t CHUNK_COMMANDS = 16;   // comenzi parsate inainte, pentru prefetch
+    constexpr size_t CHUNK_BYTES = 64 * 1024;
+    constexpr size_t KEEP_ARG_BYTES = 4096; // un argument pastrat intre apeluri
     constexpr size_t MAX_INPUT_BUFFER = 128ull * 1024 * 1024;
     constexpr size_t MAX_UNAUTH_BUFFER = 16ull * 1024; // un strain nu are voie sa ne tina megaocteti (input sau output)
 
@@ -128,47 +132,80 @@ bool enqueue_output(Client& c, const std::string& data) {
 
 Step process_buffered(Client& c, Database& db) {
     // parsam de la un offset si stergem inputul consumat o singura data pe
-    // batch: un pipeline adanc costa liniar, nu cate o copiere per comanda
+    // batch: un pipeline adanc costa liniar, nu cate o copiere per comanda.
+    // Comenzile se parseaza cate un chunk, iar Database::prefetch aduce in cache
+    // cheile intregului chunk inainte de executie: miss-urile se suprapun
     int processed = 0;
     size_t pos = 0;
-    std::vector<std::string> args;
-    resp::Status st = resp::Status::NeedMore;
-    bool quit = false;
-
-    while (processed < MAX_COMMANDS_PER_TURN) {
-        size_t end = 0;
-        st = resp::parse_request(c.in_buf, pos, &end, &args);
-        if (st != resp::Status::Complete) break;
-        pos = end;
-        ++processed;
-
-        // QUIT tine de conexiune, nu de baza de date: raspundem si inchidem
-        if (args.size() == 1 && strcasecmp(args[0].c_str(), "QUIT") == 0) {
-            quit = true;
-            break;
+    // argumentele isi pastreaza capacitatea si intre apeluri (doar thread-ul buclei
+    // ajunge aici): o cheie de peste 15 octeti nu se mai aloca la fiecare batch.
+    // Ce e mare (o valoare de peste KEEP_ARG_BYTES, un MSET lung) se elibereaza la
+    // iesire, deci raman cel mult 16 x 16 x 4 KB = 1 MB
+    static std::vector<std::string> chunk[CHUNK_COMMANDS];
+    struct Trim {
+        ~Trim() {
+            for (auto& args : chunk) {
+                if (args.size() > CHUNK_COMMANDS) std::vector<std::string>().swap(args);
+                for (auto& a : args) {
+                    if (a.capacity() > KEEP_ARG_BYTES) std::string().swap(a);
+                }
+            }
         }
+    } trim;
+    size_t ends[CHUNK_COMMANDS];
+    resp::Status st = resp::Status::Complete;
+    bool quit = false;
+    bool drop = false;
 
-        // AUTH si HELLO tin de conexiune; HELLO alege protocolul in care raspund
-        // celelalte comenzi. Pana la autentificare, doar ele (si QUIT) trec.
-        const char* name = args.empty() ? "" : args[0].c_str();
-        const std::string response = strcasecmp(name, "AUTH") == 0    ? auth(c, args, g_cfg.password)
-                                   : strcasecmp(name, "HELLO") == 0   ? hello(c, args, g_cfg.password)
-                                   : !c.authenticated                 ? "-NOAUTH Authentication required.\r\n"
-                                                                      : db.execute(c.fd, args, c.resp3);
-        if (!response.empty() && !enqueue_output(c, response)) return Step::Drop; // un cap depasit
+    while (st == resp::Status::Complete && !quit && !drop && processed < MAX_COMMANDS_PER_TURN) {
+        // marginit si in octeti: copiile argumentelor nu dubleaza un in_buf mare
+        const size_t want = std::min<size_t>(CHUNK_COMMANDS, MAX_COMMANDS_PER_TURN - processed);
+        size_t n = 0;
+        size_t scan = pos;
+        while (n < want && (n == 0 || scan - pos < CHUNK_BYTES)) {
+            st = resp::parse_request(c.in_buf, scan, &ends[n], &chunk[n]);
+            if (st != resp::Status::Complete) break;
+            scan = ends[n++];
+        }
+        if (n > 1 && c.authenticated) db.prefetch(c.fd, chunk, n);
+
+        for (size_t i = 0; i < n && !quit && !drop; ++i) {
+            const std::vector<std::string>& args = chunk[i];
+            pos = ends[i];
+            ++processed;
+
+            // QUIT tine de conexiune, nu de baza de date: raspundem si inchidem
+            if (args.size() == 1 && strcasecmp(args[0].c_str(), "QUIT") == 0) {
+                quit = true;
+                break;
+            }
+
+            // AUTH si HELLO tin de conexiune; HELLO alege protocolul in care raspund
+            // celelalte comenzi. Pana la autentificare, doar ele (si QUIT) trec.
+            const char* name = args.empty() ? "" : args[0].c_str();
+            const std::string response = strcasecmp(name, "AUTH") == 0    ? auth(c, args, g_cfg.password)
+                                       : strcasecmp(name, "HELLO") == 0   ? hello(c, args, g_cfg.password)
+                                       : !c.authenticated                 ? "-NOAUTH Authentication required.\r\n"
+                                                                          : db.execute(c.fd, args, c.resp3);
+            if (!response.empty() && !enqueue_output(c, response)) drop = true; // un cap depasit
+        }
     }
+    // un client inchis nu mai primeste nimic; mutatiile lui (deja in RAM) ajung
+    // in AOF la write-ul de la capatul iteratiei
+    if (drop) return Step::Drop;
     c.in_buf.erase(0, pos);
     track(c);
 
     // ca Redis: dupa QUIT sau o eroare de protocol (inputul nu mai poate fi
-    // resincronizat) trimitem ultimul raspuns si inchidem
+    // resincronizat) trimitem ultimul raspuns si inchidem. Pleaca acum, deci
+    // mutatiile de dinainte se scriu intai
     if (quit || st == resp::Status::Malformed) {
+        db.flush_aof();
         if (enqueue_output(c, quit ? "+OK\r\n" : "-ERR Protocol error\r\n")) flush_output(c);
         return Step::Drop;
     }
 
-    // ce nu pleaca acum ramane in out_buf, iar bucla armeaza POLLOUT pentru el
-    if (flush_output(c) == FlushResult::Dead) return Step::Drop;
+    // raspunsurile raman in out_buf: bucla le trimite dupa write-ul AOF care le acopera
     return processed == MAX_COMMANDS_PER_TURN && !c.in_buf.empty() ? Step::More : Step::Done;
 }
 

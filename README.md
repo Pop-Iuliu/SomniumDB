@@ -257,11 +257,36 @@ Measured after the S5 (persistence contracts) milestone. Both servers measured b
 | SET, 1 client | 27,609 ops/s | 24,015 ops/s | -13% |
 | GET pipelined (-P 16) | 980,392 ops/s | **1,137,273 ops/s** | **+16%** |
 | SET pipelined (-P 16) | 676,216 ops/s | 689,655 ops/s | +2% (parity) |
-| 100k x 100B insert (deep pipeline) | 1,089,913 ops/s | 564,972 ops/s | -48% |
+| 100k x 100B insert (deep pipeline) | 1,089,913 ops/s | 564,972 ops/s | -48% (before the batched AOF, see below) |
 | RSS for 63k keys (100B values) | +13 MB | +17 MB | +29% |
 | CRDTMERGE, 1 client pipelined | n/a | 263,158 ops/s | SomniumDB only |
 
 For history: before the queued-output milestone, pipelined throughput collapsed to ~19k ops/s (a blocked sender stalled the whole event loop); the same workload now runs over 50x faster. The S5 milestone also removed the SET handicap: the per-command AOF append became a single POSIX `write()` and the `everysec` fsync moved off the command thread. It now runs on its own thread, not on the watchdog, so room snapshots do not delay it and `fdatasync` does not hold the append lock.
+
+### Pipelines after the batched AOF
+
+The deep-pipeline gap was persistence after all. Every SET paid for the AOF on its own: one `write()` and a wake-up of the fsync thread (a futex, a context switch and a fight for the AOF mutex), and pipelining cannot spread a per-command cost. Measured on a 4-vCPU cloud VM (kernel 6.18) against **Redis 7.0.15**, client on the same host, 50 clients, median of 5 runs of 1,000,000 requests (200,000 unpipelined). SomniumDB uses its default `everysec`; Redis ran both without persistence, as above, and with `appendonly yes` and `appendfsync everysec`, the same durability:
+
+| Workload (ops/s) | SomniumDB before | SomniumDB after | Redis, no persistence | Redis, AOF everysec |
+| --- | --- | --- | --- | --- |
+| 100k x 100B insert, `-P 64` (deep pipeline) | 94,108 | **573,723** | 564,652 | 378,214 |
+| 100B SET, `-P 64`, 1k keys | 106,974 | **732,064** | 1,131,221 | 602,772 |
+| 100B GET, `-P 64`, 100k keys | 531,349 | **907,441** | 732,064 | 744,047 |
+| SET, `-P 16` | 124,688 | 586,854 | 956,022 | 605,693 |
+| GET, `-P 16` | 717,360 | 883,392 | 1,025,641 | 1,078,748 |
+| SET, unpipelined | 26,409 | 42,034 | 81,532 | 96,246 |
+| GET, unpipelined | 47,778 | 44,893 | 82,542 | 84,709 |
+
+The unpipelined GET difference is noise: measured alone, 8 runs each, the medians are 46.0k before and 46.7k after. On this VM SomniumDB trails Redis on unpipelined requests before and after the change, unlike on the original hardware above; that is per-request cost in the event loop on this kernel, not the AOF.
+
+What changed:
+
+* **Group commit for the AOF.** `append()` encodes the record into a batch buffer and the event loop writes it with one `write()` (under `always`, one `fdatasync`), then sends the replies it covers. Replies with nothing unwritten behind them go out at once; the others wait until 64 KB of records are buffered or the loop iteration ends. No byte reaches any client before the records of the commands it acknowledges are written: `PUBLISH`, `REPLFRONTIER`, `INFO`, `SAVE`, `QUIT` and protocol errors flush first.
+* **The fsync thread is woken only when it waits for data.** Before, every write notified it while it was waiting for its interval.
+* **Batch prefetch, as in Redis 8.** Pipelined commands are parsed 16 at a time, and the hash-table buckets, nodes, records and values of their keys are prefetched in stages before they run, so the cache misses overlap instead of queueing. Rooms under 16,384 keys stay in cache and skip it.
+* **Less work per command.** AOF records are encoded in one pass, parsed arguments keep their buffers, the CountMinSketch hashes a key once, and counters with a single writer, a cached room lookup and a lock-free check for subscribers remove 10 of the 17 atomic instructions a SET paid.
+
+The AOF format is unchanged (byte-identical records) and so is durability: `tests/pipe_test.py` kills the server with `SIGKILL` after acknowledged pipelines and finds every acknowledged write and delete after the restart, including deletes of keys in cold storage, records larger than the batch buffer, `QUIT`, `AUTH` and protocol errors in the middle of a pipeline, and a 20,000-command model check across rooms. It also checks that a subscriber never receives a `PUBLISH` before the writes ahead of it are in the AOF, and that under `always` an acknowledgement waits for its batch's `fdatasync`.
 
 ### Correctness under load
 
@@ -270,8 +295,8 @@ Both servers passed an independent verification probe: 10,000 unique keys writte
 ### Interpretation
 
 * **Unpipelined GET wins by ~1.8x.** The `io_uring` poll-read-write loop has less per-request overhead than Redis's epoll path on this kernel (6.8) and hardware.
-* **SET is no longer taxed.** With the AOF write reduced to one syscall per record and durability fsyncs running on a dedicated thread (policy `everysec`), SET outperforms Redis unpipelined and reaches pipelined parity. The target interval is one second; a stalled disk can stretch the unsynced window, which `/metrics` reports instead of hiding. Choose `SOMNIUM_AOF_SYNC=always` when durability must cover power loss on every acknowledged write (throughput drops accordingly); `no` for maximum speed when only crash-safety against process death is needed.
-* **Deep pipelines with large values still trail ~2x.** The remaining gap comes from per-command allocations and RESP parsing in the dispatcher, not from persistence.
+* **SET is no longer taxed.** With the AOF written once per group of commands and durability fsyncs running on a dedicated thread (policy `everysec`), SET outperforms Redis unpipelined and reaches pipelined parity. The target interval is one second; a stalled disk can stretch the unsynced window, which `/metrics` reports instead of hiding. Choose `SOMNIUM_AOF_SYNC=always` when durability must cover power loss on every acknowledged write (throughput drops accordingly); `no` for maximum speed when only crash-safety against process death is needed.
+* **Deep pipelines beat Redis at equal durability.** With the batched AOF, the deep-pipeline insert runs 6x faster than before: 52% ahead of Redis with `appendonly yes`, and level with Redis running without persistence (see above).
 * **Memory is +29% per key**, coming from per-record CRDT metadata and pool slack.
 
 ### How to reproduce
@@ -283,8 +308,11 @@ cmake --build build-release
 mkdir -p /tmp/somnium-bench && cd /tmp/somnium-bench
 REDIS_PORT=6380 SOMNIUM_NO_METRICS=1 /path/to/build-release/Redis &
 
-# Dedicated reference Redis (does not touch any system instance)
+# Dedicated reference Redis (does not touch any system instance), without persistence and
+# with the same durability as SomniumDB's default (AOF, fsync every second)
 redis-server --port 6399 --save "" --appendonly no --dir /tmp/somnium-bench2 &
+mkdir -p /tmp/somnium-bench3
+redis-server --port 6398 --save "" --appendonly yes --appendfsync everysec --dir /tmp/somnium-bench3 &
 
 # Run the same matrix
 redis-benchmark -h 127.0.0.1 -p 6399 -t set,get -c 50 -n 100000 --csv
@@ -296,8 +324,9 @@ redis-benchmark -h 127.0.0.1 -p 6380 -t set,get -c 50 -n 100000 -P 16 --csv
 
 # Deep pipeline with 100B values over a random 100k keyspace (also used for the RSS delta:
 # measure VmRSS of each server before/after; -r makes the keys distinct)
-redis-benchmark -h 127.0.0.1 -p 6399 -t set -c 50 -n 100000 -d 100 -r 100000 --csv
-redis-benchmark -h 127.0.0.1 -p 6380 -t set -c 50 -n 100000 -d 100 -r 100000 --csv
+redis-benchmark -h 127.0.0.1 -p 6399 -t set -c 50 -n 100000 -d 100 -r 100000 -P 64 --csv
+redis-benchmark -h 127.0.0.1 -p 6398 -t set -c 50 -n 100000 -d 100 -r 100000 -P 64 --csv
+redis-benchmark -h 127.0.0.1 -p 6380 -t set -c 50 -n 100000 -d 100 -r 100000 -P 64 --csv
 ```
 
 Numbers vary across machines, kernels, and virtualization. The meaningful comparison is relative behavior between the two servers on identical hardware, run back to back.

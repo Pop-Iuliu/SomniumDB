@@ -9,16 +9,20 @@
 #include <climits>
 
 std::string Database::execute_in_room(const Command& cmd, const Call& call) {
-    const std::shared_ptr<Room> room = find_room(call.room_name, true);
+    // camerele nu se sterg si nu se inlocuiesc in registru, deci camera de la
+    // comanda precedenta e inca cea inregistrata pentru numele ei: fara rooms_mutex.
+    // last_room_ o tine in viata; se schimba doar aici, iar functia nu e reentranta
+    if (!last_room_ || last_room_->name != call.room_name) last_room_ = find_room(call.room_name, true);
+    Room& room = *last_room_;
     // camera adormita se trezeste sub lock-ul ei, nu sub lock-ul global
-    std::lock_guard room_lock(room->room_mutex);
-    if (!activate(*room)) return ROOMS_FULL;
+    std::lock_guard room_lock(room.room_mutex);
+    if (!activate(room)) return ROOMS_FULL;
 
-    const std::string reply = cmd.run(*this, {call.client_fd, call.command, call.args, call.room_name, room.get()});
+    const std::string reply = cmd.run(*this, {call.client_fd, call.command, call.args, call.room_name, &room});
 
     // evictare o singura data, dupa comanda: acopera scrierile, dar si cheile
     // reincarcate din cold storage de citiri (raspunsul e deja construit)
-    eviction.evict_despised_keys(*room, record_pool);
+    eviction.evict_despised_keys(room, record_pool);
     return reply;
 }
 
@@ -27,7 +31,7 @@ std::string Database::handle_get(const std::string& room_name, Room& room, const
         return "-ERR Wrong number of arguments for GET\r\n";
     }
 
-    global_metrics.total_gets.fetch_add(1, std::memory_order_relaxed);
+    bump(global_metrics.total_gets);
     const Record* r = lookup(room_name, room, args[1]);
     if (!r) return nil();
 
@@ -65,7 +69,7 @@ std::string Database::handle_set(const std::string& room_name, Room& room, const
     }
 
     const std::string& key = args[1];
-    global_metrics.total_sets.fetch_add(1, std::memory_order_relaxed);
+    bump(global_metrics.total_sets);
 
     // conditia vede starea logica (cold storage inclus, expiratele absente);
     // o conditie esuata nu produce nicio mutatie, deci nimic in AOF
@@ -113,7 +117,7 @@ std::string Database::handle_mset(const std::string& room_name, Room& room, cons
         r->node_id = local_node_id;
         eviction.record_access(args[i]);
     }
-    global_metrics.total_sets.fetch_add(args.size() / 2, std::memory_order_relaxed);
+    bump<uint64_t>(global_metrics.total_sets, args.size() / 2);
 
     aof.append(room_name, args, 0, version, local_node_id);
     return "+OK\r\n";
@@ -136,7 +140,7 @@ std::string Database::handle_mget(const std::string& room_name, Room& room, cons
         eviction.record_access(args[i]);
         out += bulk_string(r->value);
     }
-    global_metrics.total_gets.fetch_add(args.size() - 1, std::memory_order_relaxed);
+    bump<uint64_t>(global_metrics.total_gets, args.size() - 1);
     return out;
 }
 
@@ -247,6 +251,7 @@ std::string Database::handle_del(const std::string& room_name, Room& room, const
 std::string Database::handle_info() {
     const auto now = std::chrono::steady_clock::now();
     const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+    aof.flush(); // starea AOF raportata include comenzile de dinainte din acelasi batch
 
     // doar contoare atomice: INFO nu ia lock-ul niciunei camere
     const std::string info_text =

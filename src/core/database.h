@@ -97,6 +97,7 @@ private:
 
     // ruleaza o comanda Scope::Room: camera trezita, room_mutex prins, evictare dupa
     std::string execute_in_room(const Command& cmd, const Call& call);
+    std::shared_ptr<Room> last_room_; // camera comenzii precedente (thread-ul de comenzi)
 
     // replay verbatim al unei mutatii persistate: aplica starea rezultata
     // (valoare, expirare, versiune CRDT) asa cum a fost serializata, fara sa
@@ -181,6 +182,15 @@ public:
 
     // resp3: protocolul negociat de conexiune prin HELLO (tinut de server)
     std::string execute(int client_fd, const std::vector<std::string>& args, bool resp3 = false);
+
+    // scrie in AOF mutatiile comenzilor executate pana aici (un write pentru tot grupul).
+    // Apelat inainte ca orice raspuns sa plece: un ack nu precede scrierea lui
+    bool flush_aof() { return aof.flush(); }
+    size_t aof_buffered() { return aof.buffered_bytes(); }
+
+    // pipeline: aduce in cache, inainte de executie, ce vor atinge comenzile urmatoare
+    // ale clientului (prima cheie a fiecareia). Doar un indiciu: nu schimba nimic
+    void prefetch(int client_fd, const std::vector<std::string>* cmds, size_t n);
 
     // versiunea pana la care toate scrierile locale sunt deja in AOF (pentru REPLFRONTIER)
     const std::atomic<uint64_t>& replication_frontier() const { return frontier_; }

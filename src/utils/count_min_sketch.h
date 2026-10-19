@@ -2,39 +2,37 @@
 
 #include <string>
 #include <cstdint>
+#include <functional>
 
 class CountMinSketch {
 private:
     static constexpr int WIDTH = 4096; // trebuie sa fie putere a lui 2
     static constexpr int DEPTH = 4;
     uint16_t table[DEPTH][WIDTH] = {0};
+    static_assert(DEPTH * 16 <= 64 && WIDTH <= (1 << 16));
 
-    inline uint32_t fast_hash(const std::string& key, const uint32_t seed) {
-        uint32_t h = seed;
-        for (const char c : key) {
-            h ^= static_cast<uint32_t>(c);
-            h *= 0x5bd1e995;
-            h ^= h >> 15;
-        }
-        return h;
-    }
+    // un singur hash pe 64 de biti (std::hash, 8 octeti pe pas) in loc de DEPTH
+    // treceri octet cu octet; fiecare rand isi ia 16 biti disjuncti din el
+    static uint64_t key_hash(const std::string& key) { return std::hash<std::string>{}(key); }
+    static uint32_t slot(const uint64_t h, const int row) { return (h >> (16 * row)) & (WIDTH - 1); }
 
 public:
     void record_access(const std::string& key) {
+        const uint64_t h = key_hash(key);
         for (int i = 0; i < DEPTH; ++i) {
-            uint32_t h = fast_hash(key, (i + 1) * 0x9e3779b9) & (WIDTH - 1);
-            if (table[i][h] < 0xFFFF) {
-                table[i][h]++;
+            uint16_t& counter = table[i][slot(h, i)];
+            if (counter < 0xFFFF) {
+                counter++;
             }
         }
     }
 
     uint16_t estimate_frequency(const std::string& key) {
+        const uint64_t h = key_hash(key);
         uint16_t min_freq = 0xFFFF;
         for (int i = 0; i < DEPTH; ++i) {
-            uint32_t h = fast_hash(key, (i + 1) * 0x9e3779b9) & (WIDTH - 1);
-            if (table[i][h] < min_freq) {
-                min_freq = table[i][h];
+            if (table[i][slot(h, i)] < min_freq) {
+                min_freq = table[i][slot(h, i)];
             }
         }
         return min_freq;

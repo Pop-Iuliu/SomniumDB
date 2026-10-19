@@ -65,10 +65,7 @@ void Database::set_client_room(const int client_fd, const std::string& room_name
 
 std::string Database::get_client_room(const int client_fd) {
     std::lock_guard lock(client_mutex);
-    if (!client_rooms.contains(client_fd)) {
-        client_rooms[client_fd] = "default";
-    }
-    return client_rooms[client_fd];
+    return client_rooms.try_emplace(client_fd, "default").first->second; // o singura cautare
 }
 
 std::string Database::execute(const int client_fd, const std::vector<std::string>& args, const bool resp3) {
@@ -86,7 +83,8 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
     // comanda necunoscuta ruleaza in camera clientului si raspunde "unknown command"
     static const Command unknown{Command::Scope::Room, false,
                                  [](Database&, const Call&) -> std::string { return "-ERR unknown command\r\n"; }};
-    const auto it = kCommands.find(command.starts_with("ROOM.") ? std::string("ROOM.") : command);
+    static const std::string room_family = "ROOM.";
+    const auto it = kCommands.find(command.starts_with(room_family) ? room_family : command); // fara copie
     const Command& cmd = it != kCommands.end() ? it->second : unknown;
 
     if (!cmd.pubsub) {
@@ -94,7 +92,7 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
         if (!resp3 && pubsub.is_subscribed(client_fd)) {
             return "-ERR Clientul este in mod SUBSCRIBE. Nu poti trimite comenzi de Database!\r\n";
         }
-        total_commands.fetch_add(1, std::memory_order_relaxed);
+        bump(total_commands);
     }
 
     const Call call{client_fd, command, args, current_room, nullptr};
@@ -112,8 +110,11 @@ const std::unordered_map<std::string, Database::Command> Database::kCommands = [
         {"UNSUBSCRIBE", {S::Connection, true, [](Database& db, const Call& c) {
              return db.pubsub.unsubscribe(c.client_fd, {c.args.begin() + 1, c.args.end()}, db.resp3_); }}},
         {"PING", {S::Connection, true, [](Database& db, const Call& c) { return db.handle_ping(c.client_fd, c.args); }}},
+        // mesajul pleaca spre abonati acum, in mijlocul batch-ului: scrierile de dinainte intai in AOF
         {"PUBLISH", {S::Connection, true, [](Database& db, const Call& c) -> std::string {
-             return c.args.size() >= 3 ? db.pubsub.publish(c.args[1], c.args[2]) : "-ERR Wrong number of arguments for PUBLISH\r\n"; }}},
+             if (c.args.size() < 3) return "-ERR Wrong number of arguments for PUBLISH\r\n";
+             db.aof.flush();
+             return db.pubsub.publish(c.args[1], c.args[2]); }}},
 
         // conexiunea si serverul, fara camera
         {"COMMAND", {S::Connection, false, [](Database&, const Call&) -> std::string { return "*0\r\n"; }}},
@@ -144,7 +145,8 @@ const std::unordered_map<std::string, Database::Command> Database::kCommands = [
         {"TTL", {S::Room, false, [](Database& db, const Call& c) { return db.handle_ttl(c.room_name, *c.room, c.args, false); }}},
         {"PTTL", {S::Room, false, [](Database& db, const Call& c) { return db.handle_ttl(c.room_name, *c.room, c.args, true); }}},
         {"SAVE", {S::Room, false, [](Database& db, const Call&) -> std::string { // nu confirmam o persistenta suspectata
-             return db.aof.healthy() ? "+OK AOF is active and up to date\r\n" : "-ERR AOF write error, persistenta suspecta\r\n"; }}},
+             return db.aof.flush() && db.aof.healthy() ? "+OK AOF is active and up to date\r\n"
+                                                       : "-ERR AOF write error, persistenta suspecta\r\n"; }}},
     };
 }();
 
@@ -168,14 +170,14 @@ Record* Database::lookup(const std::string& room_name, Room& room, const std::st
     const long long now = get_current_time_ms();
     if (const auto it = room.keys.find(key); it != room.keys.end()) {
         if (!it->second->expired(now)) {
-            global_metrics.cache_hits.fetch_add(1, std::memory_order_relaxed);
+            bump(global_metrics.cache_hits);
             return it->second;
         }
         erase(room, it);
         return nullptr;
     }
 
-    global_metrics.cache_misses.fetch_add(1, std::memory_order_relaxed);
+    bump(global_metrics.cache_misses);
     std::optional<Record> cold = eviction.take(room_name, key);
     if (!cold || cold->expired(now)) return nullptr;
 
@@ -184,6 +186,56 @@ Record* Database::lookup(const std::string& room_name, Room& room, const std::st
     global_metrics.keys_in_ram.fetch_add(1, std::memory_order_relaxed);
     room.charge(static_cast<long long>(record_cost(key, *r)));
     return r;
+}
+
+// Ca prefetch-ul pe batch din Redis 8: o cautare atinge in lant bucketul, nodul
+// dinaintea lui, nodul, octetii cheii, Record-ul si valoarea, fiecare un miss care
+// il asteapta pe precedentul. Pe etape, pentru toate comenzile odata, miss-urile
+// comenzilor diferite se suprapun. Doar citiri, sub lock-ul camerei; nimic nu se
+// modifica intre etape, deci iteratorii raman valizi.
+void Database::prefetch(const int client_fd, const std::vector<std::string>* cmds, const size_t n) {
+    constexpr size_t kMax = 16;
+    // o camera mica sta oricum in cache: acolo prefetch-ul doar ar costa
+    constexpr size_t kMinKeys = 16384;
+    const std::string room_name = get_client_room(client_fd);
+    const std::shared_ptr<Room> room =
+        last_room_ && last_room_->name == room_name ? last_room_ : find_room(room_name, false);
+    if (!room) return;
+    std::unique_lock lock(room->room_mutex, std::try_to_lock); // nu asteptam watchdog-ul
+    if (!lock.owns_lock() || room->state != RoomState::Active || room->keys.size() < kMinKeys) return;
+
+    using Map = std::unordered_map<std::string, Record*>;
+    Map& keys = room->keys;
+    Map::local_iterator heads[kMax];
+    size_t buckets[kMax];
+    size_t count = 0;
+    // 1: bucketul si primul lui nod (citiri independente intre comenzi)
+    for (size_t i = 0; i < n && count < kMax; ++i) {
+        if (cmds[i].size() < 2) continue;
+        buckets[count] = keys.bucket(cmds[i][1]);
+        heads[count] = keys.begin(buckets[count]);
+        ++count;
+    }
+    // 2: nodurile (un bucket gol nu are ce aduce)
+    size_t live = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (heads[i] == keys.end(buckets[i])) continue;
+        __builtin_prefetch(&*heads[i]);
+        heads[live++] = heads[i];
+    }
+    // 3: octetii cheii si Record-ul (de obicei primul nod e chiar cheia cautata).
+    // Record-ul si valoarea cu intentie de scriere: SET le suprascrie, iar un store
+    // ramas in asteptare ar opri prima instructiune atomica de dupa el (lock-urile)
+    for (size_t i = 0; i < live; ++i) {
+        __builtin_prefetch(heads[i]->first.data());
+        __builtin_prefetch(heads[i]->second, 1);
+    }
+    // 4: valoarea intreaga (cel mult 4 linii), pe care SET o suprascrie si GET o copiaza
+    for (size_t i = 0; i < live; ++i) {
+        const std::string& value = heads[i]->second->value;
+        const char* p = value.data();
+        for (size_t off = 0; off < std::min<size_t>(value.size() + 1, 256); off += 64) __builtin_prefetch(p + off, 1);
+    }
 }
 
 Record* Database::insert(Room& room, const std::string& key) {

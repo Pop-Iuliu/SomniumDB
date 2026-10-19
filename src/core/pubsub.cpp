@@ -11,6 +11,7 @@ std::string PubSubManager::subscribe(const int client_fd, const std::string& cha
 
     channel_subscribers[channel].insert(client_fd);
     client_subscriptions[client_fd].insert(channel);
+    subscribed_clients.store(client_subscriptions.size(), std::memory_order_relaxed);
 
     int sub_count = client_subscriptions[client_fd].size();
 
@@ -74,6 +75,7 @@ std::string PubSubManager::unsubscribe(const int client_fd, std::vector<std::str
     }
     // fara abonamente clientul iese din modul subscribe
     if (mine != client_subscriptions.end() && mine->second.empty()) client_subscriptions.erase(mine);
+    subscribed_clients.store(client_subscriptions.size(), std::memory_order_relaxed);
     return replies;
 }
 
@@ -91,10 +93,13 @@ void PubSubManager::remove_client(const int client_fd) {
     }
 
     client_subscriptions.erase(client_fd);
+    subscribed_clients.store(client_subscriptions.size(), std::memory_order_relaxed);
     printf("[PubSub] Clientul (FD: %d) deconectat. Rute curatate.\n", client_fd);
 }
 
 bool PubSubManager::is_subscribed(const int client_fd) {
+    // abonarea unui client e una din comenzile lui, deci ordonata inaintea celor de dupa
+    if (subscribed_clients.load(std::memory_order_relaxed) == 0) return false;
     std::lock_guard lock(ps_mutex);
     return client_subscriptions.contains(client_fd);
 }

@@ -134,6 +134,10 @@ jobs:
         run: |
           redis-server --port 6399 --save "" --appendonly no --dir /tmp >/dev/null 2>&1 &
           echo $! > /tmp/redis.pid
+          # aceeasi durabilitate ca SomniumDB implicit (AOF, fsync everysec): comparatia corecta
+          mkdir -p /tmp/redis-aof
+          redis-server --port 6398 --save "" --appendonly yes --appendfsync everysec --dir /tmp/redis-aof >/dev/null 2>&1 &
+          echo $! > /tmp/redis-aof.pid
           REDIS_PORT=6380 ./build-release/Redis >/tmp/somnium.log 2>&1 &
           echo $! > /tmp/somnium.pid
           sleep 2
@@ -150,8 +154,10 @@ jobs:
             redis-benchmark -h 127.0.0.1 -p 6380 -t set -c 50 -n 100000 -d 100 -r 100000 -P 64 --csv
             echo "--- Redis 6.x referinta: SET 100B pipelinat adanc -P 64 ---"
             redis-benchmark -h 127.0.0.1 -p 6399 -t set -c 50 -n 100000 -d 100 -r 100000 -P 64 --csv
+            echo "--- Redis 6.x cu AOF everysec: SET 100B pipelinat adanc -P 64 ---"
+            redis-benchmark -h 127.0.0.1 -p 6398 -t set -c 50 -n 100000 -d 100 -r 100000 -P 64 --csv
           } | tee bench.txt
-          kill "$(cat /tmp/somnium.pid)" "$(cat /tmp/redis.pid)" || true
+          kill "$(cat /tmp/somnium.pid)" "$(cat /tmp/redis.pid)" "$(cat /tmp/redis-aof.pid)" || true
 
       - uses: actions/upload-artifact@v4
         with:

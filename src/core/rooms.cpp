@@ -20,7 +20,7 @@ std::shared_ptr<Room> Database::find_room(const std::string& name, const bool cr
 }
 
 bool Database::activate(Room& room, const bool over_budget) {
-    room.last_access_time = get_current_time_ms();
+    room.last_access_time.store(get_current_time_ms(), std::memory_order_relaxed); // doar un timestamp: fara xchg
     if (room.state == RoomState::Active) return true;
 
     // rezervam locul inainte de I/O: bugetul nu poate fi depasit nici de

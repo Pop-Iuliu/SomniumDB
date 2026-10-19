@@ -58,10 +58,22 @@ public:
     // Deschide fd-ul de append; scrie headerul v3 doar daca fisierul e nou.
     bool open_file();
 
-    // Append al mutatiei rezultate. false = scrierea a esuat: starea din RAM
-    // ramane, dar persistenta trebuie suspectata (niciodata ack fals).
+    // Mutatia rezultata intra in bufferul de batch; flush() o scrie. Ca aof_buf
+    // din Redis: un singur write() (si sub always un singur fdatasync) pentru
+    // toate comenzile unui batch. Contractul: niciun octet nu pleaca spre vreun
+    // client inainte de flush(), deci un ack nu precede niciodata scrierea.
+    // false = AOF-ul e oprit (replay sau inregistrare rupta).
     bool append(const std::string& room_name, const std::vector<std::string>& args,
                 long long expire_at, uint64_t timestamp_ms, uint32_t node_id);
+
+    // scrie bufferul de batch (si il sincronizeaza sub always). false = scrierea
+    // a esuat: starea din RAM ramane, dar persistenta trebuie suspectata
+    bool flush();
+    // octetii din bufferul de batch, inca nescrisi (0 = un raspuns poate pleca acum)
+    size_t buffered_bytes() {
+        std::lock_guard lock(mutex_);
+        return pending_.size();
+    }
 
     // Rescriere (si migrare v1/v2 -> v3): starea curenta se serializeaza intr-un
     // fisier temporar si se substituie atomic celui vechi. Esuarea in orice punct
@@ -78,6 +90,9 @@ public:
     uint64_t size() const { return size_.load(std::memory_order_relaxed); }
     bool append_tail(uint64_t from);
     static std::string encode_record(const AofRecord& rec);
+    // aceeasi inregistrare, adaugata la out fara AofRecord intermediar
+    static void encode_into(std::string& out, const std::string& room, const std::vector<std::string>& args,
+                            long long expire_at, uint64_t timestamp_ms, uint32_t node_id);
     // true daca fisierul redat nu era v3 (sau era corupt): necesita reserializare
     bool needs_rewrite() const { return needs_rewrite_; }
 
@@ -101,6 +116,10 @@ private:
     std::condition_variable sync_cv_;
     std::thread sync_thread_;
     bool sync_stop_ = false;
+    // thread-ul de sync asteapta octeti noi (nu intervalul): doar atunci il trezim.
+    // Un notify la fiecare scriere il trezea degeaba, cu un futex si o lupta pe mutex_
+    bool sync_idle_ = false;
+    std::string pending_; // inregistrarile batch-ului curent, inca nescrise (sub mutex_)
     // generatia creste la fiecare inlocuire a fd-ului. O sincronizare pornita pe
     // generatia veche nu are voie sa marcheze generatia noua ca durabila.
     uint64_t generation_ = 0;
@@ -131,4 +150,6 @@ private:
     void sync_worker();
     void stop_sync_worker();
     void abort_locked(); // elibereaza rewrite_fd_ + tmp; presupune mutex_ prins
+    bool flush_locked(); // presupune mutex_ prins
+    bool write_locked(const std::string& data); // un write(), apoi politica de sync; mutex_ prins
 };

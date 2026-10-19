@@ -44,15 +44,21 @@ inline Status parse(const std::string& buf, const size_t pos, size_t* end, std::
     uint64_t count = 0;
     if (const Status st = header('*', kMaxArgs, &count); st != Status::Complete) return st;
 
-    args->clear();
+    // argumentele comenzii anterioare isi pastreaza capacitatea: un pipeline nu
+    // aloca si elibereaza cheia si valoarea la fiecare comanda. Doar Complete
+    // garanteaza *args; altfel continutul lui e nespecificat
+    size_t n = 0;
     for (uint64_t i = 0; i < count; ++i) {
         uint64_t len = 0;
         if (const Status st = header('$', kMaxBulk, &len); st != Status::Complete) return st;
         if (buf.size() - p < len + 2) return Status::NeedMore;
         if (buf[p + len] != '\r' || buf[p + len + 1] != '\n') return Status::Malformed;
-        args->emplace_back(buf, p, len);
+        if (n < args->size()) (*args)[n].assign(buf, p, len);
+        else args->emplace_back(buf, p, len);
+        ++n;
         p += len + 2;
     }
+    args->resize(n);
 
     *end = p;
     return Status::Complete;

@@ -3,6 +3,7 @@
 #include "../core/resp.h"
 #include "../server/metrics.h"
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cerrno>
 #include <cstdlib>
@@ -20,6 +21,9 @@ namespace {
     constexpr char kMagicToken[] = "SOMNIUM-AOF";
     constexpr char kMetaToken[] = "SOMNIUM-META";
     constexpr int kAofVersion = 3;
+    // bufferul de batch se scrie si inainte de capatul batch-ului cand trece de atat:
+    // EXPIRE pe o valoare mare produce o inregistrare mare dintr-o comanda mica
+    constexpr size_t kFlushBytes = 1 << 20;
 
     // comenzi de scriere: doar ele apar in AOF (in ambele formate vechi)
     bool is_write_cmd(const std::string& c) {
@@ -80,6 +84,7 @@ void AOFManager::publish_sizes() const {
 AOFManager::~AOFManager() {
     stop_sync_worker();
     std::lock_guard lock(mutex_);
+    flush_locked();
     if (fd_ >= 0) {
         if (sync_policy_ != SyncPolicy::Off && size_.load(std::memory_order_relaxed) > synced_) {
             fsutil::sync_fd(fd_);
@@ -108,22 +113,58 @@ long long AOFManager::now_ms() {
 }
 
 std::string AOFManager::encode_record(const AofRecord& rec) {
-    // room + comanda + argumente + 4 tokenuri de meta
-    std::string out = "*" + std::to_string(rec.args.size() + 5) + "\r\n";
-    const auto bulk = [&out](const std::string& v) {
-        out += '$';
-        out += std::to_string(v.size());
-        out += "\r\n";
-        out += v;
-        out += "\r\n";
-    };
-    bulk(rec.room);
-    for (const auto& a : rec.args) bulk(a);
-    bulk(kMetaToken);
-    bulk(std::to_string(rec.expire_at));
-    bulk(std::to_string(rec.timestamp_ms));
-    bulk(std::to_string(rec.node_id));
+    std::string out;
+    encode_into(out, rec.room, rec.args, rec.expire_at, rec.timestamp_ms, rec.node_id);
     return out;
+}
+
+void AOFManager::encode_into(std::string& out, const std::string& room, const std::vector<std::string>& args,
+                             const long long expire_at, const uint64_t timestamp_ms, const uint32_t node_id) {
+    // aceiasi octeti ca std::to_string, dar lungimea exacta se calculeaza intai:
+    // un resize si scrieri directe, nu ~20 de append-uri mici per inregistrare
+    char meta_buf[3][24];
+    const auto num = [](char (&buf)[24], const auto n) {
+        return std::string_view(buf, std::to_chars(buf, buf + sizeof(buf), n).ptr - buf);
+    };
+    const std::string_view meta[] = {num(meta_buf[0], expire_at), num(meta_buf[1], timestamp_ms),
+                                     num(meta_buf[2], node_id)};
+    const auto digits = [](size_t n) {
+        size_t d = 1;
+        for (; n >= 10; n /= 10) ++d;
+        return d;
+    };
+    const auto bulk_size = [&](const size_t len) { return 1 + digits(len) + 2 + len + 2; };
+
+    // room + comanda + argumente + 4 tokenuri de meta
+    const size_t count = args.size() + 5;
+    size_t total = 1 + digits(count) + 2 + bulk_size(room.size()) + bulk_size(sizeof(kMetaToken) - 1);
+    for (const auto& a : args) total += bulk_size(a.size());
+    for (const auto& m : meta) total += bulk_size(m.size());
+
+    const size_t start = out.size();
+    out.resize(start + total);
+    char* p = out.data() + start;
+    char* const limit = out.data() + out.size();
+    const auto put_num = [&](const size_t n) { p = std::to_chars(p, limit, n).ptr; };
+    const auto crlf = [&] {
+        *p++ = '\r';
+        *p++ = '\n';
+    };
+    const auto bulk = [&](const std::string_view v) {
+        *p++ = '$';
+        put_num(v.size());
+        crlf();
+        std::memcpy(p, v.data(), v.size());
+        p += v.size();
+        crlf();
+    };
+    *p++ = '*';
+    put_num(count);
+    crlf();
+    bulk(room);
+    for (const auto& a : args) bulk(a);
+    bulk(kMetaToken);
+    for (const auto& m : meta) bulk(m);
 }
 
 void AOFManager::publish_sync_locked() const {
@@ -184,9 +225,11 @@ void AOFManager::sync_worker() {
     while (true) {
         if (fd_ < 0 || size_.load(std::memory_order_relaxed) <= synced_) {
             if (sync_stop_) break;
+            sync_idle_ = true; // write_locked() ne trezeste doar in starea asta
             sync_cv_.wait(lock, [&] {
                 return sync_stop_ || (fd_ >= 0 && size_.load(std::memory_order_relaxed) > synced_);
             });
+            sync_idle_ = false;
             continue;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -292,19 +335,42 @@ bool AOFManager::open_file() {
 
 bool AOFManager::append(const std::string& room_name, const std::vector<std::string>& args,
                         const long long expire_at, const uint64_t timestamp_ms, const uint32_t node_id) {
-    const auto wait_t0 = std::chrono::steady_clock::now();
-    std::lock_guard lock(mutex_);
-    note_append_wait(wait_t0);
+    // ceasul doar daca lock-ul e chiar ocupat: fara asteptare, metrica e 0 ca inainte
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        const auto wait_t0 = std::chrono::steady_clock::now();
+        lock.lock();
+        note_append_wait(wait_t0);
+    } else {
+        global_metrics.aof_append_lock_wait_us.store(0, std::memory_order_relaxed);
+    }
     if (replaying_ || torn_) return false;
 
-    AofRecord rec;
-    rec.room = room_name;
-    rec.args = args;
-    rec.expire_at = expire_at;
-    rec.timestamp_ms = timestamp_ms;
-    rec.node_id = node_id;
-    const std::string data = encode_record(rec);
+    encode_into(pending_, room_name, args, expire_at, timestamp_ms, node_id);
+    return pending_.size() < kFlushBytes || flush_locked();
+}
 
+bool AOFManager::flush() {
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        const auto wait_t0 = std::chrono::steady_clock::now();
+        lock.lock();
+        note_append_wait(wait_t0);
+    }
+    return flush_locked();
+}
+
+bool AOFManager::flush_locked() {
+    if (pending_.empty()) return healthy_;
+    const bool ok = write_locked(pending_);
+    // la esec, ca inainte, mutatiile raman doar in RAM. O inregistrare uriasa
+    // (pana la 512 MB) nu ramane alocata dupa ce a plecat
+    pending_.clear();
+    if (pending_.capacity() > 4 * kFlushBytes) std::string().swap(pending_);
+    return ok;
+}
+
+bool AOFManager::write_locked(const std::string& data) {
     if (fd_ < 0) {
         fd_ = ::open(kAofPath, O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (fd_ < 0) {
@@ -348,8 +414,9 @@ bool AOFManager::append(const std::string& room_name, const std::vector<std::str
         case SyncPolicy::Everysec:
             // thread-ul dedicat sincronizeaza in afara acestui lock. Un fdatasync
             // lent nu are voie sa intarzie append-ul. Octetii scrisi dupa offsetul
-            // capturat raman pending pana la sincronizarea urmatoare.
-            sync_cv_.notify_one();
+            // capturat raman pending pana la sincronizarea urmatoare. Cat asteapta
+            // intervalul, se trezeste singur si vede octetii noi
+            if (sync_idle_) sync_cv_.notify_one();
             break;
         default:
             break;
@@ -479,6 +546,8 @@ void AOFManager::recover(const std::function<void(const AofRecord&)>& replay) {
 bool AOFManager::start_rewrite() {
     std::lock_guard lock(mutex_);
     if (rewrite_fd_ >= 0) return true;
+    // ce s-a executat pana la instantaneu e in fisier: size() devine offsetul cozii
+    flush_locked();
     base_size_ = size_.load(); // orice incercare reseteaza baza (vezi rewrite_due)
     publish_sizes();
     rewrite_fd_ = ::open("appendonly.aof.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -525,6 +594,7 @@ void AOFManager::abort_rewrite() {
 bool AOFManager::append_tail(const uint64_t from) {
     std::lock_guard lock(mutex_);
     if (rewrite_fd_ < 0) return false;
+    flush_locked(); // coada acopera tot ce s-a executat; commit_rewrite() urmeaza imediat
     const int in = ::open(kAofPath, O_RDONLY);
     if (in < 0) return false;
 

@@ -5,6 +5,7 @@
 #ifndef REDIS_PUBSUB_H
 #define REDIS_PUBSUB_H
 
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
@@ -19,6 +20,9 @@ private:
     std::unordered_map<int, std::unordered_set<std::string>> client_subscriptions;
 
     std::mutex ps_mutex;
+    // client_subscriptions.size(), actualizat sub ps_mutex: fara niciun abonat,
+    // is_subscribed() (o data per comanda) nu mai ia lock-ul
+    std::atomic<size_t> subscribed_clients{0};
 
     // livrarea mesajelor e delegata serverului (coada de output a clientului);
     // nu scriem niciodata direct in socket din pubsub

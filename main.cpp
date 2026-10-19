@@ -84,6 +84,16 @@ static void schedule_close(const shared_ptr<Client>& c) {
     // ticketele in zbor tin shared_ptr; CQE-urile viitoare vad closed si nu fac nimic
 }
 
+// raspunsurile care asteapta write-ul AOF al grupului (flush_replies)
+static vector<shared_ptr<Client>> replies_due;
+
+// singura cale prin care bucla trimite: un ack nu are voie sa preceada inregistrarea
+// AOF a comenzii lui (no-op cand bufferul AOF e gol)
+static net::FlushResult send_out(Client& c) {
+    db->flush_aof();
+    return net::flush_output(c);
+}
+
 static void arm_client(const shared_ptr<Client>& c, const bool for_write) {
     if (c->closed) return;
     if (for_write && c->write_armed) return; // deja armat: doar bufferam
@@ -160,7 +170,7 @@ static void deliver_pubsub(const int fd, const string& msg) {
     }
 
     // incercam trimisul direct; daca fd-ul e plin, POLLOUT il ia mai tarziu
-    const auto r = net::flush_output(*it->second);
+    const auto r = send_out(*it->second);
     if (r == net::FlushResult::Pending) arm_client(it->second, true);
     else if (r == net::FlushResult::Dead) schedule_close(it->second);
 }
@@ -172,6 +182,28 @@ static void queue_work() {
     }
 }
 
+// un write AOF pentru comenzile clientilor adunati pana aici, apoi raspunsurile lor.
+// Si la capatul iteratiei fara raspunsuri: mutatiile unui client inchis intre timp
+// nu asteapta in RAM pana la urmatoarea comanda
+static void flush_replies() {
+    db->flush_aof();
+    for (const auto& c : replies_due) {
+        c->reply_due = false;
+        if (c->closed) continue;
+        const auto r = net::flush_output(*c);
+        if (r == net::FlushResult::Pending) arm_client(c, true); // socketul e plin: restul pleaca pe POLLOUT
+        else if (r == net::FlushResult::Dead) schedule_close(c);
+    }
+    replies_due.clear();
+}
+
+// commit de grup pentru AOF (ca aof_buf din Redis, dar marginit): raspunsurile cu
+// inregistrari nescrise asteapta pana se aduna AOF_GROUP_BYTES, apoi pleaca dupa
+// un singur write. Fara nimic nescris pleaca imediat: clientul lucreaza in paralel
+// cu restul iteratiei (asteptarea inutila costa ~40% la GET pipelined). Masurat:
+// 16 KB pierde la pipeline-ul adanc, 256 KB la SET -P 16; intre 32 si 64 KB, ambele castiga
+static constexpr size_t AOF_GROUP_BYTES = 64 * 1024;
+
 // ruleaza inputul clientului si face ce a cerut conexiunea (REF-5: inchiderea si
 // armarea raman aici); true = bugetul a lasat input complet neprocesat
 static bool serve(const shared_ptr<Client>& c) {
@@ -180,8 +212,12 @@ static bool serve(const shared_ptr<Client>& c) {
         schedule_close(c);
         return false;
     }
-    if (c->pending_out() > 0) arm_client(c, true); // socketul e plin: restul pleaca pe POLLOUT
-    arm_client(c, false);                           // re-arm read
+    if (!c->reply_due) {
+        c->reply_due = true;
+        replies_due.push_back(c);
+    }
+    if (const size_t buffered = db->aof_buffered(); buffered == 0 || buffered >= AOF_GROUP_BYTES) flush_replies();
+    arm_client(c, false); // re-arm read
     return step == net::Step::More;
 }
 
@@ -408,7 +444,7 @@ int main() {
 
             if (for_write) {
                 c->write_armed = false;
-                const auto r = net::flush_output(*c);
+                const auto r = send_out(*c);
                 if (r == net::FlushResult::Pending) arm_client(c, true);
                 else if (r == net::FlushResult::Dead) schedule_close(c);
             } else {
@@ -426,6 +462,7 @@ int main() {
         }
 
         io_uring_cq_advance(&ring, count);
+        flush_replies();
 
         if (const auto now = chrono::steady_clock::now(); now >= next_sweep) {
             close_unauthenticated(now);

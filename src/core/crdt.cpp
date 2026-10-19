@@ -113,9 +113,10 @@ std::string Database::handle_replfrontier(const std::vector<std::string>& args) 
     }
     uint64_t& known = frontiers_[static_cast<uint32_t>(node)];
     known = std::max(known, f);
-    // intre comenzi nu e nimic in zbor: orice versiune locala emisa pana aici
-    // e deja in AOF, deci o versiune noua e o frontiera exacta (si avanseaza
+    // dupa flush nu e nimic in zbor: orice versiune locala emisa pana aici
+    // e in fisierul AOF, deci o versiune noua e o frontiera exacta (si avanseaza
     // cu timpul fizic chiar daca nodul nu scrie nimic)
+    aof.flush();
     frontier_ = clock_.next(get_current_time_ms(), 0);
     collect_tombstones();
     return "+OK\r\n";
