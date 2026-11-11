@@ -95,7 +95,7 @@ std::string Database::execute(const int client_fd, const std::vector<std::string
     }
 
     const Call call{client_fd, command, args, current_room, nullptr};
-    return cmd.scope == Command::Scope::Room ? execute_in_room(cmd, call) : cmd.run(*this, call);
+    return cmd.scope == Command::Scope::Connection ? cmd.run(*this, call) : execute_in_room(cmd, call);
 }
 
 // REF-4: fiecare comanda, cu proprietatile ei langa nume. Numarul de argumente si
@@ -128,16 +128,16 @@ const std::unordered_map<std::string, Database::Command> Database::kCommands = [
 
         // chei, in camera clientului
         {"GET", {S::Room, false, [](Database& db, const Call& c) { return db.handle_get(c.room_name, *c.room, c.args); }}},
-        {"SET", {S::Room, false, [](Database& db, const Call& c) { return db.handle_set(c.room_name, *c.room, c.args); }}},
-        {"DEL", {S::Room, false, [](Database& db, const Call& c) { return db.handle_del(c.room_name, *c.room, c.args); }}},
-        {"CRDTMERGE", {S::Room, false, [](Database& db, const Call& c) { return db.handle_crdtmerge(c.room_name, *c.room, c.args); }}},
-        {"CRDTDEL", {S::Room, false, [](Database& db, const Call& c) { return db.handle_crdtdel(c.room_name, *c.room, c.args); }}},
+        {"SET", {S::Write, false, [](Database& db, const Call& c) { return db.handle_set(c.room_name, *c.room, c.args); }}},
+        {"DEL", {S::Write, false, [](Database& db, const Call& c) { return db.handle_del(c.room_name, *c.room, c.args); }}},
+        {"CRDTMERGE", {S::Write, false, [](Database& db, const Call& c) { return db.handle_crdtmerge(c.room_name, *c.room, c.args); }}},
+        {"CRDTDEL", {S::Write, false, [](Database& db, const Call& c) { return db.handle_crdtdel(c.room_name, *c.room, c.args); }}},
         {"MGET", {S::Room, false, [](Database& db, const Call& c) { return db.handle_mget(c.room_name, *c.room, c.args); }}},
-        {"MSET", {S::Room, false, [](Database& db, const Call& c) { return db.handle_mset(c.room_name, *c.room, c.args); }}},
+        {"MSET", {S::Write, false, [](Database& db, const Call& c) { return db.handle_mset(c.room_name, *c.room, c.args); }}},
         {"EXISTS", {S::Room, false, [](Database& db, const Call& c) { return db.handle_exists(c.room_name, *c.room, c.args); }}},
-        {"EXPIRE", {S::Room, false, [](Database& db, const Call& c) { return db.handle_expire(c.room_name, *c.room, c.args, 1000); }}},
-        {"PEXPIRE", {S::Room, false, [](Database& db, const Call& c) { return db.handle_expire(c.room_name, *c.room, c.args, 1); }}},
-        {"PERSIST", {S::Room, false, [](Database& db, const Call& c) { return db.handle_expire(c.room_name, *c.room, c.args, 0); }}},
+        {"EXPIRE", {S::Write, false, [](Database& db, const Call& c) { return db.handle_expire(c.room_name, *c.room, c.args, 1000); }}},
+        {"PEXPIRE", {S::Write, false, [](Database& db, const Call& c) { return db.handle_expire(c.room_name, *c.room, c.args, 1); }}},
+        {"PERSIST", {S::Write, false, [](Database& db, const Call& c) { return db.handle_expire(c.room_name, *c.room, c.args, 0); }}},
         {"TTL", {S::Room, false, [](Database& db, const Call& c) { return db.handle_ttl(c.room_name, *c.room, c.args, false); }}},
         {"PTTL", {S::Room, false, [](Database& db, const Call& c) { return db.handle_ttl(c.room_name, *c.room, c.args, true); }}},
         {"SAVE", {S::Room, false, [](Database& db, const Call&) -> std::string { // nu confirmam o persistenta suspectata

@@ -60,6 +60,41 @@ def sec_torn_aof(check):
         srv.cleanup()
 
 
+def sec_refused_writes(check):
+    # STAB-4 (D1): cat AOF-ul nu poate fi scris, o scriere nu primeste +OK si nu schimba RAM-ul
+    srv = Server(env_extra=ENV, keep_dir_on_retry=True)
+    try:
+        srv.start()
+        c = Client(srv)
+        c.cmd("SET", "k", "old")
+        limit_file_size(srv, size(srv, "appendonly.aof") + 40000)
+        c.cmd("SET", "big", b"x" * 100000)  # lotul in zbor la umplerea discului: ramane de scris
+        now = str(int(time.time() * 1000))
+        writes = [("SET", "k", "new"), ("DEL", "k"), ("MSET", "k", "m", "n", "1"), ("EXPIRE", "k", "100"),
+                  ("PEXPIRE", "k", "100"), ("PERSIST", "k"), ("CRDTMERGE", "k", "peer", now, "2"),
+                  ("CRDTDEL", "k", now, "2")]
+        replies = [c.cmd(*w) for w in writes]
+        check("disc plin: fiecare scriere refuzata cu -MISCONF",
+              all(r[0] == "err" and r[1].startswith("MISCONF") for r in replies), replies)
+        check("disc plin: RAM-ul neschimbat, citirile merg",
+              c.cmd("GET", "k") == ("bulk", b"old") and c.cmd("EXISTS", "n") == ("int", 0)
+              and c.cmd("TTL", "k") == ("int", -1))
+        logged = open(os.path.join(srv.workdir, "server.0.log"), "rb").read().count(b"scriere esuata")
+        check("disc plin: reincercarile nu umplu logul", logged == 1, logged)
+        limit_file_size(srv, UNLIMITED)  # spatiul revine: prima scriere reincearca lotul ramas
+        check("spatiu eliberat: scrierile sunt acceptate", c.cmd("SET", "k", "new") == ("ok", "OK"))
+        c.close()
+
+        srv.restart()
+        c = Client(srv)
+        check("restart: lotul ramas a ajuns in AOF", c.cmd("GET", "big") == ("bulk", b"x" * 100000))
+        check("restart: scrierea de dupa eliberare supravietuieste, cele refuzate nu exista",
+              c.cmd("GET", "k") == ("bulk", b"new") and c.cmd("EXISTS", "n") == ("int", 0))
+        c.close()
+    finally:
+        srv.cleanup()
+
+
 def sec_torn_cold(check):
     # SOMNIUM_MAX_KEYS=0: dupa fiecare comanda toate cheile camerei pleaca in cold storage,
     # deci GET-urile cresc cold.bin fara sa creasca AOF-ul
@@ -387,7 +422,7 @@ def sec_accept_backoff(check):
 
 def main():
     fails = []
-    for sec in (sec_torn_aof, sec_torn_cold, sec_saturated_eviction, sec_replay_budget, sec_cold_autocompact,
+    for sec in (sec_torn_aof, sec_refused_writes, sec_torn_cold, sec_saturated_eviction, sec_replay_budget, sec_cold_autocompact,
                 sec_cold_autocompact_failure, sec_incremental_expiry, sec_replication_misaligned_offset,
                 sec_fd_limit, sec_accept_backoff):
         run_with_retry(sec, fails)

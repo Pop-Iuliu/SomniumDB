@@ -60,14 +60,20 @@ public:
 
     // Mutatia rezultata intra in bufferul de group commit; flush() o scrie in fisier.
     // false = AOF-ul nu primeste scrieri (replay, inregistrare rupta) sau scrierea
-    // a esuat: starea din RAM ramane, dar persistenta trebuie suspectata.
+    // a esuat (lotul asteapta in pending_, vezi writable()).
     bool append(const std::string& room_name, const std::vector<std::string>& args,
                 long long expire_at, uint64_t timestamp_ms, uint32_t node_id);
 
     // Group commit (ca aof_buf din Redis): tot ce s-a adunat de la ultimul flush pleaca
     // intr-un singur write(), cu un singur fdatasync sub `always`. Apelantul il cheama
     // inainte sa trimita raspunsurile, deci niciun ack nu pleaca inaintea scrierii.
+    // Un write() esuat pastreaza lotul in pending_, iar urmatorul flush il reincearca.
     bool flush();
+
+    // STAB-4 (D1): false = ultima scriere a esuat si lotul ei inca nu a ajuns in fisier.
+    // Fiecare apel il reincearca; cat ramane false, comenzile de scriere se refuza
+    // inainte sa schimbe RAM-ul. Doar thread-ul de comenzi.
+    bool writable() { return (fd_ >= 0 && !torn_) || flush(); }
 
     // Rescriere (si migrare v1/v2 -> v3): starea curenta se serializeaza intr-un
     // fisier temporar si se substituie atomic celui vechi. Esuarea in orice punct
