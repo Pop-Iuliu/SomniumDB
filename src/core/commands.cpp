@@ -19,6 +19,8 @@ std::string Database::execute_in_room(const Command& cmd, const Call& call) {
     // evictare o singura data, dupa comanda: acopera scrierile, dar si cheile
     // reincarcate din cold storage de citiri (raspunsul e deja construit)
     eviction.evict_despised_keys(*room, record_pool);
+    // evictarea e cea care creste cold.bin (STAB-2)
+    if (eviction.compact_due()) eviction.compact(get_current_time_ms());
     return reply;
 }
 

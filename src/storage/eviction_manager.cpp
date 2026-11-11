@@ -138,6 +138,7 @@ bool EvictionManager::for_each(
 }
 
 long long EvictionManager::compact(const long long now_ms) {
+    retry_at = file_bytes + kAutoCompactMin; // un disc plin nu reincearca la fiecare comanda
     const int out = ::open(kColdTmp, O_RDWR | O_CREAT | O_TRUNC, 0600); // devine fd: fara O_APPEND
     if (out < 0) {
         fprintf(stderr, "Compactare: nu pot crea %s: %s\n", kColdTmp, strerror(errno));
@@ -148,18 +149,27 @@ long long EvictionManager::compact(const long long now_ms) {
     uint64_t size = 0;
     bool ok = true;
     std::string raw;
+    std::string buf; // STAB-2: compactarea opreste clientii; un write() per MB, nu per inregistrare
     for (const auto& [room_name, keys] : index) {
         for (const auto& [key, ref] : keys) {
             raw.resize(ref.len);
             ok = fsutil::pread_all(fd, raw.data(), raw.size(), static_cast<off_t>(ref.off));
-            if (ok && decode(raw).expired(now_ms)) continue; // expirata: recuperata
-            ok = ok && fsutil::write_all(out, raw.data(), raw.size());
             if (!ok) break;
+            Record head; // doar termenul: decode() ar copia si valoarea
+            std::memcpy(&head.expire_at, raw.data(), sizeof(head.expire_at));
+            if (head.expired(now_ms)) continue; // expirata: recuperata
+            buf += raw;
+            if (buf.size() >= (1 << 20)) {
+                ok = fsutil::write_all(out, buf.data(), buf.size());
+                buf.clear();
+                if (!ok) break;
+            }
             fresh[room_name][key] = {size, ref.len};
             size += ref.len;
         }
         if (!ok) break;
     }
+    ok = ok && fsutil::write_all(out, buf.data(), buf.size());
 
     if (!ok || ::rename(kColdTmp, kColdPath) != 0) {
         fprintf(stderr, "Compactare esuata: %s (fisierul vechi ramane in uz)\n", strerror(errno));
@@ -174,6 +184,7 @@ long long EvictionManager::compact(const long long now_ms) {
     index = std::move(fresh);
     file_bytes = size;
     obsolete_bytes = 0;
+    retry_at = 0;
     global_metrics.cold_reclaimed_bytes.fetch_add(reclaimed, std::memory_order_relaxed);
     publish_metrics();
     return static_cast<long long>(reclaimed);

@@ -46,6 +46,13 @@ public:
     // recuperati sau -1 la esec (fisierul si indexul vechi raman in uz).
     long long compact(long long now_ms);
 
+    // STAB-2: compactare automata cand octetii obsoleti trec de jumatate din fisier si
+    // de kAutoCompactMin (fisierul ramane sub 2 x datele vii + minimul); dupa o
+    // compactare esuata, urmatoarea asteapta ca fisierul sa mai creasca cu minimul
+    bool compact_due() const {
+        return obsolete_bytes >= kAutoCompactMin && 2 * obsolete_bytes > file_bytes && file_bytes >= retry_at;
+    }
+
     // fiecare cheie din cold storage, cu inregistrarea ei (rescrierea AOF);
     // false = o citire a esuat
     bool for_each(const std::function<void(const std::string& room, const std::string& key, const Record&)>& fn) const;
@@ -61,6 +68,8 @@ private:
     int fd = -1;
     uint64_t file_bytes = 0;
     uint64_t obsolete_bytes = 0;
+    uint64_t retry_at = 0; // marimea de la care se reincearca o compactare esuata
+    static constexpr uint64_t kAutoCompactMin = 64ull << 20; // ca SOMNIUM_AOF_REWRITE_MIN_BYTES
     uint64_t max_keys_per_room; // SOMNIUM_MAX_KEYS
     uint64_t max_bytes;         // SOMNIUM_MAXMEMORY; 0 = fara limita
 
