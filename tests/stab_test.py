@@ -13,6 +13,8 @@ import os
 import resource
 import socket
 import stat
+import subprocess
+import sys
 import tempfile
 import time
 
@@ -217,6 +219,47 @@ def sec_cold_autocompact_failure(check):
         srv.cleanup()
 
 
+PROBE = """
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+worst, end = 0.0, time.time() + float(sys.argv[2])
+while time.time() < end:
+    t = time.perf_counter()
+    s.sendall(b"*2\\r\\n$3\\r\\nGET\\r\\n$5\\r\\nprobe\\r\\n")
+    s.recv(64)  # $-1, un singur segment
+    worst = max(worst, time.perf_counter() - t)
+    time.sleep(0.002)
+print(worst * 1000)
+"""
+
+
+def sec_incremental_expiry(check):
+    # STAB-3: la fiecare ~5 s watchdog-ul parcurge camera dupa chei expirate; pe main tinea
+    # lock-ul camerei toata parcurgerea, iar comenzile asteptau dupa el
+    n = 500000
+    srv = Server(env_extra=ENV)
+    try:
+        srv.start()
+        c = Client(srv)
+        for start in range(0, n, 1000):
+            c.cmd("MSET", *[x for i in range(start, start + 1000) for x in (f"k{i}", "v")])
+        c.s.sendall(b"".join(resp_cmd("SET", f"t{i}", "v", "PX", "100") for i in range(20000)))
+        for _ in range(20000):
+            c.read_reply()
+        # sonda in alt proces: thread-urile Python dintr-un proces impart GIL-ul si ascund blocajele
+        probe = subprocess.run([sys.executable, "-c", PROBE, str(srv.port), "6"],  # > o perioada a watchdog-ului
+                               capture_output=True, text=True, timeout=60)
+        worst = float(probe.stdout or "inf")
+        check("expirare: niciun GET blocat peste 50 ms de parcurgerea camerei", worst < 50, f"{worst:.1f} ms")
+        keys = lambda: [ln for ln in c.cmd("INFO")[1].decode().splitlines() if ln.startswith("Chei totale")]
+        check("expirare: cheile cu PX scurt pleaca din RAM fara sa fie citite",
+              wait_until(lambda: keys() == [f"Chei totale: {n}"], timeout=12), keys())
+        c.close()
+    finally:
+        srv.cleanup()
+
+
 def sec_replication_misaligned_offset(check):
     # offsetul salvat cu acelasi inode dar in mijlocul unei inregistrari: ce lasa doua
     # rescrieri AOF pe ext4 (inode-ul eliberat e refolosit) cat timp peer-ul e oprit
@@ -345,7 +388,7 @@ def sec_accept_backoff(check):
 def main():
     fails = []
     for sec in (sec_torn_aof, sec_torn_cold, sec_saturated_eviction, sec_replay_budget, sec_cold_autocompact,
-                sec_cold_autocompact_failure, sec_replication_misaligned_offset,
+                sec_cold_autocompact_failure, sec_incremental_expiry, sec_replication_misaligned_offset,
                 sec_fd_limit, sec_accept_backoff):
         run_with_retry(sec, fails)
     report(fails, "stab")
