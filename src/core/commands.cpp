@@ -10,6 +10,8 @@
 #include <thread>
 
 std::string Database::execute_in_room(const Command& cmd, const Call& call) {
+    // D1: o scriere care nu poate ajunge in AOF nu schimba RAM-ul si nu primeste +OK
+    if (cmd.scope == Command::Scope::Write && !aof.writable()) return MISCONF;
     const std::shared_ptr<Room> room = find_room(call.room_name, true);
     // camera adormita se trezeste sub lock-ul ei, nu sub lock-ul global
     std::lock_guard room_lock(room->room_mutex);

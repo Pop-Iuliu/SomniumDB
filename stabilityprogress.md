@@ -23,8 +23,8 @@ A step-by-step plan for the stability and continuity problems found by stress-te
 | --- | --- | --- |
 | STAB-1 | Honour the memory budget during AOF replay | DONE (#45) |
 | STAB-2 | Compact cold storage automatically | DONE (#46) |
-| STAB-3 | Incremental expiry | In review (branch `stab/stab-3-incremental-expiry`) |
-| D1 | Writes acknowledged while the AOF cannot be written | Decision needed |
+| STAB-3 | Incremental expiry | DONE (#47) |
+| STAB-4 | Refuse writes the AOF cannot take (D1) | In review (branch `stab/stab-4-write-ahead`) |
 
 ## Current state
 
@@ -35,7 +35,7 @@ Findings from stress-testing `main` at `b8d6f7b` (2026-10-16) on the Release and
 | 1 | AOF replay inserts every key into RAM and never evicts, so a restart ignores `SOMNIUM_MAXMEMORY` and `SOMNIUM_MAX_KEYS`. Eviction only runs after a live command touches the room. A dataset kept mostly in cold storage must fit in RAM at every restart, or the process is killed for lack of memory and the restart loops | With `SOMNIUM_MAX_KEYS=1000 SOMNIUM_MAXMEMORY=2000000` and 30,000 keys written: 1,000 keys and 320 KB resident while running, 29,986 keys and 9.6 MB resident after a restart (30x the budget) until the first command | `Database::replay_record`, `src/core/persistence.cpp` | STAB-1 |
 | 2 | `cold.bin` only shrinks on a manual `COMPACT`. Every command that reads a cold key reloads it into RAM, and the eviction that follows appends a new record and leaves the old one obsolete, so under a read/evict workload the file grows until the disk is full | On a 4 MB tmpfs, eviction churn alone refilled 2.4 MB of freed space within 20 commands | `EvictionManager`, `src/storage/eviction_manager.cpp` | STAB-2 |
 | 3 | Every 5 seconds the watchdog scans every key of every room while holding that room's lock. The command thread blocks on the same lock, so every client waits for the scan. The pause grows linearly with the keys in a room | Release build, 995,115 keys in `default`, `GET` probe every 2 ms from another process: p50 0.14 ms, max 237 ms, a stall of more than 20 ms every 5 seconds | `Database::clean_expired_keys`, `src/core/commands.cpp` | STAB-3 |
-| 4 | When an AOF write fails (disk full, I/O error) the handlers ignore `AOFManager::append()`'s result: the mutation stays in RAM and the client gets `+OK`. The write is not in the AOF, so it is not replicated (the replicator reads the AOF) and is lost on restart. The comment on `append()` says the server never acknowledges falsely | On a tmpfs with room for 7 of them, 12 of 12 large `SET`s returned `+OK`; the 5 that did not fit were gone after a restart | every write handler in `src/core/commands.cpp` and `src/core/crdt.cpp` | D1 |
+| 4 | When an AOF write fails (disk full, I/O error) the handlers ignore `AOFManager::append()`'s result: the mutation stays in RAM and the client gets `+OK`. The write is not in the AOF, so it is not replicated (the replicator reads the AOF) and is lost on restart. The comment on `append()` says the server never acknowledges falsely | On a tmpfs with room for 7 of them, 12 of 12 large `SET`s returned `+OK`; the 5 that did not fit were gone after a restart | every write handler in `src/core/commands.cpp` and `src/core/crdt.cpp` | STAB-4 |
 
 ## STAB-1: Honour the memory budget during AOF replay
 
@@ -110,9 +110,7 @@ Findings from stress-testing `main` at `b8d6f7b` (2026-10-16) on the Release and
 
 | # | Question | Recommendation |
 | --- | --- | --- |
-| D1 | When the AOF cannot be written, should a write still be applied and acknowledged (finding 4)? | **Write ahead: append to the AOF before changing RAM, and on failure reply `-MISCONF` and change nothing.** The handlers already compute the full record (value, absolute deadline, version) before the mutation, so the order can be swapped one handler at a time. The alternatives are worse. An error reply alone, with the mutation kept, leaves RAM, disk and the peers disagreeing: readers see a value that will vanish on restart. Refusing every write while the AOF is unhealthy, as Redis does, needs a way to learn that space is back, and without a write to try there is no reliable signal. Write-ahead needs no gate: each write tries the disk, and disk-full handling (torn records are now cut off) makes a failed try leave nothing behind. One case needs a choice of its own: with `SOMNIUM_AOF_SYNC=always`, a write that reached the file but whose `fdatasync` failed may or may not survive. Redis exits in that case |
-
-Once D1 is decided, it becomes STAB-4, with a test like the disk-full tests in `tests/stab_test.py`: no `+OK` while the file-size limit is in place, and nothing changed in RAM by a refused write.
+| D1 | When the AOF cannot be written, should a write still be applied and acknowledged (finding 4)? | **Decided (2026-11-12): gate and retry, see STAB-4.** Strict write-ahead, recommended below, was written before group commit (#44): it needs one `write()` per command and would take the deep pipeline back from 862k to about 142k ops/s. With `SOMNIUM_AOF_SYNC=always`, a failed `fdatasync` exits, as in Redis. Original recommendation: **Write ahead: append to the AOF before changing RAM, and on failure reply `-MISCONF` and change nothing.** The handlers already compute the full record (value, absolute deadline, version) before the mutation, so the order can be swapped one handler at a time. The alternatives are worse. An error reply alone, with the mutation kept, leaves RAM, disk and the peers disagreeing: readers see a value that will vanish on restart. Refusing every write while the AOF is unhealthy, as Redis does, needs a way to learn that space is back, and without a write to try there is no reliable signal. Write-ahead needs no gate: each write tries the disk, and disk-full handling (torn records are now cut off) makes a failed try leave nothing behind. One case needs a choice of its own: with `SOMNIUM_AOF_SYNC=always`, a write that reached the file but whose `fdatasync` failed may or may not survive. Redis exits in that case |
 
 ## Done
 

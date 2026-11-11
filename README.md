@@ -267,6 +267,8 @@ For history: before the queued-output milestone, pipelined throughput collapsed 
 
 A write no longer costs one `write()` per command. Every mutation of an event-loop iteration is encoded into one buffer, the buffer reaches the AOF in a single `write()` (and a single `fdatasync` under `SOMNIUM_AOF_SYNC=always`), and only then are the replies sent, all at the end of the iteration (the order Redis uses in `beforeSleep`). No acknowledgement leaves before its mutation is written, and a client waiting for several replies is woken once.
 
+When that `write()` fails (disk full, I/O error), the batch is kept and retried, and until it reaches the file every write command gets `-MISCONF` and changes nothing; reads keep working. The first write after space returns retries the batch, so no separate health check is needed. Only the batch that was in flight when the disk filled has already been acknowledged, and it is lost only if the process stops before the disk recovers. Under `SOMNIUM_AOF_SYNC=always`, a failed `fdatasync` makes the server exit, as Redis does: the kernel may already have dropped the pages, so retrying would only pretend.
+
 Measured on a different machine than the table above (Intel i5-12500H, WSL2 on kernel 6.18, Redis 8.0.5): median of 7 runs, a fresh server for every run. "Before" is `main` at `b07873a`.
 
 | Workload | SomniumDB before | SomniumDB after | Redis, AOF `everysec` | Redis, no persistence |

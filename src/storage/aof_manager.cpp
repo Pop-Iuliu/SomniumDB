@@ -333,6 +333,7 @@ bool AOFManager::append(const std::string& room_name, const std::vector<std::str
 
 bool AOFManager::flush() {
     if (pending_.empty()) return true;
+    if (torn_) return false; // nimic dupa o inregistrare rupta, pana la o rescriere
     const auto wait_t0 = std::chrono::steady_clock::now();
     std::lock_guard lock(mutex_);
     note_append_wait(wait_t0);
@@ -340,12 +341,12 @@ bool AOFManager::flush() {
     // thread-ul de sync doarme fara termen doar cat nu are nimic de sincronizat: numai
     // atunci are nevoie de semnal (altfel fiecare flush l-ar trezi degeaba)
     const bool sync_idle = fd_ < 0 || size_.load(std::memory_order_relaxed) <= synced_;
+    const bool retry = fd_ < 0; // reincercarile nu se mai logheaza: fiecare scriere refuzata e una
 
     if (fd_ < 0) {
         fd_ = ::open(kAofPath, O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (fd_ < 0) {
             healthy_ = false;
-            pending_.clear();
             return false;
         }
         bump_generation_locked();
@@ -355,12 +356,12 @@ bool AOFManager::flush() {
 
     size_t written = 0;
     const size_t bytes = pending_.size();
-    const bool ok = fsutil::write_all(fd_, pending_.data(), bytes, &written);
-    pending_.clear();
-    if (pending_.capacity() > 4 * kFlushBytes) pending_.shrink_to_fit(); // o valoare uriasa nu ramane alocata
-    if (!ok) {
+    if (!fsutil::write_all(fd_, pending_.data(), bytes, &written)) {
         healthy_ = false;
-        fprintf(stderr, "AOF: scriere esuata: %s (mutatiile exista doar in RAM!)\n", strerror(errno));
+        if (!retry) {
+            fprintf(stderr, "AOF: scriere esuata: %s (lotul se reincearca; scrierile noi sunt refuzate)\n",
+                    strerror(errno));
+        }
         // o scriere partiala (ENOSPC, EFBIG) lasa o inregistrare rupta: replay-ul ar lua tot
         // ce se adauga dupa ea drept coada incompleta si ar trunchia-o. Taiem acum tot ce a
         // scris acest flush (O_APPEND: a inceput la capatul fisierului, deci sunt ultimii
@@ -378,14 +379,18 @@ bool AOFManager::flush() {
         publish_sync_locked();
         return false;
     }
+    pending_.clear();
+    if (pending_.capacity() > 4 * kFlushBytes) pending_.shrink_to_fit(); // o valoare uriasa nu ramane alocata
     size_.fetch_add(bytes, std::memory_order_relaxed);
     publish_sizes();
     publish_sync_locked();
 
     switch (sync_policy_) {
         case SyncPolicy::Always:
-            // ack-urile asteapta fdatasync-ul; lock-ul ramane prins intentionat
-            if (!sync_locked(fd_)) return false;
+            // ack-urile asteapta fdatasync-ul; lock-ul ramane prins intentionat. Un fdatasync
+            // esuat nu se poate reincerca (Linux poate sa fi aruncat deja paginile murdare):
+            // ca Redis, iesim, iar la repornire replay-ul arata exact ce a ajuns pe disc (D1)
+            if (!sync_locked(fd_)) _exit(1);
             break;
         case SyncPolicy::Everysec:
             // thread-ul dedicat sincronizeaza in afara acestui lock. Un fdatasync

@@ -116,8 +116,8 @@ std::string Database::handle_replfrontier(const std::vector<std::string>& args) 
     // dupa flush nu e nimic in zbor: orice versiune locala emisa pana aici
     // e deja in AOF, deci o versiune noua e o frontiera exacta (si avanseaza
     // cu timpul fizic chiar daca nodul nu scrie nimic)
-    aof.flush();
-    frontier_ = clock_.next(get_current_time_ms(), 0);
+    // (STAB-4: un lot ramas dupa o scriere esuata tine frontiera pe loc)
+    if (aof.flush()) frontier_ = clock_.next(get_current_time_ms(), 0);
     collect_tombstones();
     return "+OK\r\n";
 }

@@ -43,6 +43,8 @@ private:
     static constexpr size_t MAX_ACTIVE_ROOMS = 3;
     static constexpr const char* ROOMS_FULL =
         "-ERR ROOMS FULL: active room budget reached, ROOM.HIBERNATE one or wait\r\n";
+    static constexpr const char* MISCONF =
+        "-MISCONF Errors writing to the AOF file, write commands are refused until it can be written\r\n";
     static constexpr long long ROOM_IDLE_MS = 10000;
     uint32_t local_node_id;     // SOMNIUM_NODE_ID: versiunea CRDT a scrierilor locale
     hlc::Clock clock_;          // versiunile scrierilor locale (thread-ul de comenzi)
@@ -84,18 +86,19 @@ private:
         const std::string& command; // numele, cu majuscule
         const std::vector<std::string>& args;
         const std::string& room_name; // camera clientului
-        Room* room;                   // doar pentru Scope::Room: activa, cu room_mutex prins
+        Room* room;                   // doar pentru Scope::Room/Write: activa, cu room_mutex prins
     };
     struct Command {
-        // Connection: fara camera. Room: in camera clientului, trezita si lock-uita de execute_in_room()
-        enum class Scope { Connection, Room } scope;
+        // Connection: fara camera. Room: in camera clientului, trezita si lock-uita de execute_in_room().
+        // Write: ca Room, dar schimba date; refuzata cu -MISCONF cat AOF-ul nu poate fi scris (STAB-4)
+        enum class Scope { Connection, Room, Write } scope;
         // Pub/Sub: permisa pe RESP2 in modul subscribe si nenumarata in "Comenzi procesate"
         bool pubsub;
         std::string (*run)(Database&, const Call&);
     };
     static const std::unordered_map<std::string, Command> kCommands;
 
-    // ruleaza o comanda Scope::Room: camera trezita, room_mutex prins, evictare dupa
+    // ruleaza o comanda Scope::Room sau Write: camera trezita, room_mutex prins, evictare dupa
     std::string execute_in_room(const Command& cmd, const Call& call);
 
     // replay verbatim al unei mutatii persistate: aplica starea rezultata
