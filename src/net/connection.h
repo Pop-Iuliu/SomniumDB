@@ -27,6 +27,7 @@ struct Client {
     bool closed = false;
     bool read_armed = false; // starea buclei: un poll e in ring
     bool write_armed = false;
+    bool flush_queued = false; // starea buclei: asteapta trimiterea de la capatul iteratiei
     bool resp3 = false; // protocolul negociat prin HELLO
     bool authenticated;
     size_t held = 0; // cat din totalul bufferelor (SEC-22) e al acestui client
@@ -53,9 +54,10 @@ FlushResult flush_output(Client& c);
 // un raspuns in coada (cifrat cu TLS daca e cazul); false = un cap depasit, clientul trebuie inchis
 bool enqueue_output(Client& c, const std::string& data);
 
-// ruleaza comenzile complete din in_buf, pana la buget, si trimite ce poate.
-// Done: bucla armeaza POLLOUT daca pending_out() > 0 si rearmeaza citirea; More:
-// la fel, iar bugetul a lasat input complet neprocesat; Drop: clientul trebuie inchis.
+// ruleaza comenzile complete din in_buf, pana la buget. Raspunsurile raman in out_buf:
+// bucla le trimite dupa Database::flush_aof(), deci niciun ack nu pleaca inaintea
+// mutatiei lui. Done: bucla rearmeaza citirea; More: la fel, iar bugetul a lasat input
+// complet neprocesat; Drop: clientul trebuie inchis.
 enum class Step { Drop, Done, More };
 Step process_buffered(Client& c, Database& db);
 

@@ -163,12 +163,11 @@ Step process_buffered(Client& c, Database& db) {
     // ca Redis: dupa QUIT sau o eroare de protocol (inputul nu mai poate fi
     // resincronizat) trimitem ultimul raspuns si inchidem
     if (quit || st == resp::Status::Malformed) {
+        db.flush_aof(); // ack-urile de pana aici pleaca acum: intai mutatiile lor in AOF
         if (enqueue_output(c, quit ? "+OK\r\n" : "-ERR Protocol error\r\n")) flush_output(c);
         return Step::Drop;
     }
 
-    // ce nu pleaca acum ramane in out_buf, iar bucla armeaza POLLOUT pentru el
-    if (flush_output(c) == FlushResult::Dead) return Step::Drop;
     return processed == MAX_COMMANDS_PER_TURN && !c.in_buf.empty() ? Step::More : Step::Done;
 }
 

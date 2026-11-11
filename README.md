@@ -263,6 +263,21 @@ Measured after the S5 (persistence contracts) milestone. Both servers measured b
 
 For history: before the queued-output milestone, pipelined throughput collapsed to ~19k ops/s (a blocked sender stalled the whole event loop); the same workload now runs over 50x faster. The S5 milestone also removed the SET handicap: the per-command AOF append became a single POSIX `write()` and the `everysec` fsync moved off the command thread. It now runs on its own thread, not on the watchdog, so room snapshots do not delay it and `fdatasync` does not hold the append lock.
 
+### Group commit
+
+A write no longer costs one `write()` per command. Every mutation of an event-loop iteration is encoded into one buffer, the buffer reaches the AOF in a single `write()` (and a single `fdatasync` under `SOMNIUM_AOF_SYNC=always`), and only then are the replies sent, all at the end of the iteration (the order Redis uses in `beforeSleep`). No acknowledgement leaves before its mutation is written, and a client waiting for several replies is woken once.
+
+Measured on a different machine than the table above (Intel i5-12500H, WSL2 on kernel 6.18, Redis 8.0.5): median of 7 runs, a fresh server for every run. "Before" is `main` at `b07873a`.
+
+| Workload | SomniumDB before | SomniumDB after | Redis, AOF `everysec` | Redis, no persistence |
+| --- | --- | --- | --- | --- |
+| SET, 1 client | 16,404 ops/s | 20,210 ops/s | 19,113 ops/s | 20,283 ops/s |
+| SET, 50 clients | 52,383 ops/s | 131,233 ops/s | 170,357 ops/s | 157,728 ops/s |
+| SET pipelined (-P 16) | 178,571 ops/s | **1,388,889 ops/s** | 1,020,408 ops/s | 1,666,666 ops/s |
+| 100k x 100B insert (deep pipeline, -P 64) | 141,688 ops/s | **862,344 ops/s** | 709,446 ops/s | 1,176,847 ops/s |
+
+GET changes little (+10% pipelined, from the single wake-up). With the same durability on both sides, pipelined SET is ahead of Redis (+36% at `-P 16`, +22% on the deep pipeline). Against a Redis with persistence switched off, SomniumDB is still 27% behind on the deep pipeline: it always writes its AOF.
+
 ### Correctness under load
 
 Both servers passed an independent verification probe: 10,000 unique keys written and read back byte-for-byte (10,000/10,000 on both). SomniumDB's internal command counter matched the exact number of benchmark commands, and the Prometheus metrics stayed consistent with the real dataset throughout the run.
@@ -271,7 +286,7 @@ Both servers passed an independent verification probe: 10,000 unique keys writte
 
 * **Unpipelined GET wins by ~1.8x.** The `io_uring` poll-read-write loop has less per-request overhead than Redis's epoll path on this kernel (6.8) and hardware.
 * **SET is no longer taxed.** With the AOF write reduced to one syscall per record and durability fsyncs running on a dedicated thread (policy `everysec`), SET outperforms Redis unpipelined and reaches pipelined parity. The target interval is one second; a stalled disk can stretch the unsynced window, which `/metrics` reports instead of hiding. Choose `SOMNIUM_AOF_SYNC=always` when durability must cover power loss on every acknowledged write (throughput drops accordingly); `no` for maximum speed when only crash-safety against process death is needed.
-* **Deep pipelines with large values still trail ~2x.** The remaining gap comes from per-command allocations and RESP parsing in the dispatcher, not from persistence.
+* **Deep pipelines were held back by persistence, not by parsing.** The ~2x gap in the first table was one `write()` and one wake-up of the fsync thread per command, plus one wake-up of the client per reply batch. [Group commit](#group-commit) removes all three. What remains against a Redis without persistence is the AOF write itself and the key lookup in `std::unordered_map`, about a quarter of the command thread's CPU.
 * **Memory is +29% per key**, coming from per-record CRDT metadata and pool slack.
 
 ### How to reproduce
@@ -296,8 +311,11 @@ redis-benchmark -h 127.0.0.1 -p 6380 -t set,get -c 50 -n 100000 -P 16 --csv
 
 # Deep pipeline with 100B values over a random 100k keyspace (also used for the RSS delta:
 # measure VmRSS of each server before/after; -r makes the keys distinct)
-redis-benchmark -h 127.0.0.1 -p 6399 -t set -c 50 -n 100000 -d 100 -r 100000 --csv
-redis-benchmark -h 127.0.0.1 -p 6380 -t set -c 50 -n 100000 -d 100 -r 100000 --csv
+redis-benchmark -h 127.0.0.1 -p 6399 -t set -c 50 -n 100000 -d 100 -r 100000 -P 64 --csv
+redis-benchmark -h 127.0.0.1 -p 6380 -t set -c 50 -n 100000 -d 100 -r 100000 -P 64 --csv
+
+# Reference Redis with SomniumDB's default durability (the group commit table)
+redis-server --port 6399 --save "" --appendonly yes --appendfsync everysec --dir /tmp/somnium-bench2 &
 ```
 
 Numbers vary across machines, kernels, and virtualization. The meaningful comparison is relative behavior between the two servers on identical hardware, run back to back.
