@@ -84,7 +84,7 @@ def sec2_auth(check):
               r is not None and r.returncode == 1 and b"SOMNIUM_PASSWORD" in r.stderr, r)
         for port in ("70000", "0", "6379abc"):
             r = run_once(srv, {"REDIS_PORT": port})
-            check(f"SEC-2: REDIS_PORT={port} refuza pornirea", r is not None and r.returncode == 1 and b"REDIS_PORT" in r.stderr, r)
+            check(f"SEC-30: REDIS_PORT={port} refuza pornirea", r is not None and r.returncode == 1 and b"REDIS_PORT" in r.stderr, r)
     finally:
         srv.cleanup()
 
@@ -437,7 +437,7 @@ def sec20_auth_log(check):
             except ConnectionError:
                 closed += 1
             c.close()
-        check("SEC-20: conexiunea se inchide dupa 3 parole gresite", closed == 30, closed)
+        check("SEC-24: conexiunea se inchide dupa 3 parole gresite", closed == 30, closed)
         check("SEC-20: toate cele 90 de esecuri sunt numarate", wait_until(lambda: sum(logged()) == 90, 3), logged())
         check("SEC-20: ...in cel mult 2 linii de log", server_log(srv).count("[AUTH]") <= 2, logged())
 
@@ -449,13 +449,13 @@ def sec20_auth_log(check):
         start = time.time()
         for i in range(len(tail)):
             c.s.sendall(tail[i:i + 1])
-        check("SEC-20: comanda trimisa octet cu octet e executata", c.read_reply()[0] == "err", "MSET cu numar par")
-        check("SEC-20: ...fara recopierea argumentului mare", time.time() - start < 20, time.time() - start)
+        check("SEC-25: comanda trimisa octet cu octet e executata", c.read_reply()[0] == "err", "MSET cu numar par")
+        check("SEC-25: ...fara recopierea argumentului mare", time.time() - start < 20, time.time() - start)
 
         far = str((int(time.time() * 1000) + 3_600_000) << 16)
-        check("SEC-20: REPLFRONTIER din viitor e refuzat", c.cmd("REPLFRONTIER", "2", far)[0] == "err")
-        check("SEC-20: REPLFRONTIER accepta nodul local", c.cmd("REPLFRONTIER", "1", "5") == ("ok", "OK"))
-        check("SEC-20: ...dar nu noduri inventate", c.cmd("REPLFRONTIER", "7", "5")[0] == "err")
+        check("SEC-26: REPLFRONTIER din viitor e refuzat", c.cmd("REPLFRONTIER", "2", far)[0] == "err")
+        check("SEC-26: REPLFRONTIER accepta nodul local", c.cmd("REPLFRONTIER", "1", "5") == ("ok", "OK"))
+        check("SEC-26: ...dar nu noduri inventate", c.cmd("REPLFRONTIER", "7", "5")[0] == "err")
         c.close()
     finally:
         srv.cleanup()
