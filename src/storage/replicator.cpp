@@ -322,6 +322,7 @@ bool Replicator::deliver(Peer& peer, const std::string& out, const size_t expect
     for (size_t seen = 0; seen < expected;) {
         const size_t crlf = in.find("\r\n", pos);
         if (crlf == std::string::npos) {
+            if (in.size() - pos > 4096) return false; // raspunsurile sunt linii scurte: altceva nu e un peer
             char chunk[4096];
             const ssize_t n = peer.ssl ? SSL_read(peer.ssl, chunk, sizeof(chunk)) : ::recv(peer.fd, chunk, sizeof(chunk), 0);
             if (n <= 0) return false;

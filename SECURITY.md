@@ -16,4 +16,4 @@ You will get an acknowledgement within 7 days. There is no fixed timeline for th
 
 ## Scope
 
-What SomniumDB protects, and what it assumes, is described in the threat model in [`securityprogress.md`](securityprogress.md). In short: every client and peer that knows the password is fully trusted, and traffic is not encrypted by the server itself. Reports about behaviour outside that model are still welcome, but may be treated as hardening rather than as vulnerabilities.
+What SomniumDB protects, and what it assumes, is described in the threat model in [`securityprogress.md`](securityprogress.md). In short: every client and peer that knows the password is fully trusted, and traffic is encrypted only when `SOMNIUM_TLS_CERT` and `SOMNIUM_TLS_KEY` are set. Reports about behaviour outside that model are still welcome, but may be treated as hardening rather than as vulnerabilities.

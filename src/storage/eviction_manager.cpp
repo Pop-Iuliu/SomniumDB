@@ -36,7 +36,8 @@ namespace {
 
 EvictionManager::EvictionManager(const Config& cfg) : max_keys_per_room(cfg.max_keys), max_bytes(cfg.maxmemory) {
     // fara O_APPEND: inregistrarile se scriu cu pwrite la file_bytes (evict_despised_keys)
-    fd =::open(kColdPath, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    // O_NOFOLLOW (si la fisierele temporare): un link pus in director nu ne face sa golim alt fisier
+    fd =::open(kColdPath, O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0) {
         fprintf(stderr, "Cold storage indisponibil (%s): cheile raman in RAM\n", strerror(errno));
     }
@@ -139,7 +140,7 @@ bool EvictionManager::for_each(
 
 long long EvictionManager::compact(const long long now_ms) {
     retry_at = file_bytes + kAutoCompactMin; // un disc plin nu reincearca la fiecare comanda
-    const int out = ::open(kColdTmp, O_RDWR | O_CREAT | O_TRUNC, 0600); // devine fd: fara O_APPEND
+    const int out = ::open(kColdTmp, O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600); // devine fd: fara O_APPEND
     if (out < 0) {
         fprintf(stderr, "Compactare: nu pot crea %s: %s\n", kColdTmp, strerror(errno));
         return -1;

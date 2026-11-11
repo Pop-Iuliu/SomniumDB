@@ -528,7 +528,7 @@ bool AOFManager::start_rewrite() {
     if (rewrite_fd_ >= 0) return true;
     base_size_ = size_.load(); // orice incercare reseteaza baza (vezi rewrite_due)
     publish_sizes();
-    rewrite_fd_ = ::open("appendonly.aof.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    rewrite_fd_ = ::open("appendonly.aof.tmp", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (rewrite_fd_ < 0) {
         fprintf(stderr, "AOF: rescriere: nu pot crea fisierul temporar: %s\n", strerror(errno));
         return false;

@@ -198,6 +198,8 @@ static bool load_tls() {
     const auto& key = cfg.tls_key;
     if (!cert && !key) return true;
     g_tls = SSL_CTX_new(TLS_method());
+    // un handshake repetat pe aceeasi conexiune costa CPU fara sa treaca prin capuri (OpenSSL 1.1.1 il permite implicit)
+    if (g_tls) SSL_CTX_set_options(g_tls, SSL_OP_NO_RENEGOTIATION);
     if (cert && key && g_tls && SSL_CTX_set_min_proto_version(g_tls, TLS1_2_VERSION) == 1 &&
         SSL_CTX_use_certificate_chain_file(g_tls, cert->c_str()) == 1 &&
         SSL_CTX_use_PrivateKey_file(g_tls, key->c_str(), SSL_FILETYPE_PEM) == 1 && SSL_CTX_check_private_key(g_tls) == 1) {

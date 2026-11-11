@@ -17,6 +17,7 @@ namespace {
     constexpr int MAX_COMMANDS_PER_TURN = 8192;
     constexpr size_t MAX_INPUT_BUFFER = 128ull * 1024 * 1024;
     constexpr size_t MAX_UNAUTH_BUFFER = 16ull * 1024; // un strain nu are voie sa ne tina megaocteti (input sau output)
+    constexpr int MAX_AUTH_FAILURES = 3; // ghicitul parolei costa o conexiune noua la fiecare 3 incercari
 
     Config g_cfg;                  // copia primita de init()
     SSL_CTX* g_tls = nullptr;      // SEC-16: SOMNIUM_TLS_CERT + SOMNIUM_TLS_KEY; nullptr = text clar
@@ -84,7 +85,8 @@ size_t Client::output_cap() const { return authenticated ? Database::MAX_REPLY :
 
 // out_buf numara si partea deja trimisa: ramane alocata pana la golire
 void track(Client& c) {
-    const size_t now = c.closed ? 0 : c.in_buf.size() + c.out_buf.size();
+    // partial.next: argumentele deja copiate ale unei comenzi incomplete ocupa cat inputul lor
+    const size_t now = c.closed ? 0 : c.in_buf.size() + c.out_buf.size() + c.partial.next;
     g_client_buffers = g_client_buffers - c.held + now;
     c.held = now;
 }
@@ -131,13 +133,15 @@ Step process_buffered(Client& c, Database& db) {
     // batch: un pipeline adanc costa liniar, nu cate o copiere per comanda
     int processed = 0;
     size_t pos = 0;
-    std::vector<std::string> args;
+    std::vector<std::string> args = std::move(c.args); // gol, sau inceputul comenzii incomplete
+    c.args.clear();
     resp::Status st = resp::Status::NeedMore;
     bool quit = false;
+    bool locked_out = false;
 
     while (processed < MAX_COMMANDS_PER_TURN) {
         size_t end = 0;
-        st = resp::parse_request(c.in_buf, pos, &end, &args);
+        st = resp::parse_request(c.in_buf, pos, &end, &args, &c.partial);
         if (st != resp::Status::Complete) break;
         pos = end;
         ++processed;
@@ -156,15 +160,20 @@ Step process_buffered(Client& c, Database& db) {
                                    : !c.authenticated                 ? "-NOAUTH Authentication required.\r\n"
                                                                       : db.execute(c.fd, args, c.resp3);
         if (!response.empty() && !enqueue_output(c, response)) return Step::Drop; // un cap depasit
+        if (c.auth_failures >= MAX_AUTH_FAILURES) {
+            locked_out = true; // -WRONGPASS e deja in coada
+            break;
+        }
     }
     c.in_buf.erase(0, pos);
+    if (c.partial.left) c.args = std::move(args); // comanda incompleta: parserul reia, nu recopiaza
     track(c);
 
     // ca Redis: dupa QUIT sau o eroare de protocol (inputul nu mai poate fi
-    // resincronizat) trimitem ultimul raspuns si inchidem
-    if (quit || st == resp::Status::Malformed) {
+    // resincronizat) trimitem ultimul raspuns si inchidem; la fel dupa prea multe parole gresite
+    if (quit || locked_out || st == resp::Status::Malformed) {
         db.flush_aof(); // ack-urile de pana aici pleaca acum: intai mutatiile lor in AOF
-        if (enqueue_output(c, quit ? "+OK\r\n" : "-ERR Protocol error\r\n")) flush_output(c);
+        if (locked_out || enqueue_output(c, quit ? "+OK\r\n" : "-ERR Protocol error\r\n")) flush_output(c);
         return Step::Drop;
     }
 

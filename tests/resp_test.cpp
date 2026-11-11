@@ -25,6 +25,21 @@ int main() {
         assert(parse_all(cmd.substr(0, cut)) == Status::NeedMore);
     }
 
+    // cu Partial, comanda sosita octet cu octet (dupa o alta, deci pos != 0) se reia
+    // de unde a ramas si da aceleasi argumente
+    {
+        const std::string two = cmd + cmd;
+        resp::Partial partial;
+        std::vector<std::string> resumed;
+        size_t resumed_end = 0;
+        for (size_t have = cmd.size(); have < two.size(); ++have) {
+            assert(resp::parse(two.substr(0, have), cmd.size(), &resumed_end, &resumed, &partial) == Status::NeedMore);
+        }
+        assert(partial.left == 1 && resumed.size() == 2); // doar ultimul argument mai e de citit
+        assert(resp::parse(two, cmd.size(), &resumed_end, &resumed, &partial) == Status::Complete);
+        assert(resumed == args && resumed_end == two.size() && partial.left == 0);
+    }
+
     // pipeline: comenzi consecutive citite de la offseturi
     const std::string pipeline = cmd + cmd + cmd;
     size_t pos = 0;

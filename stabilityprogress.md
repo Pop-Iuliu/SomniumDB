@@ -106,6 +106,14 @@ Findings from stress-testing `main` at `b8d6f7b` (2026-10-16) on the Release and
 
 **Not in this step:** expiring keys in cold storage. Their records are dropped by compaction (`compact()` already skips expired records), so STAB-2 covers them.
 
+## STAB-4: Refuse writes the AOF cannot take
+
+**Why:** finding 4, decided as D1.
+
+**Result:** a failed `flush()` keeps its batch and retries it on the next one. `AOFManager::writable()` is true while the last write succeeded, and otherwise retries the batch. The eight write commands are `Scope::Write` in the command table, and `execute_in_room` refuses them with `-MISCONF` before they touch RAM. Only the first failure is logged. `REPLFRONTIER` advances only after a successful flush. Under `always`, a failed `fdatasync` exits; that path has no test, because making `fdatasync` fail needs root. `sec_refused_writes`: with the file-size limit reached, all eight write commands get `-MISCONF` and RAM is unchanged; after the limit is lifted, the next write succeeds; after a restart, the kept batch is present and the refused writes are not. On `main`, every write returns `+OK` and the large `SET` is lost. Deep pipeline (`SET -c 50 -P 64`, 1M, Release, WSL, median of 5): 629,327 ops/s on `main`, 629,723 here.
+
+**Not in this step:** the batch in flight when the disk fills is still acknowledged before it reaches the file. Closing that gap means holding every reply until the next successful flush.
+
 ## Decisions for the team
 
 | # | Question | Recommendation |
