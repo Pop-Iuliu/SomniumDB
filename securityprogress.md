@@ -38,6 +38,13 @@ A step-by-step plan for securing SomniumDB. Each step is small enough for one pu
 | SEC-21 | Make the test runner fail on failing suites | 5. Audit 2026-10-05 | DONE (#26) |
 | SEC-22 | Cap the memory held by all client buffers | 6. Defence in depth | DONE (#28) |
 | SEC-23 | Fuzz command dispatch | 6. Defence in depth | DONE (#27) |
+| SEC-24 | Close the connection after 3 failed `AUTH` | 7. Audit 2026-11-12 | READY (not merged) |
+| SEC-25 | Resume incomplete RESP commands | 7. Audit 2026-11-12 | READY (not merged) |
+| SEC-26 | Bound `REPLFRONTIER` | 7. Audit 2026-11-12 | READY (not merged) |
+| SEC-27 | Monitoring stack on localhost | 7. Audit 2026-11-12 | READY (not merged) |
+| SEC-28 | Warn about a password without TLS | 7. Audit 2026-11-12 | READY (not merged) |
+| SEC-29 | Subscription cap, log hygiene, bounded peer replies | 7. Audit 2026-11-12 | READY (not merged) |
+| SEC-30 | Small hardening items | 7. Audit 2026-11-12 | READY (not merged) |
 
 ## Threat model
 
@@ -98,6 +105,18 @@ Rows 18 and 19 come from the review of what would remain after every step (2026-
 | --- | --- | --- | --- |
 | 18 | Client buffers have per-client caps (128 MB input, 32 MB output) but no total: 10,000 authenticated connections may hold up to about 1.6 TB, and none of it counts toward `SOMNIUM_MAXMEMORY` (unlimited by default anyway) | `main.cpp`, `drain_read()` / `enqueue_output()` | SEC-22 |
 | 19 | Only the RESP parsers are fuzzed. `Database::execute()`, which every authenticated command reaches, along with the room logic, the pool allocator and cold storage, is exercised only by the test suite | `src/core/database.cpp` | SEC-23 |
+
+Rows 20 to 26 come from the third audit, on 2026-11-12 (see Phase 7). They are read from the code, not reproduced.
+
+| # | Gap | Where | Step |
+| --- | --- | --- | --- |
+| 20 | Password guessing is only logged, never slowed: one connection can keep sending `AUTH` (about 360 per batch under the 16 KB output cap), and the 10 second timeout of SEC-18 is reset by reconnecting. Unauthenticated | `src/net/auth.cpp`, `authenticate()` | SEC-24 |
+| 21 | An incomplete command is parsed again from its first byte on every read, and every argument is copied again. After a 100 MB argument, each further packet of the same command copies 100 MB on the command thread, so a few thousand one-byte packets stall every client. Before `AUTH` the 16 KB cap keeps it to a small CPU amplification | `src/core/resp.h`, `parse()`; `src/net/connection.cpp`, `process_buffered()` | SEC-25 |
+| 22 | `REPLFRONTIER` accepts any node id and any frontier. Enough invented ids with a huge frontier raise the watermark: every tombstone is dropped and replicated writes of keys not present locally are ignored as stale until restart. The frontier map also grows with every id. Authenticated clients only | `Database::handle_replfrontier()` | SEC-26 |
+| 23 | `docker-compose.yaml` publishes Grafana (default `admin/admin`) and Prometheus (no authentication) on every interface, and the README tells the user to bind the exporter to `0.0.0.0` | `docker-compose.yaml`, `README.md` | SEC-27 |
+| 24 | A non-loopback bind needs a password but not TLS, so `AUTH` from clients and from the replicator can be read off the network, and nothing says so at startup. `SECURITY.md` still said the server never encrypts | `src/config.cpp`, `SECURITY.md` | SEC-28 |
+| 25 | State outside the SEC-22 budget and names in logs: `SUBSCRIBE` has no per-client cap and logs a line with the raw channel name each time; room names with control characters reach the logs; the replicator buffers a peer's reply without limit until a CRLF arrives. Authenticated clients and configured peers only | `src/core/pubsub.cpp`, `src/core/rooms.cpp`, `Replicator::deliver()` | SEC-29 |
+| 26 | Small items: client-initiated TLS renegotiation is not switched off (OpenSSL 1.1.1 allows it by default); `REDIS_PORT` goes through `stoi`, so `6379abc` is accepted and `70000` becomes another port; data files are opened without `O_NOFOLLOW`; CI actions are pinned by tag | `main.cpp`, `src/config.cpp`, `src/storage/*`, `.github/workflows/ci.yml` | SEC-30 |
 
 ## Phase 1: Secure defaults
 
@@ -514,6 +533,102 @@ Recommendations from the review of what would remain once every step is done. Th
 - **CI:** a second step in the `fuzz` job, with the SEC-10 flags plus `-D_GLIBCXX_ASSERTIONS`. ASan alone misses `args[i]` read past `size()` but inside the vector's capacity, which is exactly what an argument-loop off-by-one does. `-close_fd_mask=1` silences the server's stdout logs; crash reports go to stderr.
 - **Verification so far:** no libFuzzer on the machine it was written on. The harness compiles and links with GCC 13 against every listed source (stub headers for POSIX), so the CI file list is complete. A small driver standing in for libFuzzer ran six inputs (`SET`/`GET`, `MSET`/`MGET`, `SUBSCRIBE` plus `PUBLISH`, hibernate and wake, a skipped `REWRITEAOF`, RESP with `EXPIRE`/`TTL`) without errors. With the second `MSET` loop broken to `i <= args.size()`, the same driver aborts on the `_GLIBCXX_ASSERTIONS` bounds check. CI on PR #27 was green: the 60 second run found nothing. Whether libFuzzer itself reaches the broken `MSET` within 60 seconds was not tried in CI; the driver check above is the evidence for that part.
 
+## Phase 7: Audit 2026-11-12
+
+A third review of the whole server, after the refactor (REF) and stability (STAB) work. Read in full: `main.cpp`, `src/net`, `src/core`, and `src/storage` except the AOF manager, which was only searched; plus `docker-compose.yaml` and the CI workflow. It found no memory-safety bug, no authentication bypass and no path traversal.
+
+The findings were read from the code, not reproduced against a running server. Under the threat model SEC-25 (after `AUTH`), SEC-26 and SEC-29 are hardening: authenticated clients are trusted. Three items had been on the deferred list (`AUTH` lockout, pinned actions, names in log lines); they were done at the maintainer's request.
+
+The steps were written in two commits (SEC-24 to SEC-26, then SEC-27 to SEC-30), not one PR each.
+
+**Verification, all steps:** Release build with GCC 15 in WSL; `resp_test` and the full `tests/run_all.sh` suite pass (554 checks, 0 failures). The ASan, TSan and fuzz builds were not run locally: CI is the first to run them. The status stays `READY` until CI is green and the PR is merged.
+
+### SEC-24: Close the connection after 3 failed `AUTH`
+
+**Why:** gap 20. With a weak password on a network bind, nothing made guessing expensive.
+
+**Done when:** the third wrong password on a connection gets its `-WRONGPASS` and the connection is closed; the failures are still counted by the SEC-20 log line.
+
+**Files:** `src/net/auth.cpp`, `src/net/connection.*`, `tests/sec_test.py`.
+
+**Result:**
+- `Client::auth_failures` counts wrong passwords from `AUTH` and from `HELLO ... AUTH`. At `MAX_AUTH_FAILURES` (3), `process_buffered()` sends what is queued and drops the connection, on the same path as `QUIT`.
+- Guessing now costs a new TCP (and TLS) connection per 3 attempts. There is no delay and no per-address state: a long random password remains the real defence.
+- The limit is 3 because the SEC-2 test, like a client that mistypes once, fails twice and then authenticates on the same connection.
+- **Test:** 30 connections send 3 wrong passwords each; every one is closed after the third reply, and the log counts add up to 90 in at most 2 lines (this replaces the 1,000 attempts on one connection of SEC-20).
+
+### SEC-25: Resume incomplete RESP commands
+
+**Why:** gap 21. The cost of a read must not depend on how much of the command has already arrived.
+
+**Done when:** a command with a 32 MB argument followed by 14,000 bytes sent one per packet is executed in seconds.
+
+**Files:** `src/core/resp.h`, `src/net/connection.*`, `tests/resp_test.cpp`, `tests/sec_test.py`.
+
+**Result:**
+- `resp::Partial` records how many arguments are still missing and where the next one starts, relative to the start of the command. With it, `parse()` continues from there and keeps the arguments already copied.
+- The client keeps those arguments between reads (`Client::args`, `Client::partial`). Their bytes count toward `SOMNIUM_MAX_CLIENT_BUFFERS` (SEC-22), since they are a second copy of input that is still in `in_buf`.
+- AOF recovery, the replicator and the fuzzers keep the stateless 4-argument overloads, unchanged in behaviour.
+- **Tests:** `resp_test` feeds a command byte by byte at a non-zero offset and compares with the one-shot parse. `sec_test` sends the 32 MB case and requires the reply within 20 seconds. Not measured against the old code; by the reading above it would copy about 450 GB.
+- **Not covered:** `fuzz_resp` does not exercise the resumed path yet.
+
+### SEC-26: Bound `REPLFRONTIER`
+
+**Why:** gap 22. One command should not be able to switch replication off until restart.
+
+**Done when:** a frontier an hour in the future is refused, and so is a node id beyond the configured peers.
+
+**Files:** `src/core/crdt.cpp`, `tests/sec_test.py`.
+
+**Result:**
+- A frontier further ahead than `SOMNIUM_MAX_CLOCK_OFFSET_MS` gets `-ERR frontier too far in the future`, the same rule `CRDTMERGE` versions already follow.
+- A new node id is refused with `-ERR too many replication nodes` once the map holds the configured peers plus one (the local id).
+- `REPLFRONTIER` is still open to every authenticated client; separate peer credentials stay deferred. A client can still fill the free slots with invented ids, which stops tombstone collection but loses no writes.
+- A node that receives from more nodes than it lists in `SOMNIUM_PEERS` now refuses the extra frontiers. The README already asks for a symmetric peer list.
+
+### SEC-27: Monitoring stack on localhost
+
+**Why:** gap 23.
+
+**Files:** `docker-compose.yaml`, `README.md`.
+
+**Result:**
+- Grafana and Prometheus are published on `127.0.0.1` only.
+- The README recommends binding the exporter to the Docker bridge address on Linux (usually `172.17.0.1`), and keeps `0.0.0.0` plus a firewall rule as the fallback. This replaces the advice of SEC-8, point 5.
+- The images are still unpinned. Not tried with Docker: the change is the two port mappings.
+
+### SEC-28: Warn about a password without TLS
+
+**Why:** gap 24. The server still starts: a tunnel (SEC-15) is a valid setup it cannot see.
+
+**Files:** `src/config.cpp`, `SECURITY.md`.
+
+**Result:** a non-loopback `SOMNIUM_BIND` without `SOMNIUM_TLS_CERT` prints one warning at startup. `SECURITY.md` now says traffic is encrypted only when the TLS variables are set. No test of its own.
+
+### SEC-29: Subscription cap, log hygiene, bounded peer replies
+
+**Why:** gap 25.
+
+**Files:** `src/core/pubsub.cpp`, `src/core/rooms.cpp`, `src/storage/replicator.cpp`, `tests/sec_test.py`.
+
+**Result:**
+- `SUBSCRIBE` answers `-ERR too many subscriptions` beyond 10,000 channels per client. The per-subscribe log line is removed; the one on disconnect stays (it has no client-supplied text).
+- `ROOM` and `ROOM.WAKE` refuse names with control characters (below `0x20`, or `0x7f`), next to the SEC-5 rules. Rooms that already have such a name still replay from the AOF but can no longer be selected.
+- The replicator drops a peer whose pending reply line passes 4 KB.
+- **Test:** the SEC-5 test also tries a name with a newline and one with an escape sequence. The cap and the reply limit have no test of their own.
+
+### SEC-30: Small hardening items
+
+**Why:** gap 26.
+
+**Files:** `main.cpp`, `src/config.cpp`, `src/storage/aof_manager.cpp`, `src/storage/snapshot_manager.cpp`, `src/storage/eviction_manager.cpp`, `.github/workflows/ci.yml`, `tests/sec_test.py`.
+
+**Result:**
+- `SSL_OP_NO_RENEGOTIATION` on the TLS context. No test of its own.
+- `REDIS_PORT` must be a number from 1 to 65535 with nothing after it. **Test:** `70000`, `0` and `6379abc` refuse to start.
+- `O_NOFOLLOW` on `cold.bin` and on every temporary file (`appendonly.aof.tmp`, `room_*.bin.tmp`, `cold.bin.tmp`). `appendonly.aof` itself is left alone: a symlinked AOF is a plausible deployment.
+- `actions/checkout` and `actions/upload-artifact` are pinned to the commits their `v4` tags pointed to on 2026-11-12.
+
 ## Deferred (YAGNI)
 
 Each item comes back only when its trigger happens.
@@ -522,13 +637,13 @@ Each item comes back only when its trigger happens.
 | --- | --- |
 | ACLs, multiple users, per-command permissions | A need to give an untrusted application restricted access |
 | Separate peer credentials, authenticated `REPLFRONTIER` | Clients and replication peers living in different trust zones |
-| Rate limiting or lockout of failed `AUTH` attempts | The password port being exposed beyond localhost or a tunnel (prefer long random passwords first) |
 | Encryption at rest | A compliance requirement; until then use disk encryption (LUKS) |
 | Fuzzing the snapshot loader and AOF recovery | After SEC-10 runs cleanly, or when either file format changes |
 | Audit logging of commands | A compliance requirement |
 | Static analysis (CodeQL) | After SEC-9 and SEC-10 run clean, as a cheap extra pass |
-| Pinning GitHub Actions to commit SHAs, Dependabot | Adding any third-party action beyond `actions/*` |
+| Dependabot (the actions are pinned to commit SHAs since SEC-30, so updates are manual) | Adding any third-party action beyond `actions/*` |
 | IPv6 bind addresses | A deployment that needs them |
 | Keyed hashing for keys and channel names (libstdc++'s `std::hash` uses a fixed seed, so collisions can be precomputed) | Authenticated clients that are not fully trusted |
-| Constant-length password comparison (today a wrong-length guess is distinguishable by timing) | Password guessing becoming practical over the network (see the `AUTH` rate-limit row) |
-| Escaping client-supplied names (channels, rooms) in log lines | Logs consumed by a tool that trusts their line structure |
+| Constant-length password comparison (today a wrong-length guess is distinguishable by timing) | Password guessing becoming practical over the network despite SEC-24 |
+| Delay or per-address lockout of failed `AUTH` (SEC-24 only closes the connection) | Guessing over many connections showing up in the `[AUTH]` log |
+| Pinning the Prometheus and Grafana image versions | The monitoring stack being used beyond a developer machine |
