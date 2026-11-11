@@ -140,16 +140,28 @@ void Database::replay_record(const AofRecord& rec) {
 
     // camera adormita: snapshot-ul (mai vechi) se incarca acum, sub lock-ul ei,
     // si mutatiile din AOF se aplica peste el in ordinea istorica. Recovery-ul
-    // trece peste buget: redarea nu are voie sa piarda mutatii.
+    // trece peste bugetul de camere active: redarea nu are voie sa piarda mutatii.
     const std::shared_ptr<Room> room = find_room(rec.room, true);
     std::lock_guard room_lock(room->room_mutex);
     activate(*room, true);
+    apply_record(rec, command, *room);
+    // STAB-1: bugetul (SOMNIUM_MAX_KEYS, SOMNIUM_MAXMEMORY) se respecta si in timpul redarii
+    eviction.evict_despised_keys(*room, record_pool);
+}
+
+void Database::apply_record(const AofRecord& rec, const std::string& command, Room& room) {
+    // cheia din RAM sau din cold storage (redarea evicteaza si ea): o cheie e intr-un
+    // singur loc, deci o stergere sau o expirare o gaseste oriunde ar fi
+    const auto find = [&](const std::string& key) {
+        const auto it = room.keys.find(key);
+        return it != room.keys.end() ? it->second : reload(rec.room, room, key);
+    };
 
     // starea rezultata, aplicata verbatim: valoare, termen absolut si versiune
     const auto put = [&](const std::string& key, const std::string& value, const uint64_t ts, const uint64_t node) {
-        const auto it = room->keys.find(key);
-        Record* r = it != room->keys.end() ? it->second : insert(*room, key);
-        set_value(*room, r, value);
+        Record* r = find(key);
+        if (!r) r = insert(room, key);
+        set_value(room, r, value);
         r->expire_at = rec.expire_at;
         r->timestamp_ms = hlc::normalize(ts);
         r->node_id = static_cast<uint32_t>(node);
@@ -182,14 +194,12 @@ void Database::replay_record(const AofRecord& rec) {
 
     // termenul absolut din meta, nu TTL-ul relativ din argumente: fara viata in plus
     if ((command == "EXPIRE" || command == "PEXPIRE" || command == "PERSIST") && rec.args.size() >= 2) {
-        if (const auto it = room->keys.find(rec.args[1]); it != room->keys.end()) {
-            it->second->expire_at = rec.expire_at;
-        }
+        if (Record* r = find(rec.args[1])) r->expire_at = rec.expire_at;
         return;
     }
 
     if ((command == "DEL" && rec.args.size() >= 2) || (command == "CRDTDEL" && rec.args.size() >= 4)) {
-        if (const auto it = room->keys.find(rec.args[1]); it != room->keys.end()) erase(*room, it);
+        if (find(rec.args[1])) erase(room, room.keys.find(rec.args[1]));
         const Version v{hlc::normalize(rec.timestamp_ms), rec.node_id};
         set_tomb(rec.room, rec.args[1], v);
         clock_.observe(v.ts);
