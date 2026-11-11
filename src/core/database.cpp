@@ -173,8 +173,17 @@ Record* Database::lookup(const std::string& room_name, Room& room, const std::st
     }
 
     global_metrics.cache_misses.fetch_add(1, std::memory_order_relaxed);
+    Record* r = reload(room_name, room, key);
+    if (r && r->expired(now)) {
+        erase(room, room.keys.find(key));
+        return nullptr;
+    }
+    return r;
+}
+
+Record* Database::reload(const std::string& room_name, Room& room, const std::string& key) {
     std::optional<Record> cold = eviction.take(room_name, key);
-    if (!cold || cold->expired(now)) return nullptr;
+    if (!cold) return nullptr;
 
     Record* r = record_pool.construct(std::move(*cold));
     room.keys.emplace(key, r);

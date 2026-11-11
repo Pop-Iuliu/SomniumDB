@@ -114,6 +114,47 @@ def sec_saturated_eviction(check):
         srv.cleanup()
 
 
+def sec_replay_budget(check):
+    # STAB-1: de zece ori bugetul, apoi restart; redarea AOF-ului evicteaza ca o comanda live
+    budget, max_keys, n = 200000, 100, 2000
+    srv = Server(env_extra={**ENV, "SOMNIUM_MAXMEMORY": str(budget), "SOMNIUM_MAX_KEYS": str(max_keys)})
+    try:
+        srv.start()
+        c = Client(srv)
+        value = lambda i: f"{i:04d}".encode() * 250  # 1 KB, alta pentru fiecare cheie
+        for i in range(n):
+            c.cmd("SET", f"k{i}", value(i), *(("EX", "1000") if i % 10 == 0 else ()))
+        c.cmd("PERSIST", "k200")  # in cold storage, live si la redare
+        c.cmd("EXPIRE", "k201", "500")
+        # sterse din cold storage; apoi sterse din RAM (GET le reincarca), dar la redare
+        # GET-ul lipseste si DEL-ul le gaseste in cold storage
+        deleted = list(range(300, 400)) + list(range(400, 500))
+        for i in range(300, 400):
+            c.cmd("DEL", f"k{i}")
+        for i in range(400, 500):
+            c.cmd("GET", f"k{i}")
+            c.cmd("DEL", f"k{i}")
+        c.close()
+
+        srv.restart()
+        c = Client(srv)
+        info = dict(ln.split(": ", 1) for ln in c.cmd("INFO")[1].decode().splitlines() if ": " in ln)
+        keys, resident = int(info["Chei totale"]), int(info["Octeti rezidenti"])
+        check("restart: cheile din RAM in SOMNIUM_MAX_KEYS", keys <= max_keys, keys)
+        check("restart: octetii rezidenti in SOMNIUM_MAXMEMORY", resident <= budget, resident)
+
+        gone = set(deleted)
+        wrong = [i for i in range(n) if c.cmd("GET", f"k{i}") != (("nil", None) if i in gone else ("bulk", value(i)))]
+        check("restart: fiecare cheie isi citeste valoarea, cele sterse raman sterse", not wrong, wrong[:10])
+        ttl = lambda k: c.cmd("TTL", k)[1]
+        check("restart: TTL-urile supravietuiesc",
+              990 <= ttl("k0") <= 1000 and ttl("k200") == -1 and 490 <= ttl("k201") <= 500 and ttl("k1") == -1,
+              [ttl(k) for k in ("k0", "k200", "k201", "k1")])
+        c.close()
+    finally:
+        srv.cleanup()
+
+
 def sec_replication_misaligned_offset(check):
     # offsetul salvat cu acelasi inode dar in mijlocul unei inregistrari: ce lasa doua
     # rescrieri AOF pe ext4 (inode-ul eliberat e refolosit) cat timp peer-ul e oprit
@@ -241,7 +282,7 @@ def sec_accept_backoff(check):
 
 def main():
     fails = []
-    for sec in (sec_torn_aof, sec_torn_cold, sec_saturated_eviction, sec_replication_misaligned_offset,
+    for sec in (sec_torn_aof, sec_torn_cold, sec_saturated_eviction, sec_replay_budget, sec_replication_misaligned_offset,
                 sec_fd_limit, sec_accept_backoff):
         run_with_retry(sec, fails)
     report(fails, "stab")

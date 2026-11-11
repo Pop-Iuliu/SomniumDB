@@ -102,6 +102,7 @@ private:
     // (valoare, expirare, versiune CRDT) asa cum a fost serializata, fara sa
     // regenereze timestampuri sau sa re-evalueze comanda
     void replay_record(const AofRecord& rec);
+    void apply_record(const AofRecord& rec, const std::string& command, Room& room); // room_mutex prins
 
     // AOF rescris ca stare curenta, sincron (migrarea v1/v2 -> v3 la pornire)
     bool rewrite_aof();
@@ -118,6 +119,8 @@ private:
     // cheia logica: RAM, apoi cold storage (reincarcata in RAM); cheile expirate
     // conteaza ca absente. nullptr = cheia nu exista.
     Record* lookup(const std::string& room_name, Room& room, const std::string& key);
+    // muta cheia din cold storage in RAM, fara verificarea expirarii; nullptr = nu e acolo
+    Record* reload(const std::string& room_name, Room& room, const std::string& key);
     // versiunea unei scrieri primite: parsare stricta, format HLC, garda de viitor;
     // intoarce eroarea RESP sau "" la succes
     std::string incoming_version(const std::string& ts_arg, const std::string& node_arg, Version* out);

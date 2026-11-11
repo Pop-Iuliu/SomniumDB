@@ -21,7 +21,7 @@ A step-by-step plan for the stability and continuity problems found by stress-te
 
 | Step | Title | Status |
 | --- | --- | --- |
-| STAB-1 | Honour the memory budget during AOF replay | TODO |
+| STAB-1 | Honour the memory budget during AOF replay | In review (branch `stab/stab-1-replay-budget`) |
 | STAB-2 | Compact cold storage automatically | TODO |
 | STAB-3 | Incremental expiry | TODO |
 | D1 | Writes acknowledged while the AOF cannot be written | Decision needed |
@@ -54,6 +54,8 @@ Findings from stress-testing `main` at `b8d6f7b` (2026-10-16) on the Release and
 - startup time for a large AOF is measured before and after, and stated in the pull request.
 
 **Files:** `src/core/persistence.cpp`, possibly `src/core/database.cpp`, `tests/stab_test.py`, `README.md`.
+
+**Result:** `lookup`'s reload from cold storage is now `Database::reload` (no expiry check), and every replay branch finds a key through it; `replay_record` evicts after each record. `sec_replay_budget` in `tests/stab_test.py`: 2,000 keys of 1 KB with `SOMNIUM_MAXMEMORY=200000 SOMNIUM_MAX_KEYS=100`; on `main` `INFO` after the restart shows 1,800 keys and 1,995,290 bytes, on the branch both are within the limits. Without the cold-storage `DEL` (eviction alone), keys deleted before the restart come back. Startup on a 215 MB AOF (1M `SET`s of 100 bytes, 631,971 keys, Release, WSL, median of 5): no budget 1.49 s on `main`, 1.45 s on the branch; `SOMNIUM_MAXMEMORY=20000000` 1.30 s on `main` (139 MB resident, 176 MB peak RSS), 4.42 s on the branch (20 MB resident, 97 MB peak RSS, 99 MB `cold.bin`). The extra time is one `pwrite` per evicted key and one `pread` per overwrite of a cold key.
 
 **Not in this step:**
 - making `cold.bin` survive a restart, so that replay would not need to rebuild it, is a persistence format change;

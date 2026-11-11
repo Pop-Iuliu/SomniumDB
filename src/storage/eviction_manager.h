@@ -17,9 +17,9 @@
 // RAM, fie in index, niciodata in ambele: reincarcarea o scoate din index,
 // deci un DEL sau o expirare in RAM nu pot invia o valoare veche de pe disc.
 //
-// Fisierul traieste cat procesul: la pornire AOF-ul reda toata starea in RAM,
-// deci il trunchiem. De aceea nu sunt necesari markeri de stergere pe disc
-// si nici reconstruirea indexului. Folosit doar de thread-ul de comenzi.
+// Fisierul traieste cat procesul: la pornire il trunchiem, iar redarea AOF-ului
+// il reconstruieste evictand peste buget, ca o comanda live. De aceea nu sunt
+// necesari markeri de stergere pe disc. Folosit doar de thread-ul de comenzi.
 class EvictionManager {
 public:
     explicit EvictionManager(const Config& cfg);
