@@ -155,6 +155,68 @@ def sec_replay_budget(check):
         srv.cleanup()
 
 
+COMPACT_MIN = 64 << 20  # kAutoCompactMin, src/storage/eviction_manager.h
+CHURN_KEYS = [f"c{i}" for i in range(10)]
+churn_value = lambda k: f"{k}-".encode() * 33000  # ~100 KB
+CHURN_LIVE = sum(len(churn_value(k)) + 20 for k in CHURN_KEYS)  # inregistrarile vii din cold.bin
+
+
+def fill(c):
+    for k in CHURN_KEYS:
+        c.cmd("SET", k, churn_value(k))
+
+
+def churn(c, srv, gets):
+    # cu SOMNIUM_MAX_KEYS=0 fiecare GET reincarca o cheie si o evicteaza la loc: o
+    # inregistrare noua in cold.bin, cea veche devine obsoleta. Intoarce cheile citite
+    # gresit si cea mai mare marime a cold.bin vazuta intre loturi.
+    wrong, peak = set(), 0
+    for start in range(0, gets, 50):
+        batch = [CHURN_KEYS[i % len(CHURN_KEYS)] for i in range(start, min(start + 50, gets))]
+        c.s.sendall(b"".join(resp_cmd("GET", k) for k in batch))
+        wrong |= {k for k in batch if c.read_reply() != ("bulk", churn_value(k))}
+        peak = max(peak, size(srv, "cold.bin"))
+    return wrong, peak
+
+
+def sec_cold_autocompact(check):
+    # STAB-2: cold.bin se compacteaza singur, fara COMPACT
+    srv = Server(env_extra={**ENV, "SOMNIUM_MAX_KEYS": "0"})
+    try:
+        srv.start()
+        c = Client(srv)
+        fill(c)
+        wrong, peak = churn(c, srv, 2000)  # ~200 MB de evictari, de trei ori minimul
+        check("churn: fiecare cheie isi citeste valoarea", not wrong, sorted(wrong))
+        check("churn: cold.bin sub 2 x datele vii + minimul", peak <= 2 * CHURN_LIVE + COMPACT_MIN, peak)
+        c.close()
+    finally:
+        srv.cleanup()
+
+
+def sec_cold_autocompact_failure(check):
+    srv = Server(env_extra={**ENV, "SOMNIUM_MAX_KEYS": "0"}, keep_dir_on_retry=True)
+    try:
+        tmp = os.path.join(srv.workdir, "cold.bin.tmp")
+        os.mkdir(tmp)  # injectie, ca in tests/s1_test.py: compactarea nu poate crea fisierul
+        srv.start()
+        c = Client(srv)
+        fill(c)
+        wrong, _ = churn(c, srv, 1000)  # ~100 MB: o singura data peste minim
+        log = b"".join(open(os.path.join(srv.workdir, f), "rb").read()
+                       for f in os.listdir(srv.workdir) if f.startswith("server."))
+        attempts = log.count(b"nu pot crea cold.bin.tmp")
+        check("compactare esuata: cheile isi citesc valoarea", not wrong, sorted(wrong))
+        check("compactare esuata: fara reincercare la fiecare comanda", attempts == 1, attempts)
+        os.rmdir(tmp)
+        wrong, _ = churn(c, srv, 1000)  # fisierul mai creste cu minimul: reincercarea reuseste
+        check("cauza inlaturata: compactarea reia, cheile isi citesc valoarea",
+              not wrong and size(srv, "cold.bin") <= 2 * CHURN_LIVE + COMPACT_MIN, size(srv, "cold.bin"))
+        c.close()
+    finally:
+        srv.cleanup()
+
+
 def sec_replication_misaligned_offset(check):
     # offsetul salvat cu acelasi inode dar in mijlocul unei inregistrari: ce lasa doua
     # rescrieri AOF pe ext4 (inode-ul eliberat e refolosit) cat timp peer-ul e oprit
@@ -282,7 +344,8 @@ def sec_accept_backoff(check):
 
 def main():
     fails = []
-    for sec in (sec_torn_aof, sec_torn_cold, sec_saturated_eviction, sec_replay_budget, sec_replication_misaligned_offset,
+    for sec in (sec_torn_aof, sec_torn_cold, sec_saturated_eviction, sec_replay_budget, sec_cold_autocompact,
+                sec_cold_autocompact_failure, sec_replication_misaligned_offset,
                 sec_fd_limit, sec_accept_backoff):
         run_with_retry(sec, fails)
     report(fails, "stab")

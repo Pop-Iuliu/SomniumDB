@@ -21,8 +21,8 @@ A step-by-step plan for the stability and continuity problems found by stress-te
 
 | Step | Title | Status |
 | --- | --- | --- |
-| STAB-1 | Honour the memory budget during AOF replay | In review (branch `stab/stab-1-replay-budget`) |
-| STAB-2 | Compact cold storage automatically | TODO |
+| STAB-1 | Honour the memory budget during AOF replay | DONE (#45) |
+| STAB-2 | Compact cold storage automatically | In review (branch `stab/stab-2-cold-compaction`) |
 | STAB-3 | Incremental expiry | TODO |
 | D1 | Writes acknowledged while the AOF cannot be written | Decision needed |
 
@@ -77,6 +77,8 @@ Findings from stress-testing `main` at `b8d6f7b` (2026-10-16) on the Release and
 - with compaction made to fail (`cold.bin.tmp` as a directory, as in `tests/s1_test.py`), the server does not retry on every command.
 
 **Files:** `src/storage/eviction_manager.h`, `src/storage/eviction_manager.cpp`, `tests/stab_test.py`.
+
+**Result:** `EvictionManager::compact_due()` (inline, three comparisons) is checked after the eviction in `execute_in_room`. The minimum is the constant `kAutoCompactMin` (64 MB). `compact()` sets the retry point to the current size plus the minimum, and clears it on success, so a failed manual `COMPACT` also delays the automatic one. The changes from the plan: `src/core/commands.cpp` holds the call, and `compact()` now buffers its output (one `write()` per MB instead of one per record) and reads only the deadline of each record to skip expired ones. Tests: `sec_cold_autocompact` (2,000 reload and evict cycles of 100 KB values, about 200 MB: `cold.bin` peaks at 199 MB on `main`, within 2 x 1 MB + 64 MB here) and `sec_cold_autocompact_failure` (1 failed attempt in 1,000 cycles, where a variant without the retry point makes 323; once the cause is removed, compaction resumes). Pause of one compaction (`COMPACT`, Release, WSL; first run with obsolete data, then the same live data with none), before and after buffering: 632k records of 120 bytes (76 MB live) 1,858 / 1,161 to 1,336 ms, now 1,312 / 678 to 808 ms; 126k records of 1 KB (129 MB) 543 / 313 to 341 ms, now 300 / 200 to 206 ms; 12.7k records of 10 KB (127 MB) 192 / 137 to 144 ms, now 125 / 88 to 104 ms. What remains is one `pread` per record and the rebuilt index, so the pause grows with the number of live cold keys more than with their size.
 
 **Not in this step:** incremental or background compaction. Do it only if the measured pause is too long for a real dataset.
 

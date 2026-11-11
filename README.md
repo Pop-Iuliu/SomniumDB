@@ -42,7 +42,7 @@ When RAM limits are reached, SomniumDB seamlessly shifts cold keys to disk:
 * **CountMinSketch Algorithm:** Tracks access frequency to drive an approximate Least Frequently Used (LFU) eviction policy.
 * **Exact index:** An in-RAM `(room, key)` index points at the latest record in `cold.bin`, so a miss never touches the disk and a lookup reads exactly one record. A key lives in RAM or in cold storage, never both, so a deleted key can never resurface from disk.
 * **Full fidelity:** Value, absolute expiry and CRDT version travel with the record through eviction and reload.
-* **Compaction:** `COMPACT` rewrites only live records; the new file and index are published together, and a failed compaction keeps the old ones. Cold storage lasts for the process lifetime: on restart the AOF replays the full state and evicts as it goes, so keys over the memory budget start in cold storage.
+* **Compaction:** `COMPACT` rewrites only live records; the new file and index are published together, and a failed compaction keeps the old ones. It also runs on its own once obsolete records are more than half of `cold.bin` and at least 64 MB, so the file stays under twice the live cold data plus 64 MB; after a failure it waits until the file has grown by another 64 MB. Clients pause while it runs, longer with more live cold keys (measured: 0.7 to 1.3 s for 632k records of 120 bytes, 0.2 to 0.3 s for 126k records of 1 KB). Cold storage lasts for the process lifetime: on restart the AOF replays the full state and evicts as it goes, so keys over the memory budget start in cold storage.
 
 ### Built-in Observability & Metrics
 
