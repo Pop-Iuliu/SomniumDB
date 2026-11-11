@@ -111,6 +111,15 @@ std::string Database::handle_replfrontier(const std::vector<std::string>& args) 
         !fsutil::parse_u64(args[2], &f)) {
         return "-ERR usage: REPLFRONTIER node frontier\r\n";
     }
+    // ca la incoming_version: o frontiera din viitor ar ridica watermark-ul peste scrieri
+    // care inca n-au sosit (uitate apoi ca "prea vechi"), pana la restart
+    if (static_cast<long long>(hlc::physical_ms(f)) > get_current_time_ms() + max_clock_offset_ms) {
+        return "-ERR frontier too far in the future (SOMNIUM_MAX_CLOCK_OFFSET_MS)\r\n";
+    }
+    // cel mult peer-ii configurati (si nodul local): altfel harta creste cu orice id inventat
+    if (!frontiers_.contains(static_cast<uint32_t>(node)) && frontiers_.size() > peer_count_) {
+        return "-ERR too many replication nodes\r\n";
+    }
     uint64_t& known = frontiers_[static_cast<uint32_t>(node)];
     known = std::max(known, f);
     // dupa flush nu e nimic in zbor: orice versiune locala emisa pana aici

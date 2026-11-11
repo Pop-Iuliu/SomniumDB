@@ -3,6 +3,7 @@
 // si hibernate() presupun room_mutex prins.
 #include "database.h"
 #include "../server/metrics.h"
+#include <algorithm>
 
 std::shared_ptr<Room> Database::find_room(const std::string& name, const bool create) {
     {
@@ -67,7 +68,9 @@ bool Database::hibernate(Room& room) {
 
 const char* Database::wake_room(const std::string& name) {
     // SEC-5: numele devine nume de fisier ("room_" + name + ".bin")
-    if (name.empty() || name.size() > 200 || name.find_first_of(std::string_view("/\0", 2)) != std::string::npos) {
+    // ...si ajunge in loguri: fara caractere de control (linii false, secvente de terminal)
+    if (name.empty() || name.size() > 200 || name.find('/') != std::string::npos ||
+        std::ranges::any_of(name, [](const unsigned char ch) { return ch < 0x20 || ch == 0x7f; })) {
         return "-ERR invalid room name\r\n";
     }
     std::shared_ptr<Room> room = find_room(name, false);

@@ -24,7 +24,7 @@ def server_log(srv):
 
 def run_once(srv, env, timeout=5):
     """Porneste binarul cu env dat si asteapta sa iasa singur (erori de configurare)."""
-    env = dict(os.environ, REDIS_PORT=str(srv.port), **ENV, **env)
+    env = {**os.environ, "REDIS_PORT": str(srv.port), **ENV, **env}
     try:
         return subprocess.run([srv.bin], cwd=srv.workdir, env=env, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -82,6 +82,9 @@ def sec2_auth(check):
         r = run_once(srv, {"SOMNIUM_BIND": "0.0.0.0", "SOMNIUM_PASSWORD": ""})
         check("SEC-2: bind in retea fara parola refuza pornirea",
               r is not None and r.returncode == 1 and b"SOMNIUM_PASSWORD" in r.stderr, r)
+        for port in ("70000", "0", "6379abc"):
+            r = run_once(srv, {"REDIS_PORT": port})
+            check(f"SEC-2: REDIS_PORT={port} refuza pornirea", r is not None and r.returncode == 1 and b"REDIS_PORT" in r.stderr, r)
     finally:
         srv.cleanup()
 
@@ -149,7 +152,7 @@ def sec5_room_names(check):
     try:
         srv.start()
         c = Client(srv)
-        for name in ("", "a/b", "a\0b", "r" * 201):
+        for name in ("", "a/b", "a\0b", "a\nb", "a\x1b[2Jb", "r" * 201):
             check(f"SEC-5: ROOM {name[:12]!r} refuzat", c.cmd("ROOM", name) == ("err", "ERR invalid room name"))
             check(f"SEC-5: ROOM.WAKE {name[:12]!r} refuzat", c.cmd("ROOM.WAKE", name)[0] == "err")
         rooms = [name for _, name in c.cmd("ROOMS")[1]]
@@ -424,13 +427,35 @@ def sec20_auth_log(check):
     logged = lambda: [int(n) for n in re.findall(r"\[AUTH\] parole gresite: (\d+)", server_log(srv))]
     try:
         srv.start()
-        c = Client(srv)
-        for _ in range(10):  # loturi de 100: raspunsurile unui strain incap in capul de 16 KB
-            c.s.sendall(resp_cmd("AUTH", "nope") * 100)
-            for _ in range(100):
-                c.read_reply()
-        check("SEC-20: toate cele 1000 de esecuri sunt numarate", wait_until(lambda: sum(logged()) == 1000, 3), logged())
+        closed = 0
+        for _ in range(30):  # a treia parola gresita inchide conexiunea
+            c = Client(srv)
+            c.s.sendall(resp_cmd("AUTH", "nope") * 3)
+            replies = [c.read_reply() for _ in range(3)]
+            try:
+                closed += replies[2][1].startswith("WRONGPASS") and c.s.recv(64) == b""
+            except ConnectionError:
+                closed += 1
+            c.close()
+        check("SEC-20: conexiunea se inchide dupa 3 parole gresite", closed == 30, closed)
+        check("SEC-20: toate cele 90 de esecuri sunt numarate", wait_until(lambda: sum(logged()) == 90, 3), logged())
         check("SEC-20: ...in cel mult 2 linii de log", server_log(srv).count("[AUTH]") <= 2, logged())
+
+        # un argument mare, apoi restul comenzii octet cu octet: parserul reia, nu recopiaza
+        c = Client(srv)
+        c.cmd("AUTH", PW)
+        tail = b"$1\r\nx\r\n" * 2000
+        c.s.sendall(b"*2002\r\n$4\r\nMSET\r\n$33554432\r\n" + b"k" * (32 << 20) + b"\r\n")
+        start = time.time()
+        for i in range(len(tail)):
+            c.s.sendall(tail[i:i + 1])
+        check("SEC-20: comanda trimisa octet cu octet e executata", c.read_reply()[0] == "err", "MSET cu numar par")
+        check("SEC-20: ...fara recopierea argumentului mare", time.time() - start < 20, time.time() - start)
+
+        far = str((int(time.time() * 1000) + 3_600_000) << 16)
+        check("SEC-20: REPLFRONTIER din viitor e refuzat", c.cmd("REPLFRONTIER", "2", far)[0] == "err")
+        check("SEC-20: REPLFRONTIER accepta nodul local", c.cmd("REPLFRONTIER", "1", "5") == ("ok", "OK"))
+        check("SEC-20: ...dar nu noduri inventate", c.cmd("REPLFRONTIER", "7", "5")[0] == "err")
         c.close()
     finally:
         srv.cleanup()

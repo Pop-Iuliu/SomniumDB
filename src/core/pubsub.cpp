@@ -9,10 +9,15 @@
 std::string PubSubManager::subscribe(const int client_fd, const std::string& channel, const bool resp3) {
     std::lock_guard lock(ps_mutex);
 
-    channel_subscribers[channel].insert(client_fd);
-    client_subscriptions[client_fd].insert(channel);
+    // abonamentele nu intra in SOMNIUM_MAX_CLIENT_BUFFERS: fara cap, un client le creste la nesfarsit
+    constexpr size_t kMaxSubscriptions = 10000;
+    auto& mine = client_subscriptions[client_fd];
+    if (mine.size() >= kMaxSubscriptions && !mine.contains(channel)) return "-ERR too many subscriptions\r\n";
 
-    int sub_count = client_subscriptions[client_fd].size();
+    channel_subscribers[channel].insert(client_fd);
+    mine.insert(channel);
+
+    int sub_count = mine.size();
 
     // facem raspunsul in RESP
     std::string resp = resp3 ? ">3\r\n" : "*3\r\n";
@@ -20,7 +25,6 @@ std::string PubSubManager::subscribe(const int client_fd, const std::string& cha
     resp += "$" + std::to_string(channel.length()) + "\r\n" + channel + "\r\n";
     resp += ":" + std::to_string(sub_count) + "\r\n";
 
-    printf("[PubSub] Clientul (FD: %d) s-a abonat la '%s'.\n", client_fd, channel.c_str());
     return resp;
 }
 

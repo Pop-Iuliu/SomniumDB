@@ -22,6 +22,7 @@ namespace {
     std::string authenticate(Client& c, const std::string& user, const std::string& pass, const std::string& password) {
         if (!credentials_ok(user, pass, password)) {
             ++g_auth_failures; // logate agregat de sweep-ul din bucla
+            ++c.auth_failures; // process_buffered inchide conexiunea la MAX_AUTH_FAILURES
             return "-WRONGPASS invalid username-password pair\r\n";
         }
         c.authenticated = true;

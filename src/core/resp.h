@@ -22,7 +22,18 @@ constexpr size_t kMaxHeader = 32;                   // prefix + 20 cifre + CRLF 
 // Un array "*N\r\n" urmat de N bulk-uri "$len\r\n<octeti>\r\n", citit de la pos.
 // Complete: *end trece de comanda si *args o contine. NeedMore: un prefix
 // valid, asteptam octeti. Malformed: nicio continuare nu il mai face valid.
-inline Status parse(const std::string& buf, const size_t pos, size_t* end, std::vector<std::string>* args) {
+// Progresul unei comenzi incomplete (left > 0): mai sunt `left` argumente, primul la
+// pos + next. Fara el, fiecare citire reparsa comanda de la inceput si ii recopia
+// argumentele: un argument mare urmat de octeti trimisi unul cate unul oprea serverul.
+struct Partial {
+    size_t next = 0;
+    uint64_t left = 0;
+};
+
+// Cu `partial`, un NeedMore tine minte unde a ramas, iar apelul urmator (acelasi pos,
+// acelasi args, buffer doar prelungit) continua de acolo.
+inline Status parse(const std::string& buf, const size_t pos, size_t* end, std::vector<std::string>* args,
+                    Partial* partial) {
     size_t p = pos;
 
     // "<prefix><numar zecimal fara semn>\r\n", cu cautarea CRLF marginita
@@ -42,20 +53,37 @@ inline Status parse(const std::string& buf, const size_t pos, size_t* end, std::
     };
 
     uint64_t count = 0;
-    if (const Status st = header('*', kMaxArgs, &count); st != Status::Complete) return st;
+    if (partial && partial->left) {
+        p = pos + partial->next;
+        count = partial->left;
+    } else {
+        if (const Status st = header('*', kMaxArgs, &count); st != Status::Complete) return st;
+        args->clear();
+    }
 
-    args->clear();
     for (uint64_t i = 0; i < count; ++i) {
+        const size_t arg_start = p;
         uint64_t len = 0;
-        if (const Status st = header('$', kMaxBulk, &len); st != Status::Complete) return st;
-        if (buf.size() - p < len + 2) return Status::NeedMore;
-        if (buf[p + len] != '\r' || buf[p + len + 1] != '\n') return Status::Malformed;
+        Status st = header('$', kMaxBulk, &len);
+        if (st == Status::Complete) {
+            if (buf.size() - p < len + 2) st = Status::NeedMore;
+            else if (buf[p + len] != '\r' || buf[p + len + 1] != '\n') st = Status::Malformed;
+        }
+        if (st != Status::Complete) {
+            if (partial) *partial = st == Status::NeedMore ? Partial{arg_start - pos, count - i} : Partial{};
+            return st;
+        }
         args->emplace_back(buf, p, len);
         p += len + 2;
     }
 
+    if (partial) *partial = {};
     *end = p;
     return Status::Complete;
+}
+
+inline Status parse(const std::string& buf, const size_t pos, size_t* end, std::vector<std::string>* args) {
+    return parse(buf, pos, end, args, nullptr);
 }
 
 constexpr size_t kMaxInline = 64 * 1024; // ca PROTO_INLINE_MAX_SIZE din Redis
@@ -111,8 +139,9 @@ inline bool split_inline(const std::string_view line, std::vector<std::string>* 
 
 // Cererile clientilor: array RESP sau comanda inline (telnet, redis-benchmark
 // PING_INLINE), o linie terminata cu LF sau CRLF. AOF-ul ramane strict.
-inline Status parse_request(const std::string& buf, const size_t pos, size_t* end, std::vector<std::string>* args) {
-    if (pos >= buf.size() || buf[pos] == '*') return parse(buf, pos, end, args);
+inline Status parse_request(const std::string& buf, const size_t pos, size_t* end, std::vector<std::string>* args,
+                            Partial* partial) {
+    if (pos >= buf.size() || buf[pos] == '*') return parse(buf, pos, end, args, partial);
 
     const std::string_view window = std::string_view(buf).substr(pos, kMaxInline);
     const size_t nl = window.find('\n');
@@ -126,6 +155,10 @@ inline Status parse_request(const std::string& buf, const size_t pos, size_t* en
     if (!split_inline(line, args)) return Status::Malformed;
     *end = pos + nl + 1; // o linie goala e o comanda goala: ignorata
     return Status::Complete;
+}
+
+inline Status parse_request(const std::string& buf, const size_t pos, size_t* end, std::vector<std::string>* args) {
+    return parse_request(buf, pos, end, args, nullptr);
 }
 
 } // namespace resp

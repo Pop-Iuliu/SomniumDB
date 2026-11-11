@@ -18,12 +18,12 @@ std::optional<Config> load_config() {
 
     // fara acestea serverul nu porneste
     if (const char* v = getenv("REDIS_PORT")) {
-        try {
-            cfg.port = std::stoi(v);
-        } catch (...) {
+        uint64_t port = 0; // stoi accepta "6379abc", iar 70000 era trunchiat la alt port
+        if (!fsutil::parse_u64(v, &port) || port == 0 || port > 65535) {
             fprintf(stderr, "REDIS_PORT invalid: %s\n", v);
             return std::nullopt;
         }
+        cfg.port = static_cast<int>(port);
     }
     if (const char* v = getenv("SOMNIUM_MAXCLIENTS"); v && (!fsutil::parse_u64(v, &cfg.maxclients) || cfg.maxclients == 0)) {
         fprintf(stderr, "SOMNIUM_MAXCLIENTS invalid: %s\n", v);
@@ -49,6 +49,10 @@ std::optional<Config> load_config() {
     // fisierele TLS se valideaza la incarcare (main.cpp); SOMNIUM_METRICS_BIND, la bind-ul exporterului
     if (const char* v = getenv("SOMNIUM_TLS_CERT")) cfg.tls_cert = v;
     if (const char* v = getenv("SOMNIUM_TLS_KEY")) cfg.tls_key = v;
+    if (ntohl(addr.s_addr) >> 24 != 127 && !cfg.tls_cert) {
+        fprintf(stderr, "Atentie: SOMNIUM_BIND=%s fara TLS: parola si datele circula in clar "
+                        "(SOMNIUM_TLS_CERT + SOMNIUM_TLS_KEY sau un tunel)\n", cfg.bind.c_str());
+    }
     cfg.metrics = getenv("SOMNIUM_NO_METRICS") == nullptr;
     if (const char* v = getenv("SOMNIUM_METRICS_BIND")) cfg.metrics_bind = v;
     if (const char* v = getenv("SOMNIUM_TRACE_FD")) cfg.trace_fd = atoi(v);

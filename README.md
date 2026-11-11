@@ -108,8 +108,11 @@ SomniumDB includes a ready-to-use Docker environment for real-time observability
 
 ```bash
 # Prometheus in Docker scrapes host.docker.internal:9090, which a localhost
-# bind does not reach: expose the exporter, and firewall port 9090 from the network
-SOMNIUM_METRICS_BIND=0.0.0.0 ./Redis &
+# bind does not reach. On Linux, bind the exporter to the Docker bridge address
+# (docker network inspect bridge, usually 172.17.0.1): containers reach it, the
+# network does not. Where that is not possible use 0.0.0.0 and firewall port 9090.
+# Prometheus and Grafana themselves are published on localhost only.
+SOMNIUM_METRICS_BIND=172.17.0.1 ./Redis &
 
 # Spin up Prometheus & Grafana in the background
 docker-compose up -d

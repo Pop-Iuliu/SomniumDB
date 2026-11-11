@@ -9,8 +9,10 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 #include <openssl/ssl.h>
 #include "../config.h"
+#include "../core/resp.h"
 
 class Database;
 
@@ -30,6 +32,9 @@ struct Client {
     bool flush_queued = false; // starea buclei: asteapta trimiterea de la capatul iteratiei
     bool resp3 = false; // protocolul negociat prin HELLO
     bool authenticated;
+    int auth_failures = 0;          // parole gresite pe conexiunea asta; la MAX_AUTH_FAILURES e inchisa
+    std::vector<std::string> args;  // argumentele deja citite ale unei comenzi incomplete
+    resp::Partial partial;          // ...si de unde reia parserul
     size_t held = 0; // cat din totalul bufferelor (SEC-22) e al acestui client
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl; // SEC-16; nullptr = text clar
     const std::chrono::steady_clock::time_point connected = std::chrono::steady_clock::now();
