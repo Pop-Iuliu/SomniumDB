@@ -7,6 +7,7 @@
 #include <cctype>
 #include <chrono>
 #include <climits>
+#include <thread>
 
 std::string Database::execute_in_room(const Command& cmd, const Call& call) {
     const std::shared_ptr<Room> room = find_room(call.room_name, true);
@@ -270,18 +271,41 @@ std::string Database::handle_info() {
     return bulk_string(info_text);
 }
 
+// STAB-3: o trecere prin fiecare camera activa, in loturi de cel mult kBatch bucket-uri
+// per lock: comanda care asteapta camera asteapta un lot, nu toata camera. Un rehash
+// intre loturi poate sari sau revizita cateva chei; lookup() le ascunde oricum, iar
+// trecerea urmatoare le prinde.
 void Database::clean_expired_keys() {
-    std::shared_lock shared_rooms_lock(rooms_mutex);
-    const long long now = get_current_time_ms();
+    constexpr size_t kBatch = 1024;
+    std::vector<std::shared_ptr<Room>> active;
+    {
+        // camerele nu se sterg din registru (room.h), deci lock-ul se elibereaza aici
+        std::shared_lock rooms_lock(rooms_mutex);
+        for (const auto& [name, room] : rooms) {
+            if (room->state != RoomState::Sleeping) active.push_back(room); // fara chei in RAM
+        }
+    }
 
-    for (const auto& [name, room] : rooms) {
-        std::lock_guard room_lock(room->room_mutex);
-        for (auto it = room->keys.begin(); it != room->keys.end();) {
-            if (it->second->expired(now)) {
-                erase(*room, it++);
-            } else {
-                ++it;
+    std::vector<std::string> expired;
+    for (const std::shared_ptr<Room>& room : active) {
+        for (size_t bucket = 0;;) {
+            {
+                std::lock_guard room_lock(room->room_mutex);
+                if (room->state == RoomState::Sleeping || bucket >= room->keys.bucket_count()) break;
+                const long long now = get_current_time_ms();
+                const size_t end = std::min(bucket + kBatch, room->keys.bucket_count());
+                for (; bucket < end; ++bucket) {
+                    for (auto it = room->keys.begin(bucket); it != room->keys.end(bucket); ++it) {
+                        if (it->second->expired(now)) expired.push_back(it->first);
+                    }
+                }
+                // erase() nu face rehash, deci bucket-urile raman valabile pana la unlock
+                for (const std::string& key : expired) erase(*room, room->keys.find(key));
+                expired.clear();
             }
+            // un mutex nu e echitabil: fara pauza, watchdog-ul il reia inaintea
+            // thread-ului de comenzi trezit si blocajul doar s-ar muta
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     }
 }

@@ -22,8 +22,8 @@ A step-by-step plan for the stability and continuity problems found by stress-te
 | Step | Title | Status |
 | --- | --- | --- |
 | STAB-1 | Honour the memory budget during AOF replay | DONE (#45) |
-| STAB-2 | Compact cold storage automatically | In review (branch `stab/stab-2-cold-compaction`) |
-| STAB-3 | Incremental expiry | TODO |
+| STAB-2 | Compact cold storage automatically | DONE (#46) |
+| STAB-3 | Incremental expiry | In review (branch `stab/stab-3-incremental-expiry`) |
 | D1 | Writes acknowledged while the AOF cannot be written | Decision needed |
 
 ## Current state
@@ -101,6 +101,8 @@ Findings from stress-testing `main` at `b8d6f7b` (2026-10-16) on the Release and
 - the TSan job (`tests/s4_test.py`, commands and watchdog under load) passes.
 
 **Files:** `src/core/commands.cpp` (`clean_expired_keys`), `src/core/room.h`, possibly `src/server/watchdog.cpp`, `tests/stab_test.py`.
+
+**Result:** the cursor way, with two changes from the plan. First, one call still makes a full pass, so there is no per-room cursor to keep between ticks. The cursor is a local bucket index: the room lock is held for at most 1,024 buckets and released between batches, and the registry lock only while the active rooms are copied. Second, the watchdog sleeps 100 us between batches. A mutex is not fair: without the pause, the watchdog takes the lock again before the woken command thread, and the stall only moves. Only `src/core/commands.cpp` and `tests/stab_test.py` change. `sec_incremental_expiry` loads 500,000 keys and 20,000 with `PX 100`, probes `GET` from another process for 6 s (more than one watchdog period), then waits for `INFO` to show only the persistent keys. The worst `GET` is 87.5 ms on `main` (224 ms under ASan) and under the 50 ms limit here. Measurement as in finding 3 (Release, WSL, 1,000,000 keys in `default`, `GET` every 2 ms from another process, 30 s): on `main` p50 0.23 ms, p99.9 0.99 ms, max 210 ms, 6 stalls over 20 ms; here p50 0.28 ms, p99.9 1.43 ms, max 3.6 ms, none over 10 ms. Without the pause: max 99.8 ms, 27 over 10 ms. The TSan run of `tests/s4_test.py` passes.
 
 **Not in this step:** expiring keys in cold storage. Their records are dropped by compaction (`compact()` already skips expired records), so STAB-2 covers them.
 
