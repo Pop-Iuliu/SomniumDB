@@ -1,7 +1,9 @@
 #pragma once
 
-#include <string>
+#include <algorithm>
 #include <cstdint>
+#include <functional>
+#include <string>
 
 class CountMinSketch {
 private:
@@ -9,34 +11,26 @@ private:
     static constexpr int DEPTH = 4;
     uint16_t table[DEPTH][WIDTH] = {0};
 
-    inline uint32_t fast_hash(const std::string& key, const uint32_t seed) {
-        uint32_t h = seed;
-        for (const char c : key) {
-            h ^= static_cast<uint32_t>(c);
-            h *= 0x5bd1e995;
-            h ^= h >> 15;
-        }
-        return h;
+    // Un singur hash per cheie; indicele randului i e h1 + i * h2 (Kirsch & Mitzenmacher,
+    // "Less Hashing, Same Performance", ESA 2006), cu h2 impar ca sa acopere tot randul.
+    uint16_t& cell(const uint64_t hash, const int row) {
+        const uint32_t h1 = static_cast<uint32_t>(hash);
+        const uint32_t h2 = static_cast<uint32_t>(hash >> 32) | 1;
+        return table[row][(h1 + static_cast<uint32_t>(row) * h2) & (WIDTH - 1)];
     }
 
 public:
     void record_access(const std::string& key) {
+        const uint64_t hash = std::hash<std::string>{}(key);
         for (int i = 0; i < DEPTH; ++i) {
-            uint32_t h = fast_hash(key, (i + 1) * 0x9e3779b9) & (WIDTH - 1);
-            if (table[i][h] < 0xFFFF) {
-                table[i][h]++;
-            }
+            if (uint16_t& count = cell(hash, i); count < 0xFFFF) ++count;
         }
     }
 
     uint16_t estimate_frequency(const std::string& key) {
+        const uint64_t hash = std::hash<std::string>{}(key);
         uint16_t min_freq = 0xFFFF;
-        for (int i = 0; i < DEPTH; ++i) {
-            uint32_t h = fast_hash(key, (i + 1) * 0x9e3779b9) & (WIDTH - 1);
-            if (table[i][h] < min_freq) {
-                min_freq = table[i][h];
-            }
-        }
+        for (int i = 0; i < DEPTH; ++i) min_freq = std::min(min_freq, cell(hash, i));
         return min_freq;
     }
 };

@@ -58,6 +58,7 @@ static PollTicket listener_ticket{nullptr, false};
 
 static unordered_map<int, shared_ptr<Client>> clients;
 static vector<PollTicket*> arm_backlog;
+static vector<shared_ptr<Client>> to_flush; // raspunsuri de trimis la capatul iteratiei
 static int g_eventfd = -1;
 static int g_server_fd = -1;
 static bool accept_paused = false;   // acceptul se re-armeaza la urmatorul sweep, nu pe loc
@@ -146,6 +147,15 @@ static void arm_eventfd(io_uring* ring) {
     if (cfg.trace_fd == -2) printf("[TRACE] arm_eventfd submit=%d\n", submitted);
 }
 
+// Raspunsurile nu pleaca pe loc: bucla le trimite la capatul iteratiei, dupa flush-ul
+// AOF (ca beforeSleep din Redis). Niciun ack nu pleaca inaintea scrierii, iar un client
+// care asteapta mai multe raspunsuri e trezit o singura data.
+static void queue_flush(const shared_ptr<Client>& c) {
+    if (c->flush_queued || c->write_armed) return; // write_armed: socket plin, POLLOUT il readuce aici
+    c->flush_queued = true;
+    to_flush.push_back(c);
+}
+
 static void deliver_pubsub(const int fd, const string& msg) {
     const auto it = clients.find(fd);
     if (it == clients.end() || it->second->closed) return;
@@ -159,10 +169,7 @@ static void deliver_pubsub(const int fd, const string& msg) {
         return schedule_close(it->second);
     }
 
-    // incercam trimisul direct; daca fd-ul e plin, POLLOUT il ia mai tarziu
-    const auto r = net::flush_output(*it->second);
-    if (r == net::FlushResult::Pending) arm_client(it->second, true);
-    else if (r == net::FlushResult::Dead) schedule_close(it->second);
+    queue_flush(it->second);
 }
 
 static void queue_work() {
@@ -180,8 +187,8 @@ static bool serve(const shared_ptr<Client>& c) {
         schedule_close(c);
         return false;
     }
-    if (c->pending_out() > 0) arm_client(c, true); // socketul e plin: restul pleaca pe POLLOUT
-    arm_client(c, false);                           // re-arm read
+    if (c->pending_out() > 0) queue_flush(c);
+    arm_client(c, false); // re-arm read
     return step == net::Step::More;
 }
 
@@ -408,9 +415,7 @@ int main() {
 
             if (for_write) {
                 c->write_armed = false;
-                const auto r = net::flush_output(*c);
-                if (r == net::FlushResult::Pending) arm_client(c, true);
-                else if (r == net::FlushResult::Dead) schedule_close(c);
+                queue_flush(c);
             } else {
                 c->read_armed = false;
                 if (!net::drain_read(*c)) {
@@ -426,6 +431,18 @@ int main() {
         }
 
         io_uring_cq_advance(&ring, count);
+
+        // group commit: un singur write() in AOF pentru comenzile intregii iteratii, apoi
+        // raspunsurile; ce nu incape in socket pleaca pe POLLOUT
+        db->flush_aof();
+        for (const auto& c : to_flush) {
+            c->flush_queued = false;
+            if (c->closed) continue;
+            const auto r = net::flush_output(*c);
+            if (r == net::FlushResult::Pending) arm_client(c, true);
+            else if (r == net::FlushResult::Dead) schedule_close(c);
+        }
+        to_flush.clear();
 
         if (const auto now = chrono::steady_clock::now(); now >= next_sweep) {
             close_unauthenticated(now);

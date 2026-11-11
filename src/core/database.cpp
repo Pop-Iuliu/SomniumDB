@@ -65,10 +65,7 @@ void Database::set_client_room(const int client_fd, const std::string& room_name
 
 std::string Database::get_client_room(const int client_fd) {
     std::lock_guard lock(client_mutex);
-    if (!client_rooms.contains(client_fd)) {
-        client_rooms[client_fd] = "default";
-    }
-    return client_rooms[client_fd];
+    return client_rooms.try_emplace(client_fd, "default").first->second;
 }
 
 std::string Database::execute(const int client_fd, const std::vector<std::string>& args, const bool resp3) {

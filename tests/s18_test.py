@@ -193,9 +193,61 @@ def sec_overrun_metric(check):
         srv.cleanup()
 
 
+def sec_group_commit(check):
+    """Un pipeline e un singur write() si un singur fdatasync, iar ack-urile raman acoperite."""
+    srv = Server(port=PORT, keep_dir_on_retry=True, env_extra={
+        "SOMNIUM_AOF_SYNC": "always",
+        "SOMNIUM_AOF_SYNC_DELAY_MS": "150",
+    })
+    try:
+        srv.start()
+        c = Client(srv)
+        n = 20
+        t0 = time.time()
+        c.s.sendall(b"".join(resp_cmd("SET", f"g{i}", f"v{i}") for i in range(n)) + resp_cmd("DEL", "g0"))
+        replies = [c.read_reply() for _ in range(n + 1)]
+        lat = time.time() - t0
+        print(f"  always, pipeline de {n + 1} comenzi: {lat * 1000:.0f} ms")
+        check("pipeline: fiecare comanda primeste raspunsul ei", replies == [("ok", "OK")] * n + [("int", 1)], replies)
+        check("always: ack-urile asteapta fdatasync", lat >= 0.12, f"{lat * 1000:.0f} ms")
+        # un fdatasync per comanda ar insemna peste 3 secunde
+        check("group commit: un fdatasync pentru tot pipeline-ul", lat < 1.0, f"{lat * 1000:.0f} ms")
+        check("always: nimic pending dupa ack-uri", metrics().get("db_aof_pending_bytes") == 0, metrics())
+        c.close()
+    finally:
+        srv.cleanup()
+
+    # everysec: destule mutatii cat sa treaca de mai multe citiri si de pragul la care
+    # bufferul de group commit se scrie singur; kill -9 imediat dupa ultimul ack
+    srv = Server(port=PORT, keep_dir_on_retry=True)
+    try:
+        srv.start()
+        c = Client(srv)
+        n = 3000
+        value = "x" * 200
+        c.s.sendall(b"".join(resp_cmd("SET", f"k{i}", value + str(i)) for i in range(n)) +
+                    b"".join(resp_cmd("DEL", f"k{i}") for i in range(0, n, 3)))
+        replies = [c.read_reply() for _ in range(n + len(range(0, n, 3)))]
+        check("pipeline mare: toate comenzile reusesc",
+              replies == [("ok", "OK")] * n + [("int", 1)] * len(range(0, n, 3)), replies[:3])
+        srv.proc.kill()
+        srv.proc.wait()
+        c.close()
+        srv.wait_port_free()
+        srv.start()
+        c = Client(srv)
+        got = [c.cmd("GET", f"k{i}") for i in range(n)]
+        check("dupa kill -9, fiecare scriere confirmata e in AOF",
+              all(got[i] == ("bulk", (value + str(i)).encode()) for i in range(n) if i % 3))
+        check("dupa kill -9, cheile sterse raman sterse", all(got[i] == ("nil", None) for i in range(0, n, 3)))
+        c.close()
+    finally:
+        srv.cleanup()
+
+
 def main():
     fails = []
-    for sec in (sec_everysec_does_not_block_append, sec_always_waits, sec_overrun_metric,
+    for sec in (sec_everysec_does_not_block_append, sec_always_waits, sec_group_commit, sec_overrun_metric,
                 sec_old_generation_cannot_clean_new_file, sec_snapshot_does_not_postpone_sync):
         run_with_retry(sec, fails)
     report(fails, "s18")

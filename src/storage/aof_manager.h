@@ -58,10 +58,16 @@ public:
     // Deschide fd-ul de append; scrie headerul v3 doar daca fisierul e nou.
     bool open_file();
 
-    // Append al mutatiei rezultate. false = scrierea a esuat: starea din RAM
-    // ramane, dar persistenta trebuie suspectata (niciodata ack fals).
+    // Mutatia rezultata intra in bufferul de group commit; flush() o scrie in fisier.
+    // false = AOF-ul nu primeste scrieri (replay, inregistrare rupta) sau scrierea
+    // a esuat: starea din RAM ramane, dar persistenta trebuie suspectata.
     bool append(const std::string& room_name, const std::vector<std::string>& args,
                 long long expire_at, uint64_t timestamp_ms, uint32_t node_id);
+
+    // Group commit (ca aof_buf din Redis): tot ce s-a adunat de la ultimul flush pleaca
+    // intr-un singur write(), cu un singur fdatasync sub `always`. Apelantul il cheama
+    // inainte sa trimita raspunsurile, deci niciun ack nu pleaca inaintea scrierii.
+    bool flush();
 
     // Rescriere (si migrare v1/v2 -> v3): starea curenta se serializeaza intr-un
     // fisier temporar si se substituie atomic celui vechi. Esuarea in orice punct
@@ -78,6 +84,9 @@ public:
     uint64_t size() const { return size_.load(std::memory_order_relaxed); }
     bool append_tail(uint64_t from);
     static std::string encode_record(const AofRecord& rec);
+    // aceeasi inregistrare, adaugata la capatul lui `out` (fara copii intermediare)
+    static void encode(std::string& out, const std::string& room, const std::vector<std::string>& args,
+                       long long expire_at, uint64_t timestamp_ms, uint32_t node_id);
     // true daca fisierul redat nu era v3 (sau era corupt): necesita reserializare
     bool needs_rewrite() const { return needs_rewrite_; }
 
@@ -96,6 +105,7 @@ public:
 private:
     int fd_ = -1;          // appendonly.aof
     int rewrite_fd_ = -1;  // appendonly.aof.tmp, doar in timpul migrarii
+    std::string pending_;  // inregistrari codate, inca nescrise (group commit)
     SyncPolicy sync_policy_;
     std::mutex mutex_;
     std::condition_variable sync_cv_;

@@ -182,6 +182,10 @@ public:
     // resp3: protocolul negociat de conexiune prin HELLO (tinut de server)
     std::string execute(int client_fd, const std::vector<std::string>& args, bool resp3 = false);
 
+    // scrie in AOF mutatiile executate de la ultimul apel (group commit); cine trimite
+    // raspunsuri il cheama inaintea lor
+    void flush_aof() { aof.flush(); }
+
     // versiunea pana la care toate scrierile locale sunt deja in AOF (pentru REPLFRONTIER)
     const std::atomic<uint64_t>& replication_frontier() const { return frontier_; }
 
